@@ -90,6 +90,49 @@ def test_silent_feed_is_treated_as_dead():
     asyncio.run(go())
 
 
+def test_network_down_then_back():
+    """Nothing reachable for a while (like Wi-Fi off), then the server appears: the connector backs
+    off without crashing and connects as soon as it can."""
+    import socket
+
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+
+    async def go():
+        async with aiohttp.ClientSession() as s:
+            p = Probe(ctx_for(s), f"ws://127.0.0.1:{port}/ws")
+            p.backoff = Backoff(base=0.05, cap=0.3)
+            t = asyncio.create_task(p.run())
+            await asyncio.sleep(5.0)          # "offline": every attempt fails (Windows takes ~2 s to refuse)
+            failed_attempts, state_offline = p.health.errors, p.health.state
+            hits = []
+
+            async def handler(request):
+                ws = web.WebSocketResponse()
+                await ws.prepare(request)
+                hits.append(1)
+                await ws.send_str("back online")
+                async for _ in ws:
+                    pass
+                return ws
+
+            app = web.Application()
+            app.router.add_get("/ws", handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, "127.0.0.1", port).start()   # "online" again
+            await asyncio.sleep(3.0)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+            await runner.cleanup()
+            return p, failed_attempts, state_offline, hits
+
+    p, failed, state_offline, hits = asyncio.run(go())
+    assert failed >= 1 and state_offline in ("reconnecting", "connecting")
+    assert hits and p.got[-1] == "back online" and p.health.connects == 1
+
+
 def test_handshake_429_waits_instead_of_hammering():
     """Finnhub answers a second stream on the same key with HTTP 429 (measured 24 Nov 2026)."""
     async def go():

@@ -541,7 +541,9 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 
 - **Dropped or silent feeds.**
   - Every websocket reconnects with exponential back-off and jitter: 1 s doubling to 60 s, reset after a healthy minute.
-  - A feed that goes silent beyond its idle limit (45-900 s, depending on the market) counts as dead. That catches half-open TCP connections after Wi-Fi loss.
+  - A feed that goes silent beyond its idle limit counts as dead. That catches half-open TCP connections after Wi-Fi loss.
+    - The limit is 45 s for Binance, 2 min for FX and 10 min for IEX while their market is open.
+    - It is an hour while their market is closed: silence is normal then.
   - aiohttp heartbeat pings check the peer.
 - **Sleep or hibernation.**
   - A watchdog notices the wall clock jumping (more than 25 s in a 5 s tick).
@@ -647,6 +649,13 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - write methods get 405;
   - malformed, binary and oversized WebSocket input neither crashes nor blocks anything, and a stalled client doesn't stall others;
   - no key appears in any response.
+- **More recovery and calendar tests:**
+  - the network down for a while, then back;
+  - a dead webhook target;
+  - a start with no data at all;
+  - Thanksgiving (US shut, FX and crypto live), a Saturday (FX shut) and the 13:00 early close;
+  - a real daily roll replayed from the cache;
+  - token mode in the browser.
 - **Optional parts tested live:**
   - the Hyperliquid connector, whose Nasdaq-100 perp read z −1.08 against −1.13 from Binance's QQQ contract;
   - the copper, Russell 2000 and OpenAI nodes;
@@ -657,6 +666,8 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - 0.9% of one core at the full 30 fps.
 - **Fixed in this round:**
   - **TODAY's σ read 0 for ~5 minutes after every daily roll** (17:00 New York, 03:00 Pakistan), blanking the z-scores. It was found by replaying a real roll from the history cache;
+  - **quiet markets would have caused reconnect storms:** IEX is silent overnight and at weekends, and FX from Friday to Sunday, so the streams would have reconnected every 2-10 minutes. While their market is closed the silence limit is now an hour, and the heartbeat still checks the link. Finnhub pings every 60 s, measured;
+  - the dashboard now says when a token is missing or wrong, instead of "stream lost";
   - Finnhub (one stream per key) refused a second copy with HTTP 429 and the service retried every few seconds; 429 refusals now wait ≥ 2 min;
   - the Host check was case-sensitive;
   - `client.stream()` now reconnects after a restart;
