@@ -53,7 +53,10 @@
     ws.onopen = () => { wsDelay = 1000; setConn(true, "live stream"); stopPolling(); };
     ws.onmessage = (ev) => { try { const t = performance.now(); const m = JSON.parse(ev.data); perf.parseMs += performance.now() - t; perf.msgs++;
       if (m.type === "snapshot") onData(m.data); } catch (e) { console.error(e); } };
-    ws.onclose = () => { setConn(false, "stream lost, retrying"); startPolling(); setTimeout(connect, wsDelay); wsDelay = Math.min(30000, wsDelay * 2); };
+    ws.onclose = () => {
+      if (!/token/.test($("footConn").textContent)) setConn(false, "stream lost, retrying");
+      startPolling(); setTimeout(connect, wsDelay); wsDelay = Math.min(30000, wsDelay * 2);
+    };
     ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
   }
   function startPolling() { if (pollTimer) return; pollTimer = setInterval(poll, 5000); poll(); }
@@ -61,6 +64,7 @@
   async function poll() {
     try { const tok = new URLSearchParams(location.search).get("token");
       const r = await fetch("/api/snapshot?tf=all" + (tok ? "&token=" + encodeURIComponent(tok) : ""), { cache: "no-store" });
+      if (r.status === 401) setConn(false, tok ? "wrong token in the address (?token=…)" : "this server needs a token: open it as …/?token=YOUR_TOKEN");
       if (r.ok) onData(await r.json()); } catch { /* server down */ }
   }
   function setConn(ok, text) { const el = $("footConn"); el.textContent = text; el.className = "conn " + (ok ? "ok" : "bad"); }

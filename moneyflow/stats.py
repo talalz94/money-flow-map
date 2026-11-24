@@ -141,10 +141,15 @@ def sigma_daily(inst: Instrument, now: float, min_n: int = 10) -> tuple[float, i
     return _rms(rs), len(rs)
 
 
+TODAY_MIN_WINDOW_S = 3600.0   # in the first hour after the roll, TODAY is judged against a 1-hour move
+
+
 def sigma_today(inst: Instrument, now: float, days: int = 30, min_n: int = 8) -> tuple[float, int, str]:
     g = inst.g5
     roll = clock.day_roll(now)
-    off = now - roll
+    # Floor the window at one hour: right after the roll the same-clock windows on previous days
+    # would be shorter than one 5-minute step and every one of them would read as a zero move (σ = 0).
+    off = max(now - roll, TODAY_MIN_WINDOW_S)
     rs = []
     for n in range(1, days + 1):
         r0 = clock.roll_n_days_before(roll, n)

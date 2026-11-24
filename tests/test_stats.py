@@ -43,6 +43,19 @@ def test_sigma_today_same_clock_and_z_of_one():
     assert r / s == pytest.approx(1.0, rel=1e-6)                                # a perfectly typical day
 
 
+def test_sigma_today_right_after_the_roll_is_not_zero():
+    """30 s after 17:00 New York every same-clock window would be shorter than one 5-minute step:
+    σ must not collapse to 0 (it once did, blanking TODAY's z-scores for 5 minutes every day)."""
+    roll = clock.day_roll(NOW)
+    just_after = roll + 30
+    inst = drifting(just_after)
+    s, n, method = stats.sigma_today(inst, just_after)
+    s_hour, _, _ = stats.sigma_today(inst, roll + 3600)
+    assert s > 0 and method == "same-clock"
+    assert s == pytest.approx(12 * A, rel=1e-6)            # one hour of drift: the floored yardstick
+    assert s_hour == pytest.approx(s, rel=1e-6)
+
+
 def test_sigma_1w_from_daily_returns():
     inst = drifting(NOW)
     s, n, method = stats.sigma_1w(inst, NOW)

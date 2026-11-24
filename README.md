@@ -117,7 +117,7 @@ was open. History is seeded at start-up from REST and cached on disk.
 | Window | σ estimated from |
 |---|---|
 | 1H | RMS of rolling 60-minute log returns over the last 10 days. Only windows where its market was open count. |
-| TODAY | **Same-clock σ**: RMS, over the previous 30 days, of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. Fallback (fewer than 8 such days, e.g. ANT after its IPO): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
+| TODAY | **Same-clock σ**: RMS, over the previous 30 days, of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. Fallback (fewer than 8 such days, e.g. ANT after its IPO): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
 | 1W | RMS of daily (roll-to-roll) log returns over calendar days, × √7. |
 
 - **RMS, not standard deviation:** the mean of short-horizon returns is about 0, and estimating it adds noise.
@@ -625,6 +625,42 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - Yahoo's ICE DXY and VIX;
   - CoinGecko's stablecoin share;
   - Alpaca's latest TLT trade and the SPY basis.
+
+**Second test round (24-25 Nov 2026):**
+- **Independent recomputation** (`tools/verify_against_exchange.py`) for BTC, ETH, Nasdaq 100, S&P 500, gold and oil, from 35 days of raw Binance 5-minute data:
+  - stored history matched 10,079 steps (worst 0.0125%, on the still-forming latest step);
+  - a 2-hour restart gap had been back-filled with real data;
+  - σ (1H, TODAY, 1W), z-scores and % changes are identical to the recomputation;
+  - the strongest edge's correlation matched (0.110 vs 0.109).
+- **Derived series on real data:**
+  - stitched bonds match TLT's 5-minute closes in US hours (max 0.006%);
+  - overnight, each of 715 steps equals the TMF index move ÷ 3 exactly;
+  - the computed DXY stayed within 0.012 of ICE's;
+  - the stablecoin share stayed within ~0.5% (relative) of the share implied by CoinGecko's fresh totals, which lag 2.5-7.5 min.
+- **Load:**
+  - 20 WebSocket and 10 SSE clients plus 40 REST requests/s for a minute: 1,845/1,845 requests OK (p50 1.6 ms, p95 9.6 ms);
+  - every client got its 1/s update, and CPU stayed at 4-11% of one core;
+  - 5 minutes of streamed messages (299, validated for all three windows): 0 schema failures, 0 duplicates, max gap 1.3 s.
+- **Security:**
+  - path-traversal attempts are all 404, with nothing leaked;
+  - foreign Host headers are refused;
+  - write methods get 405;
+  - malformed, binary and oversized WebSocket input neither crashes nor blocks anything, and a stalled client doesn't stall others;
+  - no key appears in any response.
+- **Optional parts tested live:**
+  - the Hyperliquid connector, whose Nasdaq-100 perp read z −1.08 against −1.13 from Binance's QQQ contract;
+  - the copper, Russell 2000 and OpenAI nodes;
+  - `start.bat` (normal start, and a busy port).
+- **Dashboard:**
+  - phone, tablet and desktop layouts;
+  - memory flat over hundreds of forced re-renders;
+  - 0.9% of one core at the full 30 fps.
+- **Fixed in this round:**
+  - **TODAY's σ read 0 for ~5 minutes after every daily roll** (17:00 New York, 03:00 Pakistan), blanking the z-scores. It was found by replaying a real roll from the history cache;
+  - Finnhub (one stream per key) refused a second copy with HTTP 429 and the service retried every few seconds; 429 refusals now wait ≥ 2 min;
+  - the Host check was case-sensitive;
+  - `client.stream()` now reconnects after a restart;
+  - labels and badges now make room for same-row neighbours on tablets.
 
 **Verification pass on 24 Nov 2026, during US hours.**
 
