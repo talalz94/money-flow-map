@@ -353,7 +353,9 @@
       const a = ang(score), nx = cx + (R - 22) * Math.cos(a), ny = cy - (R - 22) * Math.sin(a);
       s += `<line x1="${cx}" y1="${cy}" x2="${nx.toFixed(1)}" y2="${ny.toFixed(1)}" stroke="#e8edf3" stroke-width="3" stroke-linecap="round"/><circle cx="${cx}" cy="${cy}" r="6" fill="#e8edf3"/>`;
       const col = score <= -20 ? COL.out : score >= 20 ? COL.in : COL.amber;
-      s += `<text x="${cx}" y="${cy - 34}" text-anchor="middle" fill="${col}" font-size="17" font-weight="800" font-family="Segoe UI, sans-serif">${esc(r.label)} ${score > 0 ? "+" : score < 0 ? "−" : ""}${Math.abs(score)}</text>`;
+      const halo = `paint-order="stroke" stroke="#0c1015" stroke-width="5" stroke-linejoin="round"`;
+      s += `<text x="${cx}" y="${cy - 58}" text-anchor="middle" fill="${col}" font-size="11.5" font-weight="700" letter-spacing="1.5" font-family="Segoe UI, sans-serif" ${halo}>${esc(r.label)}</text>`;
+      s += `<text x="${cx}" y="${cy - 30}" text-anchor="middle" fill="${col}" font-size="26" font-weight="800" font-family="Consolas, monospace" ${halo}>${score > 0 ? "+" : score < 0 ? "−" : ""}${Math.abs(score)}</text>`;
     } else s += `<text x="${cx}" y="${cy - 34}" text-anchor="middle" fill="${COL.muted}" font-size="14">waiting for data</text>`;
     svg.innerHTML = s;
     if (r && r.components) {

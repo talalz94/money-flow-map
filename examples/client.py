@@ -31,7 +31,7 @@ async def stream():
     async for snap in c.stream("1h"):
         top = snap["edges"][0] if snap["edges"] else None
         print(snap["generated_at"], snap["risk"]["label"], snap["risk"]["score"],
-              f"strongest: {top['from']} -> {top['to']}" if top else "no clear flow")
+              f"strongest: {top['from']} -> {top['to']}" if top else "no clear flow", flush=True)
 
 
 if __name__ == "__main__":

@@ -253,6 +253,11 @@ Pakistan) with the clock corrected by NTP. Measured on 24 Nov 2026; marketing cl
 | Binance spot during the US session | **~106 ms** | ~108 ms | BTC 50/s, ETH 36/s | |
 | Binance futures index/mark, US session | **144-154 ms** | ~160 ms | 1/s per symbol | |
 | Finnhub OANDA FX, US session | **336-400 ms** | 536-632 ms | 1.5-3/s per pair | busier than pre-market |
+| Evening check, 15:15 UTC (20:15 Pakistan) | Binance 215-230 ms, IEX ~120 ms, FX ~420 ms | | | from the running service's own badges |
+
+Network latency varies through the day on a home connection: Binance's median doubled between
+13:30 and 15:15 UTC. The dashboard shows each source's *current* median latency, so read the
+table as typical ranges.
 | Finnhub OANDA FX (6 pairs) | **260-345 ms** | 380-505 ms | 1-2/s per pair | DXY inputs |
 | Coinbase full ticker | 120 ms | 130 ms | 19/s (BTC) | the service uses the batched channel, which updates every ~5 s by design |
 | Hyperliquid trades (optional) | 300-450 ms | ~530 ms | | not used by default |
@@ -453,6 +458,20 @@ external requests** (no CDNs, no web fonts).
   and the service's own CPU and RAM.
 - The window choice and the motion setting are remembered in the browser.
 
+**The page's own cost.** The page measures itself: type `__mfPerf.report()` in the browser
+console. On 24 Nov 2026 it measured:
+
+| Work | Time |
+|---|---|
+| One animation frame (blit + about 100 particles) | 0.25 ms |
+| Redrawing the network when data arrives (once a second) | 1.4 ms |
+| Updating the panel (once a second) | 1.1 ms |
+| Parsing each ~87 KB update | 1.0 ms |
+
+At the 30 fps cap that is about **11 ms of script per second, roughly 1% of one core**, plus the
+browser's own compositing, which the page cannot see. With MOTION off it is about 3.5 ms/s. A
+hidden tab only parses updates and draws nothing.
+
 ---
 
 ## 8. Performance
@@ -460,7 +479,26 @@ external requests** (no CDNs, no web fonts).
 Measured on this laptop (Intel i7-10510U, 4 cores / 8 threads, 16 GB, Windows 10, Python 3.13)
 with all default sources live:
 
-__PERF_TABLE__
+CPU is given two ways: % of one logical core (Task Manager's *Details* tab) and % of the whole
+machine (its *Processes* tab, 8 logical cores).
+
+| Run (24 Nov 2026, US session) | CPU, one core: mean / median / p95 | CPU, whole machine | RAM (working set) | Private |
+|---|---|---|---|---|
+| **Headless, final config** (8 min) | **2.5% / 1.6% / 6.2%** | **0.31%** | **75-83 MB** | 62-67 MB |
+| **+ 1 WebSocket client** (8 min; the load of one open dashboard: a full ~87 KB snapshot every second) | **3.7% / 3.1% / 7.8%** | **0.46%** | 78-82 MB | 61-65 MB |
+| Headless, first config, first hour after the open (10 min; also streamed IEF/HYG bid/ask, since dropped) | 3.9% / 3.1% / 9.3% | 0.49% | 75-79 MB | 60-63 MB |
+
+- **Start to ready:** 9-21 s from the history cache.
+- **Threads:** 18.
+- **Peaks:** occasional single-second peaks of 12-22% of one core come from the periodic jobs:
+  - parsing RSS (9 feeds every 3 min);
+  - DefiLlama's 0.6 MB stablecoin list (hourly);
+  - re-estimating σ (once a minute);
+  - saving the history cache (every 30 min).
+- **Load at the US open:** about 180 messages/s across all feeds. Binance BTC/ETH trades alone
+  were ~90/s. `trade_stream = false` under `[connectors.binance_spot]` drops them in exchange for
+  BTC/ETH prices up to ~2 s old.
+- **Browser side:** see section 7 (measured in the page).
 
 Why it is light:
 - **One asyncio process.** No busy loops: every wait has a timeout.
@@ -493,9 +531,24 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - After gaps over 2 minutes it **downloads the missing history** for every instrument.
 - **Pollers** back off on errors (10 s doubling to 15 min) and recover by themselves.
 - **History** is saved to `data/cache/` every 30 minutes and on exit.
-- **Tests:**
-  - `tests/test_reconnect.py` checks reconnection after server drops, after silence, after a `kick()`, poller back-off, and the resume path.
-  - The resume path was also exercised live by restarting the service and by the recorder (section 10).
+- **Tests:** `tests/test_reconnect.py` checks:
+  - reconnection after server drops, after silence and after a `kick()`;
+  - poller back-off;
+  - the resume path;
+  - that the sleep gap is re-downloaded, not left flat. That bug was caught here: the 1-second tick had already filled the gap with the pre-sleep price.
+
+**Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
+(process suspended, which is what it experiences during sleep), then resumed:
+
+| When | What happened |
+|---|---|
+| On resume | The log says `wall clock jumped 151s (sleep/hibernate?): resyncing and reconnecting`. The clock is re-synced by NTP and every stream reconnects. |
+| 2 s later | Nodes honestly show **STALE**, with data ages of 126-133 s. |
+| 20 s later | `history gap since 15:07:21Z refilled`. |
+| 40 s later | Every stream has reconnected (2 connects each) and all 11 nodes are **LIVE** with data ages of 0.1-5 s. |
+
+Real network loss was not simulated on this PC: that needs admin rights and would cut your
+connection. It is covered by the drop and silence tests and by the same reconnect code.
 
 ---
 
