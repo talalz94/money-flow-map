@@ -60,6 +60,11 @@ def test_rest_endpoints_and_schema(cfg, keys):
             assert (await c.get("/api/nodes/nope")).status == 404
             assert isinstance(await (await c.get("/api/edges?tf=today")).json(), list)
             assert "score" in await (await c.get("/api/risk?tf=today")).json()
+            h = await (await c.get("/api/history/btc?grid=5m&hours=2")).json()
+            assert h["step_s"] == 300 and len(h["closes"]) == 24 and h["closes"][-1][0] == NOW
+            assert all(len(r) == 3 and r[1] > 0 for r in h["closes"])
+            assert (await c.get("/api/history/btc?grid=2m")).status == 400
+            assert (await c.get("/api/history/nope")).status == 404
             news = await (await c.get("/api/news?limit=5")).json()
             assert news[0]["title"] == "Fed holds rates steady" and news[0]["age_s"] == 120
             f = await (await c.get("/api/fed")).json()
@@ -136,6 +141,50 @@ def test_webhooks_deliver_events_and_skip_startup_noise(cfg, keys):
     assert any(g["event"] == "extreme_move" and g["id"] == "btc" for g in got)
 
 
+def test_python_client_stream_survives_a_service_restart(cfg, keys):
+    """examples/client.py's stream keeps going when the service is restarted."""
+    import socket
+    from aiohttp import web
+    from moneyflow.client import MoneyFlowClient
+
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+
+    async def go():
+        eng = filled_engine(cfg, keys)
+
+        async def start():
+            runner = web.AppRunner(make_app(eng, cfg, dashboard=False))
+            await runner.setup()
+            await web.TCPSite(runner, "127.0.0.1", port).start()
+            return runner
+
+        runner = await start()
+        got = []
+        client = MoneyFlowClient(f"http://127.0.0.1:{port}")
+
+        async def consume():
+            async for snap in client.stream("1h", max_backoff=0.5):
+                got.append(snap["generated_ts"])
+                if len(got) >= 2:
+                    return
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.5)
+        assert len(got) == 1                               # the snapshot sent on connect
+        await runner.cleanup()                             # the service goes away ...
+        await asyncio.sleep(0.8)
+        eng.clock.advance(5)
+        runner = await start()                             # ... and comes back
+        await asyncio.wait_for(task, timeout=10)
+        await runner.cleanup()
+        return got
+
+    got = run(go())
+    assert len(got) == 2 and got[1] > got[0]
+
+
 def test_cli_read_rendering(cfg, keys):
     from moneyflow.cli import fmt_read
     from moneyflow.server import one_tf
@@ -151,6 +200,12 @@ def test_host_guard_token_and_headless(cfg, keys):
         async with TestClient(TestServer(make_app(eng, cfg, dashboard=False))) as c:
             r = await c.get("/api/health", headers={"Host": "evil.example:8765"})
             assert r.status == 403                                       # DNS-rebinding guard
+            for h in ("localhost.evil.example", "127.0.0.1.nip.io:8765"):
+                assert (await c.get("/api/health", headers={"Host": h})).status == 403
+            for h in ("LOCALHOST:8765", "[::1]:8765", "127.0.0.1"):    # host names are case-insensitive
+                assert (await c.get("/api/health", headers={"Host": h})).status == 200
+            for p in ("/static/../moneyflow.local.toml", "/static/%2e%2e/.env"):
+                assert (await c.get(p)).status in (403, 404)
             r = await c.get("/")
             assert (await r.json())["dashboard"].startswith("disabled")
         cfg2 = dict(cfg, server=dict(cfg["server"], token="s3cret-token"))

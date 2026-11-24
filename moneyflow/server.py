@@ -188,14 +188,15 @@ def _json(data, status: int = 200) -> web.Response:
 def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
     scfg = cfg.get("server", {})
     token = scfg.get("token") or ""
-    allowed = {"localhost", "127.0.0.1", "[::1]", "::1"} | set(scfg.get("allowed_hosts", []))
+    allowed = {"localhost", "127.0.0.1", "[::1]", "::1"} | {h.lower() for h in scfg.get("allowed_hosts", [])}
     if scfg.get("host") not in (None, "127.0.0.1", "localhost", "::1"):
-        allowed.add(scfg.get("host"))
+        allowed.add(str(scfg.get("host")).lower())
     cors = scfg.get("cors_origin", "*")
 
     @web.middleware
     async def guard(request, handler):
-        host = (request.host or "").rsplit(":", 1)[0] if not (request.host or "").startswith("[") else request.host.split("]")[0] + "]"
+        raw_host = (request.host or "").lower()             # host names are case-insensitive
+        host = raw_host.rsplit(":", 1)[0] if not raw_host.startswith("[") else raw_host.split("]")[0] + "]"
         if host not in allowed and "*" not in allowed:
             return _json({"error": "host not allowed"}, 403)
         path = request.path
@@ -226,6 +227,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
                           "/api/snapshot?tf=today|1h|1w|all": "everything for one (or all) timeframes",
                           "/api/nodes?tf=": "the assets on the map", "/api/nodes/{id}?tf=": "one asset",
                           "/api/edges?tf=": "inferred flows", "/api/risk?tf=": "risk-on/off composite",
+                          "/api/history/{id}?grid=5m&hours=24": "stored closes of one series (5m: 35 days, 1m: 1 day)",
                           "/api/narrative?tf=": "what the flow says", "/api/news?limit=": "headlines",
                           "/api/fed": "next FOMC decision", "/api/events": "scheduled high-impact releases",
                           "/api/sources": "connector health and latency", "/api/health": "process health",
@@ -264,6 +266,32 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
                 return _json({t: s["timeframes"][t][name] for t in TFS})
             return _json(s["timeframes"][tf][name])
         return h
+
+    async def history(request):
+        """Stored closes of one series: ?grid=5m (35 days) or 1m (1 day), &hours=24. Each row is
+        [step END time (epoch s), close, market open during the step (1/0)]."""
+        nid = request.match_info["id"]
+        s = engine.series.get(nid)
+        if s is None:
+            return _json({"error": f"unknown id {nid!r}", "ids": sorted(engine.series)}, 404)
+        grid = request.query.get("grid", "5m")
+        if grid not in ("1m", "5m"):
+            return _json({"error": "grid must be 1m or 5m"}, 400)
+        g = s.inst.g1 if grid == "1m" else s.inst.g5
+        try:
+            hours = max(0.1, min(float(request.query.get("hours", "24")), g.size * g.step / 3600))
+        except ValueError:
+            return _json({"error": "hours must be a number"}, 400)
+        now = engine.clock.now()
+        k1 = g.k_of(now) - 1
+        k0 = max(g.first_k() or k1, k1 - int(hours * 3600 / g.step) + 1)
+        rows = []
+        for k in range(k0, k1 + 1):
+            v = g.get(k)
+            if v == v:
+                rows.append([(k + 1) * g.step, round(v, 8), 1 if g.is_live(k) else 0])
+        return _json({"id": nid, "label": s.label, "grid": grid, "step_s": g.step, "hours": hours,
+                      "source": engine.source_info(s, now), "price": s.inst.price, "closes": rows})
 
     async def news(request):
         try:
@@ -356,6 +384,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
     app.router.add_get("/api/risk", part("risk"))
     app.router.add_get("/api/narrative", part("narrative"))
     app.router.add_get("/api/tiles", part("tiles"))
+    app.router.add_get("/api/history/{id}", history)
     app.router.add_get("/api/news", news)
     app.router.add_get("/api/fed", fed)
     app.router.add_get("/api/events", events)

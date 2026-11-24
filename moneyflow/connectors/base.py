@@ -187,6 +187,13 @@ class StreamConnector(Connector):
                 await self._session_once()
             except asyncio.CancelledError:
                 raise
+            except aiohttp.WSServerHandshakeError as e:
+                self.error(e, "connection")
+                if e.status == 429:
+                    # e.g. Finnhub's free plan allows one stream per key: another app (or a second
+                    # copy of this one) holds it. Asking every few seconds would only prolong that.
+                    self.refused_until = max(self.refused_until, self.now() + 120)
+                    self.health.detail = "stream refused (HTTP 429: key already in use elsewhere, or too many attempts)"
             except Exception as e:  # noqa: BLE001 - any failure means reconnect
                 self.error(e, "connection")
             finally:
@@ -200,7 +207,11 @@ class StreamConnector(Connector):
             self.health.detail = f"{reason} - retry in {delay:.0f}s" if reason else f"retry in {delay:.0f}s"
             await self.sleep(delay)
 
+    refused_until = 0.0
+
     def retry_delay(self) -> float:
+        if self.now() < self.refused_until:
+            return max(self.backoff.next(), self.refused_until - self.now())
         return self.backoff.next()
 
     async def _session_once(self) -> None:

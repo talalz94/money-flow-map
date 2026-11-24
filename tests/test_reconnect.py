@@ -90,6 +90,36 @@ def test_silent_feed_is_treated_as_dead():
     asyncio.run(go())
 
 
+def test_handshake_429_waits_instead_of_hammering():
+    """Finnhub answers a second stream on the same key with HTTP 429 (measured 24 Nov 2026)."""
+    async def go():
+        attempts = []
+
+        async def handler(request):
+            attempts.append(1)
+            return web.Response(status=429, text="Too Many Requests")
+
+        app = web.Application()
+        app.router.add_get("/ws", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        async with aiohttp.ClientSession() as s:
+            p = Probe(ctx_for(s), f"ws://127.0.0.1:{port}/ws")
+            t = asyncio.create_task(p.run())
+            await asyncio.sleep(1.0)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+        await runner.cleanup()
+        return p, attempts
+
+    p, attempts = asyncio.run(go())
+    assert len(attempts) == 1                                   # no retry storm within the second
+    assert p.retry_delay() >= 100 and "HTTP 429" in p.health.detail
+
+
 def test_kick_forces_an_immediate_reconnect():
     async def go():
         runner, url, hits = await start_server("silent")

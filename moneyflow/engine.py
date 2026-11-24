@@ -589,7 +589,7 @@ class Engine:
         return out
 
     def _ref(self, rc: dict, ri: Instrument, s: SeriesDef, w, now) -> dict:
-        r, pct, p0 = stats.window_return(ri, w, now)
+        _, pct, _ = stats.window_return(ri, w, now)
         basis = None
         main = s.inst.price
         if not isnum(ri.price):
@@ -736,7 +736,7 @@ class Engine:
             ny = dt.datetime.fromtimestamp(e["ts"], clock.NY)
             loc = clock.to_local(e["ts"], self.local_tz)
             out.append({"title": e["title"], "country": e["country"], "impact": e["impact"], "at": clock.iso(e["ts"]),
-                        "when_text": f"{ny:%a %H:%M} New York / {loc:%a %H:%M} local",
+                        "when_text": f"{ny:%a %H:%M} New York / {loc:%a %H:%M} {clock.local_label(self.local_tz)}",
                         "in_s": round(e["ts"] - now), "forecast": e.get("forecast"), "previous": e.get("previous")})
             if len(out) >= limit:
                 break

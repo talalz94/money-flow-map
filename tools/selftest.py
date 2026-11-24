@@ -162,7 +162,7 @@ def main() -> int:
     check(hd.get("Access-Control-Allow-Origin") == "*", "CORS header for other local apps")
     st, _, _ = jget(base + "/api/health", headers={"Host": "evil.example"})
     check(st == 403, "requests for a foreign Host are refused (DNS-rebinding guard)", str(st))
-    st, _, page = http(base + "/")
+    st, _, _ = http(base + "/")
     check(st == 200, "dashboard page or headless notice served")
 
     # ── streams ─────────────────────────────────────────────────────────────────────────

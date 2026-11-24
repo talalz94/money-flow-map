@@ -60,15 +60,29 @@ class MoneyFlowClient:
     def health(self) -> dict:
         return self._get("/api/health")
 
-    async def stream(self, tf: str = "today"):
-        """Yield snapshots pushed over the WebSocket (requires aiohttp)."""
+    async def stream(self, tf: str = "today", reconnect: bool = True, max_backoff: float = 30.0):
+        """Yield snapshots pushed over the WebSocket (requires aiohttp). If the service restarts or
+        the connection drops, it reconnects by itself (1 s doubling to `max_backoff`) unless
+        `reconnect=False`, in which case the generator simply ends."""
+        import asyncio
+
         import aiohttp
         url = self.base.replace("http", "ws", 1) + "/ws?" + urllib.parse.urlencode({"tf": tf, **({"token": self.token} if self.token else {})})
-        async with aiohttp.ClientSession() as s:
-            async with s.ws_connect(url, heartbeat=30) as ws:
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        yield json.loads(msg.data)["data"]
+        delay = 1.0
+        while True:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.ws_connect(url, heartbeat=30) as ws:
+                        delay = 1.0
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                yield json.loads(msg.data)["data"]
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+                pass
+            if not reconnect:
+                return
+            await asyncio.sleep(delay)
+            delay = min(max_backoff, delay * 2)
 
 
 def is_running(base_url: str = "http://127.0.0.1:8765") -> bool:

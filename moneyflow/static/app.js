@@ -112,8 +112,9 @@
     for (const c of [canvas, S.staticCanvas]) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
     const narrow = W < 560;                                   // phones: two columns, compact labels
     const R = narrow ? 17 : Math.max(17, Math.min(38, Math.min(W * 0.6, H) * 0.046));
+    const legendH = narrow ? 0 : (document.querySelector(".legend") || {}).offsetHeight || 20;   // it wraps when narrow
     S.layout = narrow ? { W, H, dpr, R, narrow, padX: R * 2.6, padTop: R + 30, padBot: R + 70 }
-                      : { W, H, dpr, R, narrow, padX: R * 3.2, padTop: R * 1.5, padBot: R + 58 };
+                      : { W, H, dpr, R, narrow, padX: R * 3.2, padTop: R * 1.5, padBot: R + 44 + legendH };
     S.narrowPos = null;
   }
   /* On narrow screens the configured x/y would crowd three nodes into a row: nodes are re-flowed
@@ -216,7 +217,8 @@
     // label; then sigma, change and an inline sparkline on one line (keeps the block short)
     const fs = Math.round(Math.max(11, Math.min(14, R * 0.40)));
     g.fillStyle = COL.text; g.font = `600 ${fs}px "Segoe UI", sans-serif`;
-    const label = S.layout.narrow ? n.label.replace(/\s*\(.*\)\s*$/, "") : n.label;   // "Stablecoins (cash in crypto)" -> "Stablecoins"
+    let label = S.layout.narrow ? n.label.replace(/\s*\(.*\)\s*$/, "") : n.label;   // "Stablecoins (cash in crypto)" -> "Stablecoins"
+    if (!S.layout.narrow && g.measureText(label).width / 2 + 6 > roomBeside(n, p)) label = n.label.replace(/\s*\(.*\)\s*$/, "");
     const lw = g.measureText(label).width;
     const lx = Math.max(lw / 2 + 2, Math.min(S.layout.W - lw / 2 - 2, p.x));          // never clipped at the edges
     g.fillText(label, lx, p.y + R + fs + 3);
@@ -242,9 +244,37 @@
       drawBadge(g, n, short, bx, by, bw);
       return;
     }
-    const right = p.x + R + 6 + bw < S.layout.W - 4;
-    bx = right ? p.x + R + 6 : p.x - R - 6 - bw; by = p.y - R * 0.35;
+    const need = R + 6 + bw + 4;                                 // room a side badge takes
+    const fitsRight = p.x + R + 6 + bw < S.layout.W - 4 && gapTo(n, p, +1) > need + R;
+    const fitsLeft = p.x - R - 6 - bw > 4 && gapTo(n, p, -1) > need + R;
+    if (fitsRight || fitsLeft) {
+      bx = fitsRight ? p.x + R + 6 : p.x - R - 6 - bw; by = p.y - R * 0.35;
+    } else {                                                     // crowded row: badge under the numbers
+      bx = p.x - bw / 2; by = y2 + 17;
+    }
     drawBadge(g, n, btxt, bx, by, bw);
+  }
+  /* Distance to the nearest node on the same row on one side (+1 right, -1 left). */
+  function gapTo(n, p, side) {
+    const td = tfData(); if (!td) return Infinity;
+    let gap = Infinity;
+    for (const o of td.nodes) {
+      if (o.id === n.id) continue;
+      const q = pos(o), dx = (q.x - p.x) * side;
+      if (dx > 0 && Math.abs(q.y - p.y) < S.layout.R * 2.5) gap = Math.min(gap, dx);
+    }
+    return gap;
+  }
+  /* Half-width available to a node's label before it reaches a neighbour on the same row. */
+  function roomBeside(n, p) {
+    const td = tfData(); if (!td) return Infinity;
+    let room = Infinity;
+    for (const o of td.nodes) {
+      if (o.id === n.id) continue;
+      const q = pos(o);
+      if (Math.abs(q.y - p.y) < S.layout.R * 2.5) room = Math.min(room, Math.abs(q.x - p.x) - S.layout.R - 10);
+    }
+    return room;
   }
   function drawBadge(g, n, btxt, bx, by, bw) {
     const bcol = { live: "rgba(34,211,138,0.16)", delayed: "rgba(242,184,75,0.18)", closed: "rgba(139,151,168,0.18)" }[n.status] || "rgba(255,77,109,0.18)";
@@ -489,7 +519,8 @@
 
   // read-only hooks for tests and the console (no effect on the page)
   window.__mfDebug = { nodePos: () => S.nodePos, layout: () => S.layout, tf: () => S.tf, motion: () => S.motion,
-    particles: () => S.particles.length, generated: () => S.data && S.data.generated_at };
+    particles: () => S.particles.length, generated: () => S.data && S.data.generated_at,
+    render: () => { S.lastPanel = 0; render(); }, frame: () => drawFrame() };   // for soak tests of the drawing code
 
   // ── boot ────────────────────────────────────────────────────────────────────────────
   let resizeTimer = null;

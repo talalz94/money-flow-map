@@ -21,7 +21,7 @@ import math
 from dataclasses import dataclass
 
 from . import clock
-from .series import G1_STEP, G5_STEP, Instrument, isnum
+from .series import G5_STEP, Instrument, isnum
 
 NaN = float("nan")
 TIMEFRAMES = ("1h", "today", "1w")

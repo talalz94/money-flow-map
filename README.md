@@ -381,6 +381,7 @@ The service listens on `http://127.0.0.1:8765` (localhost only). Everything is r
 | `GET /api/snapshot?tf=today` | Everything for one window (`1h`, `today`, `1w`), or `tf=all` for all three |
 | `GET /api/nodes?tf=1h` · `/api/nodes/{id}` | Assets (`bonds usd gold silver oil ndx spx ant btc eth stables`, aux: `vix_proxy hyg ief`) |
 | `GET /api/edges?tf=` · `/api/risk?tf=` · `/api/narrative?tf=` · `/api/tiles?tf=` | Parts of the read |
+| `GET /api/history/{id}?grid=5m&hours=24` | Stored closes of one series (5m: 35 days, 1m: 1 day), each `[step end time, close, market open 1/0]`, for drawing your own charts |
 | `GET /api/news?limit=30` · `/api/fed` · `/api/events` | Headlines, next FOMC decision, scheduled releases |
 | `GET /api/sources` · `/api/health` | Connector states and latency; process CPU/RAM, clock offset |
 | `GET /api/schema` | The JSON Schema (`moneyflow/schema/snapshot.schema.json`) |
@@ -405,6 +406,7 @@ for e in snap["edges"][:3]:
     print(e["from"], "->", e["to"], e["weight"])
 ```
 See `examples/client.py` (REST and `--stream`) and `examples/webhook_receiver.py`.
+`client.stream()` reconnects by itself (1 s doubling to 30 s) if the service restarts.
 
 ```js
 const ws = new WebSocket("ws://127.0.0.1:8765/ws?tf=today");
@@ -554,6 +556,9 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 - **Another app holds Alpaca's single stream:** the free plan allows one, and Alpaca refuses the second with code 406. The service waits 5 min between retries and meanwhile polls the latest IEX trades over REST every 20 s.
   - It waits for Alpaca's login answer before subscribing, so a refusal is never mistaken for bad keys.
   - Tested live: the bonds node stayed **live** through the REST fallback, at a data age of about 20 s.
+- **Finnhub also allows one stream per key.** A second copy of this service, or another app using the same key, takes the slot, and Finnhub refuses the first with HTTP 429 (seen live on 24 Nov 2026).
+  - Any websocket refused with 429 waits at least 2 minutes before retrying instead of hammering, and its status says why.
+  - **Run one copy at a time;** other apps should read this service's API rather than open their own Finnhub or Alpaca streams.
 - **Closing the window or Ctrl+C / Ctrl+Break:** a graceful stop that saves the history cache. Tested: exit code 0 in 1.2 s, cache written.
 - **History** is saved to `data/cache/` every 30 minutes and on exit.
 - **Tests:** `tests/test_reconnect.py` checks:

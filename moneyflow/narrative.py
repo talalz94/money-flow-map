@@ -161,6 +161,8 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
     if fed.get("days") is not None:
         d = fed["days"]
         when = fed.get("when_ny", "")
+        if fed.get("when_local") and fed.get("local_label"):
+            when += f" = {fed['when_local']} {fed['local_label']}"
         if d <= 2:
             add("fed_close", f"FOMC decision in {fed.get('countdown', f'{d:.1f} days')} ({when}): rate decisions can move "
                              "every asset on this map within minutes.", "warn")
