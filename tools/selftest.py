@@ -98,6 +98,10 @@ def main() -> int:
     print(f"      market now: US stocks {market['us_equities']}, FX {market['fx']}, VIX {market['vix']}")
 
     # ── nodes ───────────────────────────────────────────────────────────────────────────
+    just_started = (proc.get("uptime_s") or 1e9) < 300
+    if just_started:
+        print("      note: the service started under 5 minutes ago: a feed that has not ticked yet (e.g. a quiet"
+              " FX pair around 17:00 New York) is reported as a warning, not a failure")
     for tf, s in snaps.items():
         nodes = {n["id"]: n for n in s["nodes"]}
         for nid, n in nodes.items():
@@ -107,7 +111,8 @@ def main() -> int:
                 print(f"      note: {nid} is too new for the {tf} window (its history starts {n['history_from'][:10]})")
                 continue
             ok_status = stt in ("live", "delayed", "closed")
-            check(ok_status, f"{tf}: {nid} status", f"status={stt} age={n['age_s']}s", warn_only=stt == "warming_up")
+            check(ok_status, f"{tf}: {nid} status", f"status={stt} age={n['age_s']}s",
+                  warn_only=stt == "warming_up" or (stt == "stale" and just_started))
             if stt == "live":
                 limit = 120 if n["source"]["id"] in ("finnhub", "alpaca", "computed") else 30
                 check(n["age_s"] is not None and n["age_s"] < limit, f"{tf}: {nid} data fresh", f"age={n['age_s']}s")

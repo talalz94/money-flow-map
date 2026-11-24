@@ -94,7 +94,8 @@ enabled = true
 ws_url = "wss://ws-feed.exchange.coinbase.com"
 
 [connectors.hyperliquid]           # public: optional 24/7 fallback (HIP-3 index/commodity perps)
-enabled = false
+enabled = false                    # tested live 24 Nov 2026 (xyz:XYZ100 node); its history API gives at
+                                   # most 5,000 candles (~17 days of 5-minute data, enough for every σ)
 ws_url = "wss://api.hyperliquid.xyz/ws"
 rest_url = "https://api.hyperliquid.xyz/info"
 
