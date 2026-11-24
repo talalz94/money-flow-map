@@ -49,7 +49,10 @@ python -m moneyflow check        # measure every source's latency (with the serv
 ```
 
 What to expect:
-- **First start:** about 20-30 s to download 35 days of 5-minute history (measured: 22 s).
+- **First start:** about 20-30 s to download 35 days of 5-minute history (measured: 22 s, and 26 s on 25 Nov).
+  Binance's request budget is shared by every program on your internet connection. If others use
+  it in the same minute, the service pauses until the next minute rather than use more than half of
+  it, and the log says so (one first start next to a second copy took 81 s).
 - **Later starts:** about 7-25 s, because history is cached in `data/` and only the missing tail is downloaded (measured: 7-21 s).
 - **While loading:** nodes show **WARMING UP** until their volatility history is in.
 
@@ -76,7 +79,7 @@ Windows. Everything is in `requirements.txt`.
 | **DOLLAR · DXY** | The ICE Dollar Index formula, computed live from six FX pairs. |
 | **US 10Y YIELD** | FRED's daily close, with the date shown, plus the live TLT move as a hint. |
 | **BTC LEVERAGE** | Bitcoin perpetual funding (per year) and the change in open interest over the window. |
-| **Next Fed rate decision** | A countdown, shown in New York time and in your local time (Pakistan by default), plus the next high-impact releases. |
+| **Next Fed rate decision** | A countdown, shown in New York time and in your local time (this PC's time zone, or `local_timezone` in the config), plus the next high-impact releases. |
 | **What the flow says** | Rule-based sentences. Each sentence carries the id of the rule that produced it (hover to see it). |
 | **Strongest flows** | The top inferred edges with weight and correlation ρ. |
 | **News wire** | Headlines from several feeds, newest first. Each shows its source and how long ago it was published. |
@@ -172,6 +175,8 @@ Each component is in σ units, clipped to ±4. Weights are in the config (`[risk
   - `B` is a cap-weighted basket of live Binance prices (BTC, ETH, BNB, SOL, XRP).
   - The share moves **mechanically** when crypto prices fall, even with no new money. So the hover and narrative also show the **supply change** (mints − burns), which is the real "new cash" signal.
 - **US Bonds (TLT).** A *stitched* series. While US markets are open it uses TLT on IEX. Outside them it uses the TMF perpetual's index ÷ 3 (TMF is 3× TLT). At the open it snaps back to the real price, so the opening gap is real.
+  - **Without an Alpaca key** there is no live TLT. The service then downloads TLT's 5-minute (60 days) and 1-minute (2 days) bars from Yahoo's chart API at start-up, so the proxy is anchored on TLT's real last close. From then on the node follows TMF ÷ 3 around the clock, and the hover says so.
+  - The 1-minute series (one day) and the 5-minute series (35 days) are kept consistent: the 1-minute chain starts from the 5-minute value at a 5-minute boundary, and a gap in the proxy's data never drops its move.
 - **Anthropic (ANT).** Anthropic listed on Nasdaq in November 2026. The node uses Binance's 24/7 ANT perpetual, with the IEX quote as a reference. Its σ starts on the realized-variance fallback because its history is short.
 
 ### 3.7 "What the flow says"
@@ -296,7 +301,7 @@ Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON
 | **Binance futures, legacy `/stream` path** | Connects but **delivers nothing** (Nov 2026). `/market/stream` (and `/public/stream` for book data) work. |
 | **Hyperliquid HIP-3** `xyz:DXY`, `xyz:VIX` | Listed but **zero volume and open interest**: frozen prices. The index perps (`xyz:XYZ100`, `xyz:SP500`) are liquid. The connector is included as an optional fallback, off by default. |
 | **VIX real-time** | The index is licensed. Every free quote found (Cboe, Yahoo) is 15 min delayed. The tile shows the delayed level, labelled with its age, and the live UVXY perpetual as the real-time direction. |
-| **Yahoo streaming** | Unofficial. FX about 1 s (Finnhub is 3-4× faster). Not used for live prices; the chart API is used only for DXY history and a second delayed VIX quote. |
+| **Yahoo streaming** | Unofficial. FX about 1 s (Finnhub is 3-4× faster). Not used for live prices; the chart API is used only for history (DXY, and TLT/HYG/IEF when there is no Alpaca key) and a second delayed VIX quote. |
 | **JBlanked** (key present) | Every calendar endpoint answers **HTTP 401 "requires credits"** with this key. Not used. |
 | **Finnhub** economic calendar and FX candles | HTTP 403 on the free plan. |
 | **Spot BTC/ETH ETF flows** | Farside's pages answered this program's HTTP client with a **Cloudflare bot challenge** (403). Bot checks are respected, not worked around, so the connector is off. DefiLlama's ETF routes are 404; SoSoValue needs a key; CoinGlass is paid. No ETF flows by default. |
@@ -319,7 +324,7 @@ Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON
 - **CoinGecko public API:** 5-30 calls/min. Uses 1 per 5 min. Attribution: "Data provided by CoinGecko".
 - **DefiLlama:** free, no key. Uses 1 call per hour, plus history twice a day.
 - **FRED:** 120 calls/min per key. Uses 3 calls per 6 h.
-- **Cboe delayed quotes and Yahoo:** delayed data for personal use. Yahoo's API is unofficial, so it is used sparingly: VIX once a minute while VIX is calculated, DXY history at start.
+- **Cboe delayed quotes and Yahoo:** delayed data for personal use. Yahoo's API is unofficial, so it is used sparingly: VIX once a minute while VIX is calculated, DXY history at start, and (only without an Alpaca key) two history requests per ETF at start.
 - **federalreserve.gov:** public domain. Polled once a day.
 - **Forex Factory weekly export:** polled every 2 h.
 - **RSS:** publishers' public feeds. Each is polled every 3 min with ETag / If-Modified-Since. Headlines link back to the publisher.
@@ -332,7 +337,7 @@ Keys are optional; each one unlocks one source:
 
 | Key | Unlocks | Without it |
 |---|---|---|
-| `ALPACA_KEY_ID`, `ALPACA_SECRET` | TLT/HYG/IEF and the ETF reference quotes; the real-time news stream | Bonds come only from the TMF proxy; credit drops out of the risk meter |
+| `ALPACA_KEY_ID`, `ALPACA_SECRET` | TLT/HYG/IEF and the ETF reference quotes; the real-time news stream | Bonds follow the TMF proxy around the clock, anchored on TLT's real close (Yahoo history at start-up); credit drops out of the risk meter |
 | `FINNHUB_KEY` | the live DXY, Finnhub news | No dollar node |
 | `FRED_API_KEY` | the 10Y yield tile and curve | No 10Y tile |
 
@@ -665,13 +670,16 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - memory flat over hundreds of forced re-renders;
   - 0.9% of one core at the full 30 fps.
 - **Fixed in this round:**
-  - **TODAY's σ read 0 for ~5 minutes after every daily roll** (17:00 New York, 03:00 Pakistan), blanking the z-scores. It was found by replaying a real roll from the history cache;
+  - **TODAY's σ read 0 for ~5 minutes after every daily roll** (17:00 New York, 22:00 UTC in winter), blanking the z-scores. It was found by replaying a real roll from the history cache;
   - **quiet markets would have caused reconnect storms:** IEX is silent overnight and at weekends, and FX from Friday to Sunday, so the streams would have reconnected every 2-10 minutes. While their market is closed the silence limit is now an hour, and the heartbeat still checks the link. Finnhub pings every 60 s, measured;
   - the dashboard now says when a token is missing or wrong, instead of "stream lost";
   - Finnhub (one stream per key) refused a second copy with HTTP 429 and the service retried every few seconds; 429 refusals now wait ≥ 2 min;
   - the Host check was case-sensitive;
   - `client.stream()` now reconnects after a restart;
-  - labels and badges now make room for same-row neighbours on tablets.
+  - labels and badges now make room for same-row neighbours on tablets;
+  - **bonds' TODAY move differed by 0.1% between two copies of the service.** Found by running one with keys and one without, side by side. The one-day 1-minute bonds series restarted from TLT's raw close at the start of its window, dropping the proxy's moves since the close. It now starts from the 5-minute series, at a 5-minute boundary where the proxy's own close is known, and a gap in the proxy's data no longer drops a move. The two series now agree within 0.0002% outside US hours (in US hours both are TLT's real bars);
+  - **without an Alpaca key the bonds node was blank.** It now takes TLT's history from Yahoo's chart API and follows the TMF proxy from TLT's real close. With and without keys, the TODAY baselines agreed within 0.013% and the moves within 0.007 points;
+  - **...and in US hours it would have stayed frozen at that close.** A price carried forward from history counted as "trading" during market hours, so the bonds series kept TLT's old close instead of following its proxy. A carried price now counts as trading only once live data has arrived.
 
 **Verification pass on 24 Nov 2026, during US hours.**
 

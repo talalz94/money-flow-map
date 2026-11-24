@@ -1,6 +1,8 @@
 """Engine behaviour that needs no network: statuses, staleness limits, closed markets, history retry."""
 import asyncio
 
+import pytest
+
 from conftest import ny_ts
 from moneyflow import clock
 from moneyflow.engine import Engine
@@ -77,6 +79,48 @@ def test_stablecoin_share_anchors_even_when_cached_data_arrives_before_prices(cf
     eng.tick(now)
     assert share.inst.anchor_px and 13.0 < share.inst.price < 14.5   # 285B / 2.08T = 13.7%
     assert eng.status_of(share, now) == "live"
+
+
+def test_keyless_bonds_follow_the_proxy_from_tlts_real_close(cfg, monkeypatch, tmp_path):
+    """No Alpaca key: TLT's history comes from Yahoo's chart. The bonds node anchors on TLT's real
+    last bar and follows TMF / 3 through the US session (it once sat frozen at that bar all session),
+    and the Yahoo prices never count as live TLT."""
+    from moneyflow.connectors import binance as bn, pollers
+    from moneyflow.keys import KeyStore
+    start = ny_ts(2026, 11, 24, 10, 0)                     # Tuesday, US session open
+    eng = engine_at(cfg, KeyStore(), start)
+    eng.cache_dir = tmp_path
+    eng.connectors = {}
+
+    async def klines(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        step = 300 if interval == "5m" else 60
+        t1 = int(end_ms / 1000) // step * step
+        return [(t, 30.0 if symbol == "TMFUSDT" else 100.0, 1.0, 0.5) for t in range(t1 - 500 * step, t1, step)]
+
+    asked = []
+
+    async def chart(session, symbol, interval="5m", rng="60d"):
+        asked.append((symbol, interval, rng))
+        if symbol != "TLT":
+            return []
+        bars = range(int(start) - 1800, int(start), 60 if interval == "1m" else G5_STEP)   # 9:30 on
+        return [(t, 82.0 if t == bars[-1] else 81.0) for t in bars]                         # last close 82
+
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    asyncio.run(eng.seed_history())
+    tlt, tmf, bonds = eng.instruments["alpaca:TLT"], eng.instruments["binance_fut:TMFUSDT"], eng.series["bonds"]
+    assert ("TLT", "5m", "60d") in asked and ("TLT", "1m", "2d") in asked
+    assert tlt.extra["history_source"] == "Yahoo chart (no Alpaca key)"
+    assert bonds.inst.g1.asof(start) == bonds.inst.g5.asof(start) == 82.0   # both grids: TLT's last bar
+    for m in range(1, 31):                                 # 30 minutes: TMF (3x TLT) climbs 3%
+        t = start + 60 * m
+        tmf.on_price(30.0 * (1 + 0.001 * m), t - 0.5, t - 0.4)
+        eng.tick(t)
+    t_end = start + 1800
+    assert not tlt.live_seen and not bonds.inst.primary_live(t_end)
+    assert bonds.inst.price == pytest.approx(82.0 * 1.03 ** (1 / 3), rel=2e-4)   # +1%, not frozen at 82.0
+    assert bonds.inst.active_source(t_end) is tmf
 
 
 def test_history_retries_until_complete(cfg, keys, monkeypatch, tmp_path):

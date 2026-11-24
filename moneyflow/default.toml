@@ -129,7 +129,8 @@ interval_s = 7200
 enabled = false
 interval_s = 7200
 
-[connectors.yahoo]                 # unofficial chart API (personal use): DXY history at start-up,
+[connectors.yahoo]                 # unofficial chart API (personal use): DXY history at start-up (and
+                                   # TLT/HYG/IEF history when there is no Alpaca key),
 enabled = true                     # and a second 15-min-delayed VIX quote that follows Cboe's overnight
 vix_quote = true                   # session (Cboe's own delayed JSON shows the prior close until 09:30)
 

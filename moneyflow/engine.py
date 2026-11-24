@@ -344,6 +344,28 @@ class Engine:
         async def alpaca_all():
             conn = self.connectors.get("alpaca")
             if conn is None or not alp_insts or not conn.available()[0]:
+                # No Alpaca (no key, or switched off): take the same ETFs' history from Yahoo's chart
+                # API instead, so the bonds node can anchor on TLT's real last close and stay live
+                # through its 24/7 proxy. These prices are history only and never shown as live.
+                if alp_insts and cfgmod.connector_enabled(self.cfg, "yahoo"):
+                    for i in alp_insts:
+                        # Always ask (one small request per ETF): the cache's newest step can be a
+                        # carried price, which says nothing about the sessions since. Five days of
+                        # bars cover a recent cache; otherwise take the full 60.
+                        last = history.last_good_ts(i)
+                        rng = "5d" if last and now - last < 4 * 86400 else "60d"
+                        try:
+                            rows = await pollers.yahoo_chart(self.ctx.session, i.symbol, "5m", rng)
+                            if rows:
+                                i.seed("g5", rows, rows[-1][0] + 300)
+                                i.extra["history_source"] = "Yahoo chart (no Alpaca key)"
+                            # 1-minute bars too (two sessions cover the 1-day grid): without them the
+                            # 1-minute bonds series fills US hours from the proxy, 0.03% off the real TLT
+                            rows1 = await pollers.yahoo_chart(self.ctx.session, i.symbol, "1m", "2d")
+                            if rows1:
+                                i.seed("g1", rows1, rows1[-1][0] + 60)
+                        except Exception as e:  # noqa: BLE001
+                            st["errors"].append(f"yahoo {i.symbol}: {e}"[:200])
                 st["done"] += len(alp_insts)
                 return
             try:

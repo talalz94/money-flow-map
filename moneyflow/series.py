@@ -215,15 +215,20 @@ class Instrument:
         if k1_now <= self._k1:
             return
         p = self.price
+        # A carried price counts as trading only once live data has arrived this session. Carrying a
+        # cached or downloaded close through market hours (TLT without an Alpaca key) is not trading:
+        # flagged live, it froze the bonds node at that close for the whole US session instead of
+        # letting it follow its 24/7 proxy.
+        traded = self._live_seen
         start = max(self._k1, k1_now - G1_SIZE)
         for k in range(start, k1_now):
             t_end = (k + 1) * G1_STEP
-            self.g1.put(k, p, clock.market_open(self.hours, t_end - 1))
+            self.g1.put(k, p, traded and clock.market_open(self.hours, t_end - 1))
         k5_now = int(now // G5_STEP)
         if k5_now > self._k5:
             for k in range(max(self._k5, k5_now - G5_SIZE), k5_now):
                 t_end = (k + 1) * G5_STEP
-                self.g5.put(k, p, clock.market_open(self.hours, t_end - 1))
+                self.g5.put(k, p, traded and clock.market_open(self.hours, t_end - 1))
                 if self.v5 is not None:
                     self._close_volume(k)
             self._k5 = k5_now
@@ -254,8 +259,8 @@ class Instrument:
                     tb_known = False
         if seen:
             self.v5.put(k5, q, tb if tb_known else NaN)
-        elif clock.market_open(self.hours, (k5 + 1) * G5_STEP - 1):
-            self.v5.put(k5, 0.0, 0.0)
+        elif self._live_seen and clock.market_open(self.hours, (k5 + 1) * G5_STEP - 1):
+            self.v5.put(k5, 0.0, 0.0)       # a quiet step on a live feed (no feed: unknown, not zero)
         # drop anything older than this step (late messages)
         for d in (self._vol_min, self._vol_acc):
             for m in [m for m in d if m < m0]:
@@ -322,17 +327,17 @@ class Derived(Instrument):
         """Recompute the live value and close finished steps from the inputs' grids."""
         k1_now = int(now // G1_STEP)
         if self._k1 is not None and k1_now > self._k1:
-            for k in range(max(self._k1, k1_now - G1_SIZE), k1_now):
-                v = self.value_step("g1", k)
-                if isnum(v):
-                    self.g1.put(k, v, clock.market_open(self.hours, (k + 1) * G1_STEP - 1))
             k5_now = int(now // G5_STEP)
-            if k5_now > self._k5:
+            if k5_now > self._k5:            # 5-minute steps first: a Stitched 1-minute chain anchors on them
                 for k in range(max(self._k5, k5_now - G5_SIZE), k5_now):
                     v = self.value_step("g5", k)
                     if isnum(v):
                         self.g5.put(k, v, clock.market_open(self.hours, (k + 1) * G5_STEP - 1))
                 self._k5 = k5_now
+            for k in range(max(self._k1, k1_now - G1_SIZE), k1_now):
+                v = self.value_step("g1", k)
+                if isnum(v):
+                    self.g1.put(k, v, clock.market_open(self.hours, (k + 1) * G1_STEP - 1))
         if self._k1 is None or k1_now > self._k1:
             self._k1, self._k5 = k1_now, int(now // G5_STEP)
         v = self.value_live(now)
@@ -344,8 +349,10 @@ class Derived(Instrument):
             self.recv_ts = max(rts) if rts else now
 
     def rebuild(self, until: float) -> None:
-        """Recompute both grids from the inputs' grids (after history was seeded)."""
-        for gname, g in (("g1", self.g1), ("g5", self.g5)):
+        """Recompute both grids from the inputs' grids (after history was seeded). The 35-day 5-minute
+        grid goes first: series that chain from step to step (Stitched) anchor the 1-day 1-minute
+        grid on it, so the two grids agree."""
+        for gname, g in (("g5", self.g5), ("g1", self.g1)):
             firsts = [getattr(i, gname).first_k() for i in self.inputs if getattr(i, gname).last_k is not None]
             if not firsts:
                 continue
@@ -527,11 +534,23 @@ class Stitched(Derived):
         if gp.is_live(k) and isnum(p):
             return p
         prev = g.get(k - 1)
+        if not isnum(prev) and grid == "g1" and isnum(self.g5.asof(k * gp.step, max_back=3)):
+            # Start of the 1-minute chain (it spans only a day): begin where a 5-minute step ends and
+            # the proxy's own 1-minute close is known, at the 5-minute stitched value there, which
+            # already carries every proxy move since the primary's last session. Starting from the
+            # previous 5-minute close instead dropped the proxy's moves until its 1-minute bars began
+            # (0.04% off, seen live).
+            end = (k + 1) * gp.step
+            return self.g5.get(end // G5_STEP - 1) if end % G5_STEP == 0 and isnum(gx.get(k)) else NaN
         if not isnum(prev):
             prev = gp.get(k - 1) if isnum(gp.get(k - 1)) else gp.asof((k) * gp.step, max_back=600)
-        x1, x0 = gx.get(k), gx.get(k - 1)
-        if isnum(prev) and isnum(x1) and isnum(x0) and x0 > 0:
-            return prev * (1.0 + (x1 / x0 - 1.0) / self.beta)
+        x1 = gx.get(k)
+        if isnum(prev) and isnum(x1):
+            # the move since the proxy's LAST KNOWN close: a gap in its data must not drop a move,
+            # which would leave the series off by it for good
+            x0 = gx.asof(k * gx.step, max_back=gx.size)
+            if isnum(x0) and x0 > 0:
+                return prev * (1.0 + (x1 / x0 - 1.0) / self.beta)
         return prev
 
     def value_live(self, now: float) -> float:

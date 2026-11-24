@@ -12,6 +12,7 @@ connection, connections recycled by Binance every 24 h (handled by the reconnect
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from collections import deque
@@ -20,6 +21,8 @@ import aiohttp
 
 from .. import jsonutil
 from .base import PollConnector, StreamConnector
+
+log = logging.getLogger(__name__)
 
 SPOT_REST = "https://api.binance.com"
 FUT_REST = "https://fapi.binance.com"
@@ -37,7 +40,11 @@ class WeightGate:
     async def wait(self) -> None:
         async with self.lock:
             if self.used >= self.limit * 0.5 and time.time() - self.at < 60:
-                await asyncio.sleep(max(1.0, 61 - (time.time() % 60)))
+                pause = max(1.0, 61 - (time.time() % 60))
+                # the budget is per IP address, so other programs on this PC count too
+                log.info("Binance request budget half used this minute (%d of %d): pausing %.0f s",
+                         self.used, self.limit, pause)
+                await asyncio.sleep(pause)
                 self.used = 0
 
     def update(self, headers) -> None:
@@ -74,7 +81,9 @@ async def fetch_klines(session, market: str, symbol: str, interval: str, start_m
     if market == "spot":
         base, path, lim, gate = SPOT_REST, "/api/v3/klines", 1000, SPOT_GATE
     else:
-        base, gate, lim = FUT_REST, FUT_GATE, 1500
+        # 1000 bars cost weight 5 and 1500 cost 10 (measured): a third cheaper per bar, so a first
+        # start (35 days for every perp) stays clear of the gate's half-budget pause
+        base, gate, lim = FUT_REST, FUT_GATE, 1000
         path = "/fapi/v1/indexPriceKlines" if price == "index" else "/fapi/v1/klines"
     step_ms = {"1m": 60_000, "5m": 300_000, "1h": 3_600_000}[interval]
     out = []

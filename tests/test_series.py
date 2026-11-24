@@ -69,6 +69,26 @@ def test_us_regular_instrument_ignores_extended_hours_prints():
     assert inst.price == 81.0
 
 
+def test_carried_price_is_not_trading_until_live_data_arrives():
+    """A downloaded close carried through market hours is not trading. Only live data makes a session
+    step count as traded; otherwise the bonds node sat frozen at TLT's close all session without a key."""
+    inst = Instrument("alpaca:TLT", "alpaca", "TLT", "us_regular", volume=True)
+    t0 = ny_ts(2026, 11, 24, 10, 0)
+    inst.seed("g5", [(t0 - 600, 80.0), (t0 - 300, 80.5)], t0)
+    assert inst.g5.is_live(int((t0 - 300) // G5_STEP))            # real bars keep their flags
+    inst.roll(t0 + 1)                                             # starts the step clock
+    inst.roll(t0 + 1801)                                          # 30 session minutes, no live message
+    k = int((t0 + 600) // G5_STEP)
+    assert inst.g5.get(k) == 80.5 and not inst.g5.is_live(k)
+    assert not inst.g1.is_live(int((t0 + 600) // G1_STEP))
+    assert math.isnan(inst.v5.get(k)[0])                          # volume unknown, not zero (no RVOL 0)
+    inst.on_price(81.0, t0 + 1810, t0 + 1810)                     # the first live trade
+    inst.roll(t0 + 2101)
+    k_live = int((t0 + 1800) // G5_STEP)
+    assert inst.g5.get(k_live) == 81.0 and inst.g5.is_live(k_live)
+    assert inst.v5.get(k_live) == (0.0, 0.0)                      # a quiet step on a live feed
+
+
 def test_seed_fills_with_carry_forward_and_market_flags():
     inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")
     start = ny_ts(2026, 11, 23, 15, 50)
@@ -108,6 +128,34 @@ def test_stablecoin_share_moves_with_the_basket():
     assert s.value_live(0) == pytest.approx(10.0)                 # 100 / 1000
     b["BTC"].price, b["ETH"].price = 90.0, 9.0                    # basket -10%
     assert s.value_live(0) == pytest.approx(100 / (100 + 900 * 0.9) * 100)
+
+
+def test_stitched_one_minute_and_five_minute_grids_agree():
+    """The 1-minute grid spans only a day: when it starts after the primary's last session, its chain
+    must continue from the 5-minute series (which includes the proxy's moves since the close), and
+    no proxy move may be dropped where the proxy's 1-minute bars begin or have a hole. Each of these
+    once left the bonds series off for good (0.1%, 0.04%, 0.012%), skewing TODAY's bond move."""
+    close = ny_ts(2026, 11, 23, 16, 0)
+    now = close + 86400 + 2040                 # the next day, 16:34 New York
+    prim = Instrument("alpaca:TLT", "alpaca", "TLT", "us_regular")
+    prox = Instrument("bf:TMF", "bf", "TMF", "24/7")
+    k5_open, k5_now = int(ny_ts(2026, 11, 23, 9, 30) // G5_STEP), int(now // G5_STEP)
+    prim.seed("g5", [(k * G5_STEP, 80.0) for k in range(k5_open, int(close // G5_STEP))], close)
+    prim.seed("g1", [(k * 60, 80.0) for k in range(int(close // 60) - 390, int(close // 60))], close)
+    # the proxy rises 0.3% an hour, every hour, so the stitched series rises 0.1% an hour after the close
+    px = lambda t: 30.0 * math.exp(0.003 * (t - close) / 3600) if t > close else 30.0
+    prox.seed("g5", [(k * G5_STEP, px((k + 1) * G5_STEP)) for k in range(k5_open, k5_now)], now)
+    # as the engine downloads them, the proxy's 1-minute bars begin a minute into the grid's day
+    # (at 16:35, right after a 5-minute boundary) ...
+    prox.seed("g1", [(k * 60, px((k + 1) * 60)) for k in range(int(now // 60) - 1439, int(now // 60))], now)
+    prox.g1.put(int((close + 3000) // 60), NaN, True)                 # ... and the 16:50 bar is missing
+    st = Stitched("s", prim, prox, beta=3.0)
+    st.rebuild(now)
+    t_check = close + 3600                                            # 17:00, inside the 1-minute day
+    a, b = st.g1.asof(t_check), st.g5.asof(t_check)
+    assert a == a and b == b
+    assert a == pytest.approx(b, rel=1e-6)                            # the grids agree
+    assert a == pytest.approx(80.0 * math.exp(0.001), rel=1e-6)      # an hour after the close at 0.1%/h
 
 
 def test_stitched_uses_primary_when_open_and_scaled_proxy_otherwise():
