@@ -1,0 +1,9 @@
+# Runtime (the only hard dependency): websockets, HTTP client and the local server in one library.
+aiohttp>=3.9
+# Optional, used automatically when installed:
+orjson>=3.9        # faster JSON
+psutil>=5.9        # CPU/RAM figures in /api/health and tools/measure_resources.py
+tzdata>=2024.1     # time-zone data for Windows (New York / Pakistan clocks)
+# Tests only:
+pytest>=8
+jsonschema>=4

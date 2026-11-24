@@ -1,0 +1,210 @@
+"""Alpaca market data, free "Basic" plan (ALPACA_KEY_ID / ALPACA_SECRET; data only, no orders).
+
+IEX real-time stream: trades for every configured symbol, bid/ask for a few thin ones (mid price).
+IEX is one exchange (~2-3% of US volume), so prices are real-time but volume is a SAMPLE.
+News stream (v1beta1/news): real-time headlines.
+History: 5-minute and 1-minute IEX bars over REST (the free SIP feed has a 15-minute embargo).
+The free plan allows one connection per stream; if Alpaca refuses it (code 406, e.g. another app
+holds it), the connector waits and retries every few minutes, and prices fall back to REST polls
+of the latest IEX trade every 20 s meanwhile.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import math
+
+from .. import clock, jsonutil
+from .base import PollConnector, StreamConnector
+
+
+def _hdr(keys) -> dict:
+    return {"APCA-API-KEY-ID": keys.get("ALPACA_KEY_ID") or "", "APCA-API-SECRET-KEY": keys.get("ALPACA_SECRET") or ""}
+
+
+async def fetch_bars(conn, symbols: list[str], timeframe: str, start: float, end: float | None = None,
+                     feed: str = "iex") -> dict[str, list[tuple]]:
+    """-> {symbol: [(bar_start_ts, close, quote_volume)]} via the multi-symbol bars endpoint."""
+    url = f"{conn.cfg.get('rest_url', 'https://data.alpaca.markets')}/v2/stocks/bars"
+    params = {"symbols": ",".join(symbols), "timeframe": timeframe, "limit": 10000, "feed": feed,
+              "start": dt.datetime.fromtimestamp(start, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+              "adjustment": "raw"}
+    if end:
+        params["end"] = dt.datetime.fromtimestamp(end, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    out: dict[str, list] = {s: [] for s in symbols}
+    token = None
+    for _ in range(60):
+        if token:
+            params["page_token"] = token
+        j = await conn.get_json(url, params=params, headers=_hdr(conn.keys), timeout=60)
+        for sym, bars in (j.get("bars") or {}).items():
+            for b in bars:
+                vw = b.get("vw") or b.get("c")
+                out.setdefault(sym, []).append((clock.parse_iso(b["t"]), float(b["c"]), float(b.get("v", 0)) * float(vw)))
+        token = j.get("next_page_token")
+        if not token:
+            break
+    for s in out:
+        out[s].sort()
+    return out
+
+
+class AlpacaStream(StreamConnector):
+    name = "alpaca"
+    title = "Alpaca IEX (real-time)"
+    idle_timeout = 600.0      # quiet outside US hours; heartbeat pings keep the socket checked
+    heartbeat = 25.0
+
+    def __init__(self, ctx, cfg):
+        super().__init__(ctx, cfg)
+        self.subs: dict[str, object] = {}        # symbol -> Instrument
+        self.quote_syms = {s.upper() for s in cfg.get("quote_symbols", [])}
+        self.refused_until = 0.0
+        self.auth_failed = False
+
+    def add(self, symbol: str, inst) -> None:
+        self.subs[symbol.upper()] = inst
+
+    def available(self):
+        if not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"):
+            return False, "no ALPACA_KEY_ID / ALPACA_SECRET"
+        return (bool(self.subs), "no symbols")
+
+    def url(self):
+        return self.cfg.get("ws_url", "wss://stream.data.alpaca.markets/v2/iex")
+
+    def retry_delay(self):
+        if self.auth_failed:
+            return 3600.0
+        if self.now() < self.refused_until:
+            return max(60.0, self.refused_until - self.now())
+        return super().retry_delay()
+
+    async def on_open(self, ws):
+        await ws.send_str(jsonutil.dumps({"action": "auth", "key": self.keys.get("ALPACA_KEY_ID"),
+                                          "secret": self.keys.get("ALPACA_SECRET")}))
+        syms = sorted(self.subs)
+        await ws.send_str(jsonutil.dumps({"action": "subscribe", "trades": syms,
+                                          "quotes": sorted(self.quote_syms & set(syms))}))
+
+    def on_text(self, data, recv):
+        for m in jsonutil.loads(data):
+            T = m.get("T")
+            if T == "t":
+                inst = self.subs.get(m["S"])
+                if inst is None:
+                    continue
+                ts = clock.parse_iso(m["t"])
+                p, size = float(m["p"]), float(m.get("s", 0))
+                inst.extra["last_trade"] = p
+                inst.on_trade_volume(ts, p * size)
+                if m["S"] not in self.quote_syms or not self._mid_ok(inst):
+                    inst.on_price(p, ts, recv)
+                else:
+                    inst.note_message(recv, ts)
+            elif T == "q":
+                inst = self.subs.get(m["S"])
+                if inst is None:
+                    continue
+                bp, ap = float(m.get("bp") or 0), float(m.get("ap") or 0)
+                inst.extra["bid"], inst.extra["ask"] = bp, ap
+                if self._mid_ok(inst):
+                    inst.on_price((bp + ap) / 2.0, clock.parse_iso(m["t"]), recv)
+            elif T == "error":
+                code, msg = m.get("code"), m.get("msg")
+                self.error(f"Alpaca error {code}: {msg}")
+                if code == 406:          # connection limit exceeded (another app holds the stream)
+                    self.refused_until = self.now() + 300
+                    self.health.detail = "stream refused: connection limit (another app?) - REST fallback"
+                if code in (401, 402):   # auth failed / not authenticated
+                    self.auth_failed = True
+            elif T == "success" and m.get("msg") == "authenticated":
+                self.health.detail = "authenticated"
+
+    @staticmethod
+    def _mid_ok(inst) -> bool:
+        b, a = inst.extra.get("bid", 0), inst.extra.get("ask", 0)
+        return b > 0 and a > 0 and a >= b and (a - b) / ((a + b) / 2) < 0.002
+
+
+class AlpacaNews(StreamConnector):
+    name = "alpaca_news"
+    title = "Alpaca news (real-time)"
+    idle_timeout = 900.0
+    heartbeat = 25.0
+
+    def available(self):
+        if not self.cfg.get("news", True):
+            return False, "news disabled"
+        if not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"):
+            return False, "no ALPACA_KEY_ID / ALPACA_SECRET"
+        return True, ""
+
+    def url(self):
+        return self.cfg.get("news_ws_url", "wss://stream.data.alpaca.markets/v1beta1/news")
+
+    async def on_open(self, ws):
+        await ws.send_str(jsonutil.dumps({"action": "auth", "key": self.keys.get("ALPACA_KEY_ID"),
+                                          "secret": self.keys.get("ALPACA_SECRET")}))
+        await ws.send_str(jsonutil.dumps({"action": "subscribe", "news": ["*"]}))
+
+    # The stream carries every company press release (measured: ~2 a second at the US open, mostly
+    # micro-caps). Only items about the map's tickers or macro themes reach the news wire.
+    MACRO_TAGS = {"FED", "MACRO", "BONDS", "USD", "OIL", "GOLD", "BTC", "ETH", "STABLE", "ANT", "ETF"}
+
+    def on_text(self, data, recv):
+        from ..news import tags_for
+        items = []
+        watch = self.engine.watch_symbols()
+        for m in jsonutil.loads(data):
+            if m.get("T") == "n" and m.get("headline"):
+                head = m["headline"].strip()
+                if not (set(m.get("symbols") or []) & watch) and not (set(tags_for(head)) & self.MACRO_TAGS):
+                    self.health.detail = "filtering company press releases"
+                    continue
+                items.append({"title": head, "url": m.get("url") or "",
+                              "ts": clock.parse_iso(m.get("created_at") or m.get("updated_at")),
+                              "source": f"{m.get('source') or 'Alpaca'} (via Alpaca)"})
+            elif m.get("T") == "error":
+                self.error(f"Alpaca news error {m.get('code')}: {m.get('msg')}")
+        if items:
+            self.engine.on_news(items)
+
+
+class AlpacaFallback(PollConnector):
+    """REST latest-trade polling, active only while the stream is down or refused."""
+    name = "alpaca_rest"
+    title = "Alpaca IEX (REST fallback)"
+    interval = 20.0
+
+    def __init__(self, ctx, cfg, stream: AlpacaStream):
+        super().__init__(ctx, cfg)
+        self.stream = stream
+        self.interval = 20.0
+
+    def available(self):
+        return self.stream.available()
+
+    async def poll(self):
+        if self.stream.health.state == "connected" and self.stream.ws is not None:
+            self.health.detail = "standby (stream connected)"
+            return
+        if not any(clock.market_open(i.hours, self.now()) for i in self.stream.subs.values()):
+            self.health.detail = "standby (US market closed)"
+            return
+        url = f"{self.cfg.get('rest_url', 'https://data.alpaca.markets')}/v2/stocks/trades/latest"
+        j = await self.get_json(url, params={"symbols": ",".join(sorted(self.stream.subs)),
+                                             "feed": self.cfg.get("feed", "iex")}, headers=_hdr(self.keys))
+        recv = self.now()
+        for sym, t in (j.get("trades") or {}).items():
+            inst = self.stream.subs.get(sym)
+            if inst is not None and t.get("p"):
+                inst.on_price(float(t["p"]), clock.parse_iso(t["t"]), recv)
+        self.health.mark_msg(recv)
+        self.health.detail = "polling (stream down)"
+
+    def next_interval(self):
+        return 20.0 if self.stream.health.state != "connected" else 60.0
+
+
+def nan_to_none(x):
+    return None if x is None or (isinstance(x, float) and math.isnan(x)) else x

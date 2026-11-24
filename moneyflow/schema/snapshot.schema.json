@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "moneyflow.snapshot/1",
+  "title": "moneyflow snapshot (one timeframe)",
+  "description": "Returned by GET /api/snapshot?tf=1h|today|1w and pushed over /ws and /sse. With tf=all the per-timeframe fields (timeframe, label, window, nodes, aux, edges, risk, narrative, tiles) are nested under `timeframes.<tf>` instead (see $defs.all). A heuristic read, not a fact.",
+  "type": "object",
+  "required": ["schema", "version", "generated_at", "generated_ts", "timeframe", "window", "nodes", "edges", "risk", "narrative", "tiles", "market", "sources", "meta"],
+  "properties": {
+    "schema": {"const": "moneyflow.snapshot/1"},
+    "version": {"type": "string"},
+    "generated_at": {"type": "string", "description": "UTC ISO-8601, from the NTP-corrected clock"},
+    "generated_ts": {"type": "number", "description": "epoch seconds"},
+    "default_timeframe": {"enum": ["1h", "today", "1w"]},
+    "timeframe": {"enum": ["1h", "today", "1w"]},
+    "label": {"type": "string"},
+    "window": {"$ref": "#/$defs/window"},
+    "nodes": {"type": "array", "items": {"$ref": "#/$defs/series"}, "description": "assets drawn on the map"},
+    "aux": {"type": "array", "items": {"$ref": "#/$defs/series"}, "description": "auxiliary inputs (VIX proxy, HYG, IEF)"},
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}},
+    "risk": {"$ref": "#/$defs/risk"},
+    "narrative": {"type": "array", "items": {"$ref": "#/$defs/bullet"}},
+    "tiles": {"type": "object"},
+    "fed": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/fed"}]},
+    "events": {"type": "array", "items": {"type": "object"}},
+    "news": {"type": "array", "items": {"$ref": "#/$defs/news"}},
+    "news_version": {"type": "integer"},
+    "market": {"type": "object", "properties": {
+      "us_equities": {"enum": ["regular", "pre", "post", "closed"]},
+      "fx": {"enum": ["open", "closed"]}, "crypto": {"const": "open"}, "vix": {"type": "string"}}},
+    "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+    "meta": {"type": "object", "required": ["heuristic", "disclaimer", "clock"], "properties": {
+      "heuristic": {"const": true}, "disclaimer": {"type": "string"}, "clock": {"type": "object"}}}
+  },
+  "$defs": {
+    "num": {"type": ["number", "null"]},
+    "window": {"type": "object", "required": ["start", "end", "label"], "properties": {
+      "start": {"type": "string"}, "end": {"type": "string"}, "label": {"type": "string"}}},
+    "series": {
+      "type": "object",
+      "required": ["id", "label", "short", "node", "price", "change_pct", "z", "status", "age_s", "source"],
+      "properties": {
+        "id": {"type": "string"}, "label": {"type": "string"}, "short": {"type": "string"}, "group": {"type": "string"},
+        "node": {"type": "boolean"}, "x": {"$ref": "#/$defs/num"}, "y": {"$ref": "#/$defs/num"},
+        "price": {"$ref": "#/$defs/num"}, "ref_price": {"$ref": "#/$defs/num"},
+        "change_pct": {"$ref": "#/$defs/num", "description": "percent change over the window"},
+        "log_return": {"$ref": "#/$defs/num"},
+        "z": {"$ref": "#/$defs/num", "description": "window log return / the asset's typical move (σ) for that window"},
+        "sigma_pct": {"$ref": "#/$defs/num", "description": "one typical move for this window, in percent"},
+        "sigma_method": {"type": "string"}, "sigma_samples": {"type": "integer"},
+        "direction": {"enum": ["inflow", "outflow", "neutral", null]},
+        "status": {"enum": ["live", "delayed", "closed", "stale", "warming_up", "no_data"]},
+        "age_s": {"$ref": "#/$defs/num", "description": "now minus the timestamp of the newest data"},
+        "latency_ms": {"$ref": "#/$defs/num", "description": "median receive time minus exchange timestamp"},
+        "updated_at": {"type": ["string", "null"]},
+        "source": {"type": "object", "required": ["id", "name", "symbol", "proxy"], "properties": {
+          "id": {"type": "string"}, "name": {"type": "string"}, "short": {"type": "string"}, "symbol": {"type": "string"},
+          "field": {"type": "string"}, "proxy": {"type": "boolean"}, "description": {"type": "string"}}},
+        "volume": {"oneOf": [{"type": "null"}, {"type": "object", "properties": {
+          "quote_volume": {"type": "number"}, "rvol": {"$ref": "#/$defs/num"}, "baseline_days": {"type": "integer"},
+          "taker_buy_ratio": {"type": "number"}, "net_taker": {"type": "number"}}}]},
+        "derivatives": {"oneOf": [{"type": "null"}, {"type": "object"}]},
+        "reference": {"type": "array", "items": {"type": "object", "properties": {
+          "source": {"type": "string"}, "symbol": {"type": "string"}, "price": {"$ref": "#/$defs/num"},
+          "change_pct": {"$ref": "#/$defs/num"}, "basis_pct": {"$ref": "#/$defs/num"}, "age_s": {"$ref": "#/$defs/num"},
+          "status": {"type": "string"}}}},
+        "spark": {"type": "array", "items": {"type": ["number", "null"]}},
+        "inflow_share": {"type": "number"}, "outflow_share": {"type": "number"},
+        "extra": {"type": "object"}, "note": {"type": "string"}
+      }
+    },
+    "edge": {"type": "object", "required": ["from", "to", "weight", "share", "from_z", "to_z"], "properties": {
+      "from": {"type": "string"}, "to": {"type": "string"},
+      "weight": {"type": "number", "description": "sqrt(|z_from| * z_to) * (1 - corr) / 2"},
+      "share": {"type": "number", "description": "weight / sum of weights shown"},
+      "corr": {"$ref": "#/$defs/num", "description": "correlation of step returns inside the window"},
+      "from_z": {"type": "number"}, "to_z": {"type": "number"}}},
+    "risk": {"type": "object", "required": ["score", "label", "coverage", "components"], "properties": {
+      "score": {"type": ["integer", "null"], "minimum": -100, "maximum": 100},
+      "label": {"enum": ["RISK-OFF", "LEANING RISK-OFF", "MIXED", "LEANING RISK-ON", "RISK-ON", "NO DATA"]},
+      "coverage": {"type": "number", "minimum": 0, "maximum": 1}, "s": {"$ref": "#/$defs/num"},
+      "method": {"type": "string"},
+      "components": {"type": "array", "items": {"type": "object", "required": ["id", "weight", "available"], "properties": {
+        "id": {"type": "string"}, "label": {"type": "string"}, "inputs": {"type": "array"}, "weight": {"type": "number"},
+        "value": {"$ref": "#/$defs/num"}, "contribution": {"$ref": "#/$defs/num"}, "available": {"type": "boolean"}}}}}},
+    "bullet": {"type": "object", "required": ["id", "text", "level"], "properties": {
+      "id": {"type": "string"}, "rule": {"type": "string"}, "text": {"type": "string"},
+      "level": {"enum": ["info", "up", "down", "warn", "muted"]}}},
+    "fed": {"type": "object", "required": ["decision_at", "decision_ts", "seconds", "days", "when_ny", "when_local"], "properties": {
+      "decision_at": {"type": "string"}, "decision_ts": {"type": "number"}, "seconds": {"type": "integer"},
+      "days": {"type": "number"}, "countdown": {"type": "string"}, "when_ny": {"type": "string"},
+      "when_local": {"type": "string"}, "local_tz": {"type": "string"}, "sep": {"type": "boolean"}, "label": {"type": "string"}}},
+    "news": {"type": "object", "required": ["title", "source", "published_at", "age_s"], "properties": {
+      "title": {"type": "string"}, "source": {"type": "string"}, "url": {"type": "string"},
+      "published_at": {"type": "string"}, "age_s": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}}},
+    "source": {"type": "object", "required": ["id", "kind", "state"], "properties": {
+      "id": {"type": "string"}, "title": {"type": "string"}, "kind": {"enum": ["stream", "poll"]}, "state": {"type": "string"},
+      "msgs": {"type": "integer"}, "msgs_per_s": {"$ref": "#/$defs/num"}, "latency_ms_median": {"$ref": "#/$defs/num"},
+      "last_message_age_s": {"$ref": "#/$defs/num"}, "last_error": {"type": ["string", "null"]}}},
+    "all": {"type": "object", "required": ["schema", "timeframes"], "properties": {
+      "timeframes": {"type": "object", "required": ["1h", "today", "1w"]}}}
+  }
+}

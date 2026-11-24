@@ -1,0 +1,39 @@
+# Secrets: never commit keys
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets*.toml
+
+# Local data, caches, recordings, reports with machine details (root folder only:
+# tests/data/ holds the test fixtures and IS tracked)
+/data/
+/reports/
+*.log
+*.jsonl.gz
+!tests/data/*.jsonl.gz
+
+# The example screenshot is a third-party video frame: keep it local, never publish it
+reference/
+
+# Local config overrides (may hold webhook URLs or paths)
+moneyflow.local.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+.claude/

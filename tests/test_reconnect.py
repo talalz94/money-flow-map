@@ -1,0 +1,183 @@
+"""Reconnection after drops, silence and sleep/resume, against a local flaky websocket server."""
+import asyncio
+import types
+
+import aiohttp
+from aiohttp import web
+
+from moneyflow import clock
+from moneyflow.connectors.base import Backoff, PollConnector, StreamConnector
+from moneyflow.engine import Engine
+from moneyflow.keys import KeyStore
+
+
+def ctx_for(session):
+    eng = types.SimpleNamespace()
+    return types.SimpleNamespace(engine=eng, clock=clock.Clock(), keys=KeyStore(), session=session)
+
+
+class Probe(StreamConnector):
+    name = "probe"
+    title = "probe"
+    idle_timeout = 5.0
+    heartbeat = None
+
+    def __init__(self, ctx, url):
+        super().__init__(ctx, {})
+        self._url = url
+        self.got = []
+        self.backoff = Backoff(base=0.05, cap=0.2)
+
+    def url(self):
+        return self._url
+
+    def on_text(self, data, recv):
+        self.got.append(data)
+
+
+async def start_server(mode):
+    hits = []
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        hits.append(1)
+        await ws.send_str(f"hello {len(hits)}")
+        if mode == "drop":
+            await ws.close()                       # the server drops every connection at once
+        else:
+            async for _ in ws:                     # stay open and silent
+                pass
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/ws", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    return runner, f"ws://127.0.0.1:{port}/ws", hits
+
+
+def test_reconnects_after_server_drops():
+    async def go():
+        runner, url, hits = await start_server("drop")
+        async with aiohttp.ClientSession() as s:
+            p = Probe(ctx_for(s), url)
+            t = asyncio.create_task(p.run())
+            await asyncio.sleep(1.5)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+        await runner.cleanup()
+        assert p.health.connects >= 3 and len(hits) >= 3
+        assert p.got[:2] == ["hello 1", "hello 2"]
+    asyncio.run(go())
+
+
+def test_silent_feed_is_treated_as_dead():
+    async def go():
+        runner, url, hits = await start_server("silent")
+        async with aiohttp.ClientSession() as s:
+            p = Probe(ctx_for(s), url)
+            p.idle_timeout = 0.3
+            t = asyncio.create_task(p.run())
+            await asyncio.sleep(1.6)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+        await runner.cleanup()
+        assert p.health.connects >= 2                  # reconnected after each 0.3 s of silence
+    asyncio.run(go())
+
+
+def test_kick_forces_an_immediate_reconnect():
+    async def go():
+        runner, url, hits = await start_server("silent")
+        async with aiohttp.ClientSession() as s:
+            p = Probe(ctx_for(s), url)
+            p.idle_timeout = 60
+            t = asyncio.create_task(p.run())
+            await asyncio.sleep(0.4)
+            assert p.health.connects == 1
+            p.kick()                                    # what the engine does after sleep/resume
+            await asyncio.sleep(0.6)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+        await runner.cleanup()
+        assert p.health.connects == 2
+    asyncio.run(go())
+
+
+def test_poller_backs_off_on_errors_and_recovers():
+    class Flaky(PollConnector):
+        name = "flaky"
+        title = "flaky"
+
+        def __init__(self, ctx):
+            super().__init__(ctx, {"interval_s": 0.05})
+            self.backoff = Backoff(base=0.01, cap=0.05)
+            self.calls = 0
+
+        async def poll(self):
+            self.calls += 1
+            if self.calls <= 2:
+                raise RuntimeError("HTTP 503 token=abcdef123456")
+
+    async def go():
+        p = Flaky(ctx_for(None))
+        t = asyncio.create_task(p.run())
+        await asyncio.sleep(0.5)
+        t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+        return p
+
+    p = asyncio.run(go())
+    assert p.calls >= 4 and p.health.errors == 2 and p.health.state in ("ok", "polling")
+    assert "abcdef123456" not in p.health.last_error           # errors are redacted
+
+
+def test_gap_after_sleep_is_redownloaded_not_left_flat(cfg, keys, monkeypatch, tmp_path):
+    """After a sleep the 1-second tick carries the last pre-sleep price across the gap. The refill
+    must re-download from the moment the PC went to sleep and overwrite that flat stretch."""
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+
+    now = 1795528800.0                                    # 2026-11-24 13:20 UTC, on a 5-minute boundary
+    eng = Engine(cfg, keys, clock.Clock(fixed=now))
+    eng.cache_dir = tmp_path
+    inst = eng.instruments["binance_spot:BTCUSDT"]
+    sleep_at = now - 3600
+    k0 = int((now - 86400) // G5_STEP)
+    inst.seed("g5", [(k * G5_STEP, 100.0) for k in range(k0, int(now // G5_STEP))], now)   # flat = stale gap
+
+    async def fake_klines(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        step = 300 if interval == "5m" else 60
+        t = (start_ms // 1000 // step) * step
+        rows = []
+        while t + step <= end_ms / 1000:
+            rows.append((t, 110.0 if t >= sleep_at else 100.0, 1.0, 0.5))
+            t += step
+        return rows
+
+    monkeypatch.setattr(bn, "fetch_klines", fake_klines)
+    eng.connectors = {}
+    eng.cfg = dict(cfg, connectors=dict(cfg["connectors"], yahoo={"enabled": False}))
+
+    async def go():
+        await eng.seed_history(incremental=True, since=sleep_at)
+    asyncio.run(go())
+    k_mid = int((sleep_at + 1800) // G5_STEP)
+    assert inst.g5.get(k_mid) == 110.0                    # the gap now holds the real (downloaded) prices
+    assert inst.g5.get(int((sleep_at - 3 * 3600) // G5_STEP)) == 100.0
+
+
+def test_engine_resume_resyncs_and_kicks_every_connector(cfg, keys):
+    async def go():
+        eng = Engine(cfg, keys, clock.Clock(fixed=1795500000.0))
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())) as s:
+            eng.ctx.session = s
+            kicked = []
+            eng.connectors = {n: types.SimpleNamespace(kick=lambda n=n: kicked.append(n)) for n in ("a", "b", "c")}
+            await eng.on_resume(gap=60)
+        return kicked
+    assert sorted(asyncio.run(go())) == ["a", "b", "c"]

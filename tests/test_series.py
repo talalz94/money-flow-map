@@ -1,0 +1,117 @@
+import math
+
+import pytest
+
+from conftest import ny_ts
+from moneyflow.series import DXY, G1_STEP, G5_STEP, Grid, Instrument, NaN, StablecoinShare, Stitched
+
+
+def test_grid_put_get_asof_and_gap_invalidation():
+    g = Grid(60, 10)
+    for k in range(100, 105):
+        g.put(k, float(k), True)
+    assert g.get(104) == 104.0 and g.get(99) != g.get(99)       # NaN outside
+    assert g.asof(105 * 60) == 104.0                             # close of the step that ended at 105*60
+    assert g.asof(104 * 60 + 30) == 103.0                        # step 104 has not ended yet
+    g.put(108, 108.0, False)                                     # skip 105..107 -> unknown
+    assert math.isnan(g.get(106)) and not g.is_live(108)
+    assert g.asof(108 * 60, max_back=1) != g.asof(108 * 60, max_back=1)   # 107 unknown, 106 too far back
+    assert g.asof(108 * 60, max_back=5) == 104.0
+    for k in range(109, 125):                                    # ring wrap
+        g.put(k, float(k), True)
+    assert math.isnan(g.get(110)) and g.get(124) == 124.0 and g.first_k() == 115
+
+
+def test_instrument_rolls_steps_and_carries_forward():
+    t0 = ny_ts(2026, 11, 24, 10, 0)                              # a Tuesday, 24/7 instrument
+    inst = Instrument("x:A", "x", "A", "24/7", volume=True)
+    inst.on_price(100.0, t0 + 1, t0 + 1.1)
+    inst.on_price(101.0, t0 + 50, t0 + 50.1)
+    inst.on_price(102.0, t0 + 61, t0 + 61.1)                     # next minute closes the first at 101
+    assert inst.g1.get(int(t0 // 60)) == 101.0
+    inst.roll(t0 + 5 * 60 + 1)                                   # idle: carried forward
+    assert inst.g1.get(int(t0 // 60) + 4) == 102.0
+    assert inst.g5.get(int(t0 // 300)) == 102.0 and inst.g5.is_live(int(t0 // 300))
+    assert inst.latency_ms() == pytest.approx(100.0, abs=1)
+
+
+def test_minute_volumes_sum_into_five_minute_steps():
+    t0 = ny_ts(2026, 11, 24, 10, 0)
+    inst = Instrument("x:A", "x", "A", "24/7", volume=True)
+    inst.on_price(1.0, t0, t0)
+    for m in range(5):
+        inst.on_minute_volume(t0 + 60 * m, 10.0 + m, 6.0)       # kline-style cumulative per minute
+        inst.on_minute_volume(t0 + 60 * m, 20.0 + m, 12.0)      # later update of the same minute replaces it
+    inst.roll(t0 + 300 + 1)
+    q, tb = inst.v5.get(int(t0 // 300))
+    assert q == pytest.approx(sum(20.0 + m for m in range(5))) and tb == pytest.approx(60.0)
+
+
+def test_us_regular_instrument_ignores_extended_hours_prints():
+    inst = Instrument("alpaca:TLT", "alpaca", "TLT", "us_regular")
+    inst.on_price(80.0, ny_ts(2026, 11, 24, 8, 0), ny_ts(2026, 11, 24, 8, 0))   # pre-market
+    assert math.isnan(inst.price) and inst.extra["ext_price"] == 80.0
+    inst.on_price(81.0, ny_ts(2026, 11, 24, 9, 31), ny_ts(2026, 11, 24, 9, 31))
+    assert inst.price == 81.0
+
+
+def test_seed_fills_with_carry_forward_and_market_flags():
+    inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")
+    start = ny_ts(2026, 11, 23, 15, 50)
+    closes = [(start, 10.0), (start + 300, 11.0)]                 # 15:50 and 15:55 bars
+    until = ny_ts(2026, 11, 23, 16, 30)
+    n = inst.seed("g5", closes, until)
+    assert n == (until - start) // 300
+    k_close = int(ny_ts(2026, 11, 23, 16, 0) // 300)
+    assert inst.g5.get(k_close + 3) == 11.0                       # carried after the close
+    assert inst.g5.is_live(k_close - 1) and not inst.g5.is_live(k_close + 1)
+    assert inst.price == 11.0                                     # no live price yet: last close
+
+
+def _inst(price, sym="P"):
+    i = Instrument(f"t:{sym}", "t", sym, "24/7")
+    i.price, i.ts = price, 0.0
+    return i
+
+
+def test_dxy_formula_elasticities():
+    px = {"EURUSD": 1.0960, "USDJPY": 159.0, "GBPUSD": 1.27, "USDCAD": 1.38, "USDSEK": 10.24, "USDCHF": 0.80}
+    base = DXY.formula(px)
+    assert 95 < base < 115
+    up = DXY.formula({**px, "EURUSD": px["EURUSD"] * 1.01})
+    assert math.log(up / base) == pytest.approx(-0.576 * math.log(1.01), rel=1e-9)
+    assert math.isnan(DXY.formula({**px, "USDSEK": NaN}))
+    d = DXY("dxy", {k: _inst(v, k) for k, v in px.items()})
+    assert d.value_live(0) == pytest.approx(base)
+
+
+def test_stablecoin_share_moves_with_the_basket():
+    b = {"BTC": _inst(100.0, "BTC"), "ETH": _inst(10.0, "ETH")}
+    s = StablecoinShare("share", b)
+    s.set_weights({"BTC": 3.0, "ETH": 1.0})
+    s.set_supply(100.0, 0.0)
+    s.set_anchor(1000.0, 0.0, prices={"BTC": 100.0, "ETH": 10.0})
+    assert s.value_live(0) == pytest.approx(10.0)                 # 100 / 1000
+    b["BTC"].price, b["ETH"].price = 90.0, 9.0                    # basket -10%
+    assert s.value_live(0) == pytest.approx(100 / (100 + 900 * 0.9) * 100)
+
+
+def test_stitched_uses_primary_when_open_and_scaled_proxy_otherwise():
+    prim = Instrument("alpaca:TLT", "alpaca", "TLT", "us_regular")
+    prox = Instrument("bf:TMF", "bf", "TMF", "24/7")
+    st = Stitched("s", prim, prox, beta=3.0)
+    t_open = ny_ts(2026, 11, 24, 15, 0)
+    prim.on_price(80.0, t_open, t_open)
+    prox.on_price(30.0, t_open, t_open)
+    st.refresh(t_open + 1)
+    assert st.price == 80.0 and st.active_source(t_open + 1) is prim
+    # after the close: proxy +3% -> stitched +1%
+    t_eve = ny_ts(2026, 11, 24, 18, 0)
+    for k in range(int((t_open + 60) // G1_STEP), int(t_eve // G1_STEP) + 1):
+        prox.roll(k * G1_STEP + 1)
+        prim.roll(k * G1_STEP + 1)
+        st.refresh(k * G1_STEP + 1)
+    prox.on_price(30.9, t_eve + 61, t_eve + 61)
+    st.refresh(t_eve + 62)
+    assert st.active_source(t_eve + 62) is prox
+    assert st.price == pytest.approx(80.0 * (1 + 0.03 / 3), rel=1e-6)

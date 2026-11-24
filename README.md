@@ -1,0 +1,577 @@
+# Money Flow Map
+
+A real-time, **heuristic** read of where money is moving across markets right now: stocks, bonds,
+the dollar, gold, silver, oil, Anthropic, Bitcoin, Ether and stablecoins. It runs as **one
+lightweight Python process** that listens to free, low-latency public data feeds. It serves the
+read as a **local JSON API** (REST, WebSocket, SSE, webhooks) for other apps, plus an
+**optional dashboard**.
+
+![dashboard](docs/dashboard.jpg)
+
+> **Heuristic, not fact.** Prices are public; *flows between assets are inferred* from
+> simultaneous opposite moves. Nobody can see where each dollar actually goes. Nothing here is
+> advice, and nothing here can place an order: it uses market data only.
+
+---
+
+## Contents
+1. [Quick start](#1-quick-start)
+2. [What it shows](#2-what-it-shows)
+3. [How the flows are computed](#3-how-the-flows-are-computed)
+4. [Sources, measured latency, terms](#4-sources-measured-latency-terms)
+5. [Keys and configuration](#5-keys-and-configuration)
+6. [Connecting other apps (API)](#6-connecting-other-apps-api)
+7. [The dashboard](#7-the-dashboard)
+8. [Performance](#8-performance)
+9. [Recovery after sleep or network loss](#9-recovery-after-sleep-or-network-loss)
+10. [Tests and tools](#10-tests-and-tools)
+11. [Limits: what is real-time and what is not](#11-limits-what-is-real-time-and-what-is-not)
+12. [Project layout](#12-project-layout)
+
+---
+
+## 1. Quick start
+
+```powershell
+.\start.ps1
+```
+Or double-click **`start.bat`**. This finds Python 3.11+, installs `aiohttp` only if it is
+missing, starts the service and opens the dashboard at <http://127.0.0.1:8765/>. Stop it with
+Ctrl+C or by closing the window.
+
+```powershell
+.\start.ps1 -NoDashboard        # API only (headless)
+python -m moneyflow run --no-dashboard --port 8800
+python -m moneyflow read --tf 1h # print the current read in the terminal
+python -m moneyflow keys         # which API keys were found (values are never shown)
+python -m moneyflow check        # measure every source's latency and freshness
+```
+
+What to expect:
+- **First start:** about 20-30 s to download 35 days of 5-minute history (measured: 22 s).
+- **Later starts:** about 7-25 s, because history is cached in `data/` and only the missing tail is downloaded (measured: 7-21 s).
+- **While loading:** nodes show **WARMING UP** until their volatility history is in.
+
+Requirements: Windows (also works on macOS/Linux), Python 3.11+ (developed on 3.13),
+`aiohttp`. `orjson` and `psutil` are used when installed. `tzdata` provides the time zones on
+Windows. Everything is in `requirements.txt`.
+
+---
+
+## 2. What it shows
+
+| Element | Meaning |
+|---|---|
+| **Node** (sphere) | An asset. **Green glow = inflow** (bid), **red = outflow** (offered), grey = no clear move. Glow strength grows with the size of the move. |
+| **σ** under a node | The window's move divided by that asset's **typical move for the same window** (its z-score). +2σ is an unusually strong rise for *that* asset; it lets bonds, coins and indices be compared. |
+| **%** under a node | The plain percent change over the window. |
+| **Sparkline** | The path of the move over the window. |
+| **Badge** (e.g. `BNC-F* 144ms · 0.4s`) | The data source, its **median latency** (exchange timestamp to receipt) and the **age of its newest data**. Green = live, amber = delayed, grey = market closed, red = stale. `*` = a proxy (e.g. a perpetual standing in for the ETF). |
+| **Curved edge with moving dots** | An **inferred** flow from an outflow asset to an inflow asset in the same window. Thicker means stronger. |
+| **The Fed** (centre) | Days to the next FOMC rate decision. |
+| **1H / TODAY / 1W** | The window: the last 60 minutes; since **17:00 New York** yesterday (the global trading-day roll, i.e. the US close); the last 7 days. |
+| **Risk-on / risk-off meter** | A −100…+100 composite of documented components (section 3). |
+| **FEAR · VIX** | The VIX level. It is licensed and **15 minutes delayed**, and is labelled so. Beside it is a live 24/7 proxy, the UVXY perpetual. |
+| **DOLLAR · DXY** | The ICE Dollar Index formula, computed live from six FX pairs. |
+| **US 10Y YIELD** | FRED's daily close, with the date shown, plus the live TLT move as a hint. |
+| **BTC LEVERAGE** | Bitcoin perpetual funding (per year) and the change in open interest over the window. |
+| **Next Fed rate decision** | A countdown, shown in New York time and in your local time (Pakistan by default), plus the next high-impact releases. |
+| **What the flow says** | Rule-based sentences. Each sentence carries the id of the rule that produced it (hover to see it). |
+| **Strongest flows** | The top inferred edges with weight and correlation ρ. |
+| **News wire** | Headlines from several feeds, newest first. Each shows its source and how long ago it was published. |
+| **Status strip** | Every connector with its state, median latency and message rate. |
+
+Every asset reports one of these statuses: `live`, `delayed`, `closed` (its market is shut),
+`stale` (its market is open but the feed is silent), `warming_up` (not enough history for σ)
+or `no_data`. **Delayed or closed data is never shown as live.**
+
+---
+
+## 3. How the flows are computed
+
+All maths is in `moneyflow/stats.py`, `moneyflow/flow.py` and `moneyflow/narrative.py`, and it is
+unit-tested.
+
+### 3.1 Price series
+Every instrument keeps fixed-memory ring buffers:
+- 1-minute closes for 1 day;
+- 5-minute closes for 35 days;
+- 5-minute traded volume, including the taker-buy part where the venue reports it.
+
+The live price updates every tick. A step's `live` flag records whether that instrument's market
+was open. History is seeded at start-up from REST and cached on disk.
+
+### 3.2 The z-score (σ)
+`z = log return over the window / σ`, where σ is the asset's **own typical move for that same kind of window**:
+
+| Window | σ estimated from |
+|---|---|
+| 1H | RMS of rolling 60-minute log returns over the last 10 days. Only windows where its market was open count. |
+| TODAY | **Same-clock σ**: RMS, over the previous 30 days, of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. Fallback (fewer than 8 such days, e.g. ANT after its IPO): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
+| 1W | RMS of daily (roll-to-roll) log returns over calendar days, × √7. |
+
+- **RMS, not standard deviation:** the mean of short-horizon returns is about 0, and estimating it adds noise.
+- **No information is not a zero move:** a market that was **shut for the whole window** gets a missing z. HYG at 3 a.m. has no "1H" move.
+
+### 3.3 Volume confirmation (where volume exists)
+- **Relative volume:** volume in the window ÷ the median volume of the same window on the previous 20 days. For 1W it is the previous 4 weeks.
+- **Net taker flow (USD):** taker-buy quote volume − taker-sell quote volume, from Binance 1-minute klines. It shows how much aggressive buying versus selling hit the book.
+- **IEX volume** (Alpaca) is a *sample*, about 2-3% of US volume, so only relative volume is used from it.
+
+### 3.4 Flow edges (inferred)
+For every pair with **A offered** (`z_A ≤ −θ`) and **B bid** (`z_B ≥ +θ`) in the same window:
+
+```
+weight(A→B) = sqrt(|z_A| · z_B) · (1 − ρ_AB) / 2
+```
+- `ρ_AB` is the correlation of A's and B's step returns **inside the window**: 1-minute steps for 1H, 5-minute for TODAY, hourly for 1W.
+- A rotation looks like one asset sold while the other is bought, step by step (ρ → −1). That keeps the full weight.
+- Assets that merely moved together (ρ → +1) get **no edge**.
+- Unknown ρ counts as 0.5.
+- Defaults: θ = 0.5σ, at most 16 edges and 5 per asset, minimum weight 0.3.
+
+The strongest edge is the "strongest flow". It is a statement about *simultaneous opposite
+moves*, not about where any particular dollar went.
+
+### 3.5 Risk-on / risk-off composite (−100…+100)
+Each component is in σ units, clipped to ±4. Weights are in the config (`[risk]`):
+
+| Component | Formula | Weight |
+|---|---|---|
+| Stocks vs Treasuries | z(S&P 500) − z(TLT) | 0.25 |
+| Fear | −z(UVXY perpetual, live VIX proxy) | 0.20 |
+| Crypto | mean(z(BTC), z(ETH)) | 0.15 |
+| Credit | z(HYG) − z(IEF) | 0.10 |
+| Dollar | −z(DXY) | 0.10 |
+| Stablecoin share | −z(stablecoin share of crypto) | 0.10 |
+| Gold (haven demand) | −z(gold) | 0.05 |
+| Tech leadership | z(Nasdaq 100) − z(S&P 500) | 0.05 |
+
+- `S` = the weighted mean of the available components. `score = round(100 · tanh(S / 1.5))`.
+- Labels: ≤ −60 RISK-OFF, −60…−20 leaning risk-off, ±20 mixed, 20…60 leaning risk-on, ≥ 60 RISK-ON.
+- Missing inputs, such as HYG/IEF outside US hours, drop out and the weights are renormalised. `coverage` reports the live share of weight.
+- Because z-scores remove scale, a leveraged or futures-based proxy (UVXY ≈ 1.5× short-term VIX futures) gives a z close to that of what it tracks.
+
+### 3.6 Special series
+- **US Dollar (DXY).** `50.14348112 · EURUSD^−0.576 · USDJPY^0.136 · GBPUSD^−0.119 · USDCAD^0.091 · USDSEK^0.042 · USDCHF^0.036`, computed on every OANDA tick from Finnhub.
+  - **Validated live:** over 16 minutes and 323 timestamp-matched quotes, the computed value minus ICE's DXY (via Yahoo, 10 min delayed) was **mean +0.0007, sd 0.0024, max 0.011**, at a DXY of about 103.9.
+  - The history comes from ICE's DXY itself.
+- **Stablecoins (cash in crypto).** The share of total crypto market cap held in USD stablecoins:
+  `S / (S + NS₀ · B(t)/B₀)`.
+  - `S` is the supply from DefiLlama. `NS₀` is the non-stable cap from CoinGecko.
+  - `B` is a cap-weighted basket of live Binance prices (BTC, ETH, BNB, SOL, XRP).
+  - The share moves **mechanically** when crypto prices fall, even with no new money. So the hover and narrative also show the **supply change** (mints − burns), which is the real "new cash" signal.
+- **US Bonds (TLT).** A *stitched* series. While US markets are open it uses TLT on IEX. Outside them it uses the TMF perpetual's index ÷ 3 (TMF is 3× TLT). At the open it snaps back to the real price, so the opening gap is real.
+- **Anthropic (ANT).** Anthropic listed on Nasdaq in November 2026. The node uses Binance's 24/7 ANT perpetual, with the IEX quote as a reference. Its σ starts on the realized-variance fallback because its history is short.
+
+### 3.7 "What the flow says"
+These are deterministic rules in `narrative.py`; each bullet carries its rule id. Examples:
+- **Bonds bid while stocks fall** (z ≥ 1 vs ≤ −1): "classic safety trade".
+- **Stocks and bonds both sold**: "Treasuries are not working as a haven".
+- **Dollar bid while stocks fall.**
+- **Gold sold with stocks and crypto**: "broad liquidation".
+- **Fear spike**: VIX proxy ≥ 2σ.
+- **Stablecoin share up while crypto is down**: "crypto traders moving to cash", qualified by the supply change.
+- **Ether lagging Bitcoin.**
+- **Open interest vs price**: deleveraging, new shorts, new longs or short covering.
+- **Negative funding.**
+- **Oil shocks.**
+- **Tech lagging.**
+- **Plus:** the risk regime, the Fed countdown, the next US high-impact release, and caveats about proxies and closed markets.
+
+---
+
+## 4. Sources, measured latency, terms
+
+### 4.1 What feeds each node
+
+| Node | Real-time source (default) | Reference / fallback | Hours |
+|---|---|---|---|
+| Nasdaq 100 | Binance **QQQUSDT** perpetual, *index price* (Binance's fair price of QQQ, 1 s) | QQQ on Alpaca IEX | 24/7 (weekends = perp price discovery) |
+| S&P 500 | Binance **SPYUSDT** perpetual, index | SPY on IEX | 24/7 |
+| Anthropic (ANT) | Binance **ANTUSDT** perpetual, index | ANT on IEX (Nasdaq listed) | 24/7 |
+| Gold | Binance **XAUUSDT** perpetual, index | GLD (IEX), PAXG (Binance spot) | 24/7 |
+| Silver | Binance **XAGUSDT**, index | SLV | 24/7 |
+| Crude oil (WTI) | Binance **CLUSDT**, index | USO | 24/7 |
+| US Bonds (TLT) | **TLT on Alpaca IEX** (mid quote) in US hours | TMF perpetual index ÷ 3 otherwise | stitched 24/7 |
+| US Dollar (DXY) | **Computed** from 6 OANDA FX pairs (Finnhub websocket) | UUP on IEX | FX hours (Sun 17:00 – Fri 17:00 NY) |
+| Bitcoin, Ethereum | Binance spot trades (BTCUSDT, ETHUSDT) | Coinbase BTC-USD / ETH-USD (the "Coinbase premium") | 24/7 |
+| Stablecoins | Computed: DefiLlama supply ÷ CoinGecko market cap, moved by live Binance prices | | 24/7 |
+| VIX tile | Cboe delayed quote and Yahoo quote (both **15 min delayed**) | live proxy: Binance **UVXYUSDT** perpetual | VIX hours |
+| Credit (risk input) | HYG and IEF on IEX | | US regular hours |
+
+Context sources:
+- **FRED:** DGS10, DGS2 and the HY spread (daily).
+- **federalreserve.gov:** the FOMC calendar.
+- **Forex Factory weekly export:** scheduled US releases.
+- **Binance REST:** open interest.
+- **Headlines:**
+  - Alpaca news stream (real-time, filtered to the map's tickers and macro themes).
+  - Finnhub news.
+  - RSS: FinancialJuice, FT, Bloomberg, CNBC, FXStreet, CoinDesk, Cointelegraph, The Block and the Fed's press releases.
+
+**Why perpetuals for indices and commodities?** In November 2026 Binance lists "TradFi
+perpetuals" that trade around the clock. Measured on 24 Nov 2026:
+
+| Perpetual | 24h turnover |
+|---|---|
+| QQQUSDT | $1.2B |
+| XAUUSDT | $3.0B |
+| ANTUSDT | $1.1B |
+| CLUSDT | $0.7B |
+| SPYUSDT | $0.34B |
+
+On Saturday 21 November QQQUSDT still traded $192M and XAUUSDT $684M. Their index price keeps
+moving at weekends and re-prices when CME futures reopen on Sunday evening. They are therefore the
+best free 24/7, low-latency proxy for these markets. During US hours the hover shows the basis
+against the real ETF on IEX.
+
+How closely does the index track the real ETF? Measured against IEX trades on 24 Nov 2026:
+
+| When | QQQ | SPY | ANT |
+|---|---|---|---|
+| First 3 minutes after the open (median) | +11 bp | +13 bp | +16 bp |
+| 09:50 New York | −0.4 to +4.5 bp | about +6 bp | −2 to +19 bp |
+
+At the open the index lagged a falling market. ANT, a new listing, is the noisiest. So **%
+changes from the perpetuals can differ from the ETF's own by about 0.1% around the open**.
+
+### 4.2 Measured latency
+Latency is **receive time − the exchange's own timestamp**, measured on this PC (home connection,
+Pakistan) with the clock corrected by NTP. Measured on 24 Nov 2026; marketing claims were not used.
+> The PC clock ran **0.95-0.99 s fast**. Uncorrected, every source would look about 1 s slower.
+> The service measures this offset itself (SNTP) and corrects all ages.
+
+| Source (what is used) | Median | p90 | Rate | Notes |
+|---|---|---|---|---|
+| Binance spot trades (BTC, ETH) | **89-126 ms** | ~140 ms | 13-17/s per coin | 95 ms in the first probe |
+| Binance futures, liquid trades (BTC, XAU) | **95 ms** | 170-245 ms | 15-44/s | `/market/stream` path |
+| Binance futures, TradFi perp trades | 110-245 ms | 245 ms | 1-6/s | pushed in 250 ms batches |
+| Binance futures index/mark price (`markPrice@1s`) | **130-156 ms** | ~165 ms | 1/s per symbol | the price used for TradFi nodes |
+| Alpaca IEX (quotes / trades), pre-market | **~110 ms** | ~113 ms | SPY quotes 11/s | |
+| Alpaca IEX, US regular session (14:34 UTC) | **132-139 ms** | ~145 ms | TLT 52/s, IEF 27/s, HYG 17/s quotes at the open | every ETF symbol |
+| Binance spot during the US session | **~106 ms** | ~108 ms | BTC 50/s, ETH 36/s | |
+| Binance futures index/mark, US session | **144-154 ms** | ~160 ms | 1/s per symbol | |
+| Finnhub OANDA FX, US session | **336-400 ms** | 536-632 ms | 1.5-3/s per pair | busier than pre-market |
+| Finnhub OANDA FX (6 pairs) | **260-345 ms** | 380-505 ms | 1-2/s per pair | DXY inputs |
+| Coinbase full ticker | 120 ms | 130 ms | 19/s (BTC) | the service uses the batched channel, which updates every ~5 s by design |
+| Hyperliquid trades (optional) | 300-450 ms | ~530 ms | | not used by default |
+| Yahoo streamer FX (rejected) | 0.9-1.1 s | ~2 s | | unofficial |
+| Yahoo `^VIX` | **902 s (15 min)** | | | licensing delay |
+| Yahoo `DX-Y.NYB` (ICE DXY) | **602 s (10 min)** | | | used only for the DXY *history* |
+| Cboe delayed VIX JSON | 15 min | | | shows the prior close until 09:30 New York |
+
+| Polled source | Freshness when fetched | Poll interval |
+|---|---|---|
+| CoinGecko `/global` | data 5-7 min old | 5 min |
+| DefiLlama stablecoins | live total; history daily | 60 min |
+| FRED DGS10 | on 24 Nov the latest close was 20 Nov (1-2 business days) | 6 h |
+| FinancialJuice RSS | newest headline 1-2 min old | 3 min |
+| CNBC RSS | ~6 min | 3 min |
+| Finnhub general news | 15-45 min | 2.5 min |
+| Alpaca news stream | real-time | stream |
+
+Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON report to `data/`.
+
+### 4.3 Tested and rejected (and why)
+
+| Candidate | Result |
+|---|---|
+| **Kraken** websocket (real FX pairs) | This network's DNS **refuses** `ws.kraken.com` / `api.kraken.com` ("Query refused"). Not usable here. |
+| **Binance futures, legacy `/stream` path** | Connects but **delivers nothing** (Nov 2026). `/market/stream` (and `/public/stream` for book data) work. |
+| **Hyperliquid HIP-3** `xyz:DXY`, `xyz:VIX` | Listed but **zero volume and open interest**: frozen prices. The index perps (`xyz:XYZ100`, `xyz:SP500`) are liquid. The connector is included as an optional fallback, off by default. |
+| **VIX real-time** | The index is licensed. Every free quote found (Cboe, Yahoo) is 15 min delayed. The tile shows the delayed level, labelled with its age, and the live UVXY perpetual as the real-time direction. |
+| **Yahoo streaming** | Unofficial. FX about 1 s (Finnhub is 3-4× faster). Not used for live prices; the chart API is used only for DXY history and a second delayed VIX quote. |
+| **JBlanked** (key present) | Every calendar endpoint answers **HTTP 401 "requires credits"** with this key. Not used. |
+| **Finnhub** economic calendar and FX candles | HTTP 403 on the free plan. |
+| **Spot BTC/ETH ETF flows** | Farside's pages answered this program's HTTP client with a **Cloudflare bot challenge** (403). Bot checks are respected, not worked around, so the connector is off. DefiLlama's ETF routes are 404; SoSoValue needs a key; CoinGlass is paid. No ETF flows by default. |
+| **MT5 / Exness** | MetaTrader 5 is installed on this PC, but the other projects only hold Exness *web-terminal indicators* (no data connector). A live MT5 feed would need the terminal running, which is heavy, and it gives broker CFD quotes. Not used; it could be added as a connector. |
+| **Binance spot EURUSDT** for FX | Only EUR exists (no GBP/JPY/CAD/SEK/CHF). Not enough for the DXY. |
+
+### 4.4 Terms and rate limits (summary)
+- **Binance**
+  - Public market data needs no key.
+  - REST weight limits: 6,000/min (spot) and 2,400/min (futures). The service watches the used-weight header and pauses at 50%.
+  - Up to 1,024 streams per websocket; Binance closes each connection every 24 h, and the service reconnects.
+  - Market data only. API Terms of Use: <https://www.binance.com/en/terms>
+- **Alpaca Basic (free)**
+  - Real-time IEX feed; **one** connection per stream type; 200 REST calls/min.
+  - For personal, non-redistributed use.
+  - If another app holds the stream (error 406), the service retries every 5 min and polls the latest trades over REST meanwhile.
+- **Finnhub free**
+  - 60 REST calls/min, 50 websocket symbols, attribution "Data provided by Finnhub".
+  - Uses 6 symbols and 1 news call per 150 s.
+- **CoinGecko public API:** 5-30 calls/min. Uses 1 per 5 min. Attribution: "Data provided by CoinGecko".
+- **DefiLlama:** free, no key. Uses 1 call per hour, plus history twice a day.
+- **FRED:** 120 calls/min per key. Uses 3 calls per 6 h.
+- **Cboe delayed quotes and Yahoo:** delayed data for personal use. Yahoo's API is unofficial, so it is used sparingly: VIX once a minute while VIX is calculated, DXY history at start.
+- **federalreserve.gov:** public domain. Polled once a day.
+- **Forex Factory weekly export:** polled every 2 h.
+- **RSS:** publishers' public feeds. Each is polled every 3 min with ETag / If-Modified-Since. Headlines link back to the publisher.
+
+---
+
+## 5. Keys and configuration
+
+Keys are optional; each one unlocks one source:
+
+| Key | Unlocks | Without it |
+|---|---|---|
+| `ALPACA_KEY_ID`, `ALPACA_SECRET` | TLT/HYG/IEF and the ETF reference quotes; the real-time news stream | Bonds come only from the TMF proxy; credit drops out of the risk meter |
+| `FINNHUB_KEY` | the live DXY, Finnhub news | No dollar node |
+| `FRED_API_KEY` | the 10Y yield tile and curve | No 10Y tile |
+
+Put them in a git-ignored `.env` (copy `.env.example`), **or** point the config at an existing
+`.env` instead of copying:
+
+```toml
+# moneyflow.local.toml (git-ignored)
+[keys]
+env_files = [".env", "../my-other-project/.env"]
+
+[general]
+local_timezone = "Asia/Karachi"   # the second clock; "" (the default) = this PC's own zone
+```
+Only the four key names above are read from those files. Other secrets in them, such as e-mail
+passwords or exchange trading keys, are never loaded. Values are never printed, logged, cached or
+served:
+- `python -m moneyflow keys` shows only *set / missing*;
+- every log line and every error string goes through a redaction filter;
+- a test checks that no key appears in any API response.
+
+**Configuration** is TOML:
+- `moneyflow/default.toml` documents every option.
+- Override it in `moneyflow.toml`, or in `moneyflow.local.toml` (git-ignored) for this PC.
+- `[[series]]` entries merge by `id`. To add an asset (for example the disabled `copper`, `iwm`
+  or `openai` series), set `enabled = true`, or add a new entry with a `source` and `symbol`.
+- Connectors are switched in `[connectors.*]`.
+
+```toml
+[[series]]
+id = "copper"
+enabled = true
+
+[connectors.hyperliquid]
+enabled = true
+```
+
+---
+
+## 6. Connecting other apps (API)
+
+The service listens on `http://127.0.0.1:8765` (localhost only). Everything is read-only JSON.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/snapshot?tf=today` | Everything for one window (`1h`, `today`, `1w`), or `tf=all` for all three |
+| `GET /api/nodes?tf=1h` · `/api/nodes/{id}` | Assets (`bonds usd gold silver oil ndx spx ant btc eth stables`, aux: `vix_proxy hyg ief`) |
+| `GET /api/edges?tf=` · `/api/risk?tf=` · `/api/narrative?tf=` · `/api/tiles?tf=` | Parts of the read |
+| `GET /api/news?limit=30` · `/api/fed` · `/api/events` | Headlines, next FOMC decision, scheduled releases |
+| `GET /api/sources` · `/api/health` | Connector states and latency; process CPU/RAM, clock offset |
+| `GET /api/schema` | The JSON Schema (`moneyflow/schema/snapshot.schema.json`) |
+| `WS /ws?tf=today` | A `{"type":"snapshot","tf":..,"data":{..}}` message every second. Send `{"tf":"1h"}` to switch. |
+| `GET /sse?tf=today` | The same messages as Server-Sent Events (`event: snapshot`) |
+| Webhooks | POSTs on `regime_change`, `strongest_flow_change`, `extreme_move` (|z| ≥ 3), optional `snapshot` |
+
+Examples:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8765/api/risk?tf=1h"
+(Invoke-RestMethod "http://127.0.0.1:8765/api/snapshot?tf=today").narrative.text
+curl.exe -N "http://127.0.0.1:8765/sse?tf=today"
+```
+
+```python
+from moneyflow.client import MoneyFlowClient          # standard library only
+c = MoneyFlowClient()                                   # http://127.0.0.1:8765
+snap = c.snapshot("today")
+print(snap["risk"]["label"], snap["risk"]["score"])
+for e in snap["edges"][:3]:
+    print(e["from"], "->", e["to"], e["weight"])
+```
+See `examples/client.py` (REST and `--stream`) and `examples/webhook_receiver.py`.
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:8765/ws?tf=today");
+ws.onmessage = (m) => { const s = JSON.parse(m.data).data; console.log(s.risk.label, s.edges[0]); };
+```
+
+**Snapshot shape** (abridged; the full schema is in `/api/schema`):
+
+```json
+{"schema": "moneyflow.snapshot/1", "generated_at": "2026-11-24T14:13:34.340Z", "timeframe": "today",
+ "window": {"start": "...", "end": "...", "label": "since 17:00 New York Mon 23 Nov"},
+ "nodes": [{"id": "ndx", "label": "Nasdaq 100", "price": 638.67, "change_pct": -2.10, "z": -2.01,
+            "sigma_pct": 1.06, "direction": "outflow", "status": "live", "age_s": 0.15, "latency_ms": 121,
+            "source": {"id": "binance_fut", "name": "Binance USD-M perpetual", "symbol": "QQQUSDT", "proxy": true},
+            "volume": {"rvol": 1.92, "net_taker": -15307890, "taker_buy_ratio": 0.48},
+            "reference": [{"symbol": "QQQ", "source": "alpaca", "price": 635.76, "status": "closed"}],
+            "spark": [-0.04, 0.03, "..."]}],
+ "edges": [{"from": "spx", "to": "stables", "weight": 1.53, "share": 0.18, "corr": -0.65}],
+ "risk": {"score": -83, "label": "RISK-OFF", "coverage": 1.0, "components": ["..."]},
+ "narrative": [{"id": "bonds_bid_safety", "text": "Bonds are bid (yields falling) while stocks fall: a classic safety trade.", "level": "down"}],
+ "tiles": {"vix": {"level": 29.59, "status": "delayed"}, "dxy": {"level": 103.86}, "us10y": {"value": 4.92, "date": "2026-11-20"}},
+ "fed": {"decision_at": "2026-12-09T19:00:00.000Z", "countdown": "15d 04h 55m", "when_ny": "Wed, Dec 9, 2:00 PM New York"},
+ "news": [{"title": "...", "source": "FinancialJuice", "age_s": 105, "tags": ["FED"]}],
+ "sources": [{"id": "binance_spot", "state": "connected", "latency_ms_median": 89.6, "msgs_per_s": 13.4}],
+ "meta": {"heuristic": true, "clock": {"offset_ms": -983}}}
+```
+
+**Webhooks** (`moneyflow.toml`):
+```toml
+[webhooks]
+targets = [{ url = "http://127.0.0.1:9000/hook", events = ["regime_change", "extreme_move"] }]
+min_interval_s = 60
+```
+
+**Sharing on your LAN** is off by default. It needs both `server.host = "0.0.0.0"` and a
+`server.token`; the config refuses one without the other. Requests whose Host header is not
+localhost are refused, which protects against DNS rebinding.
+
+---
+
+## 7. The dashboard
+
+A single page in `moneyflow/static/`: plain HTML, CSS and JavaScript, no framework, and **no
+external requests** (no CDNs, no web fonts).
+
+**Rendering**
+- The network is drawn into an off-screen canvas **only when data changes** (once a second).
+- The visible canvas copies it and draws the moving particles at **≤ 30 fps**.
+- Animation **stops while the tab is hidden**, when MOTION is switched off, or when Windows asks
+  for reduced motion. The news wire pauses too.
+
+**Interaction**
+- Hover a node to see its price, source, data age and latency.
+- The hover card also shows:
+  - the move and σ in all three windows, and the typical 1σ move;
+  - relative volume and net taker flow;
+  - funding and open interest;
+  - the reference quotes with their basis;
+  - the stablecoin supply change and the DXY's FX legs.
+- The status strip shows every connector. The footer shows the PC clock correction, market hours,
+  and the service's own CPU and RAM.
+- The window choice and the motion setting are remembered in the browser.
+
+---
+
+## 8. Performance
+
+Measured on this laptop (Intel i7-10510U, 4 cores / 8 threads, 16 GB, Windows 10, Python 3.13)
+with all default sources live:
+
+__PERF_TABLE__
+
+Why it is light:
+- **One asyncio process.** No busy loops: every wait has a timeout.
+- **Light streams.** Binance futures use 1 s index prices and 1-minute klines rather than every
+  trade, Coinbase uses its 5-second batch channel, and Alpaca news is filtered.
+- **Cached computation.** σ is recomputed once a minute, correlations every 10-30 s, volume
+  baselines every 30-120 s.
+- **Snapshots only when wanted.** They are built for the 1-second push only when a client is
+  connected, otherwise on request.
+- **Fixed memory.** Ring buffers of about 0.2 MB per instrument.
+- **History cached on disk.**
+
+Measure it yourself:
+```powershell
+python tools/measure_resources.py --minutes 10              # headless
+python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard/WebSocket client
+```
+
+---
+
+## 9. Recovery after sleep or network loss
+
+- **Dropped or silent feeds.**
+  - Every websocket reconnects with exponential back-off and jitter: 1 s doubling to 60 s, reset after a healthy minute.
+  - A feed that goes silent beyond its idle limit (45-900 s, depending on the market) counts as dead. That catches half-open TCP connections after Wi-Fi loss.
+  - aiohttp heartbeat pings check the peer.
+- **Sleep or hibernation.**
+  - A watchdog notices the wall clock jumping (more than 25 s in a 5 s tick).
+  - It then clears the DNS cache, re-syncs the clock by NTP and **kicks every connector** into an immediate reconnect.
+  - After gaps over 2 minutes it **downloads the missing history** for every instrument.
+- **Pollers** back off on errors (10 s doubling to 15 min) and recover by themselves.
+- **History** is saved to `data/cache/` every 30 minutes and on exit.
+- **Tests:**
+  - `tests/test_reconnect.py` checks reconnection after server drops, after silence, after a `kick()`, poller back-off, and the resume path.
+  - The resume path was also exercised live by restarting the service and by the recorder (section 10).
+
+---
+
+## 10. Tests and tools
+
+```powershell
+python -m pytest              # unit, API, reconnect and offline-replay tests (no network needed)
+```
+- **Unit tests:**
+  - key loading and redaction;
+  - New York trading-day roll across DST, NYSE holidays and early closes, FX and VIX hours;
+  - the ring buffers;
+  - σ estimators on exact synthetic series;
+  - edge weights and the risk composite;
+  - narrative rules (including the reference screenshot's read);
+  - Fed calendar parsing;
+  - RSS/Atom and news de-duplication;
+  - config merging and validation.
+- **API:** REST endpoints validated against the JSON Schema, WebSocket and SSE streams, the Host
+  guard and token, headless mode, and no keys in any response.
+- **Offline replay:** `tests/data/replay_sample.jsonl.gz` holds real frames recorded on 24 Nov 2026
+  around the US open, replayed through the real connector parsers, the engine and the snapshot
+  builder. The test checks prices, the DXY formula, latency and the schema.
+- **Tools:**
+  - `tools/record.py`: record live frames for replay.
+  - `tools/check_latency.py` (= `python -m moneyflow check`): latency and freshness report.
+  - `tools/measure_resources.py`: CPU and RAM report.
+
+---
+
+## 11. Limits: what is real-time and what is not
+
+| Truly real-time (≤ 0.4 s) | Real-time **proxies** | Delayed or slow (labelled) |
+|---|---|---|
+| Bitcoin, Ether (Binance spot) | Nasdaq 100, S&P 500, ANT, gold, silver, oil: **Binance perpetual index prices**, not the cash index or ETF. Weekend prices are perpetual price discovery. | **VIX level: 15 min delayed** (licence) |
+| Binance perpetual index and mark prices (1 s) | Bonds outside US hours: **TMF perpetual ÷ 3** (thin, about $2M/day) | **10Y yield: FRED daily close**, 1-2 business days old |
+| DXY computed from OANDA FX (~0.3 s) | VIX direction: **UVXY perpetual** | **Stablecoin supply: hourly**; total crypto cap from CoinGecko is 5-10 min old (moved live by Binance prices) |
+| TLT/HYG/IEF on IEX during US hours (~0.13 s) | Stablecoin share between CoinGecko polls: moved by a 5-coin basket | Headlines: depends on the publisher (FinancialJuice ~minutes; Finnhub 15-45 min) |
+| Alpaca news stream | | Open interest: polled each minute; ETF flows: not available for free (see 4.3) |
+
+More caveats:
+- **IEX is one exchange.** Its prices are real-time, but its volume is a sample.
+- **Outside US hours** the HYG/IEF credit component drops out of the risk meter.
+- **σ adapts to the recent regime.** After a volatile month the same % move earns a smaller σ.
+- **Edges are inference.** Several assets falling while one rises will draw edges from all of
+  them. The correlation weighting keeps co-moving pairs out, but it cannot prove causation.
+- **Fed dates** come from the Fed's own page. An unscheduled meeting appears only once the Fed
+  publishes it.
+
+---
+
+## 12. Project layout
+
+```
+moneyflow/
+  cli.py          run / read / keys / check
+  engine.py       builds series from the config, runs connectors, seeds history, builds snapshots
+  series.py       ring buffers, instruments, DXY, stablecoin share, stitched series
+  stats.py        windows, σ estimators, volume, correlation, sparklines
+  flow.py         edges, risk composite
+  narrative.py    "what the flow says" rules
+  fed.py          FOMC calendar parser and countdown
+  news.py         RSS/Atom parsing, headline book
+  server.py       REST, WebSocket, SSE, webhooks, dashboard
+  clock.py        NTP-corrected clock, New York day roll, NYSE/FX/VIX calendars
+  keys.py         .env loading (whitelist) and redaction
+  history.py      on-disk grid cache
+  latency.py      the `check` command
+  client.py       a small Python client
+  connectors/     binance, alpaca, finnhub, coinbase, hyperliquid, pollers (Cboe, CoinGecko,
+                  DefiLlama, FRED, Fed, Forex Factory, Farside, RSS, Yahoo)
+  static/         the dashboard (index.html, app.js, style.css)
+  schema/         snapshot.schema.json
+  default.toml    every option, documented
+tests/            pytest suite + data/ (FOMC page excerpt, recorded frames)
+tools/            record.py, check_latency.py, measure_resources.py
+examples/         client.py, webhook_receiver.py
+start.ps1 / start.bat
+```
