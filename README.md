@@ -140,7 +140,8 @@ weight(A→B) = sqrt(|z_A| · z_B) · (1 − ρ_AB) / 2
 - `ρ_AB` is the correlation of A's and B's step returns **inside the window**: 1-minute steps for 1H, 5-minute for TODAY, hourly for 1W.
 - A rotation looks like one asset sold while the other is bought, step by step (ρ → −1). That keeps the full weight.
 - Assets that merely moved together (ρ → +1) get **no edge**.
-- Unknown ρ counts as 0.5.
+- Unknown ρ counts as 0 (factor 0.5).
+- So does the stablecoin share against BTC and ETH. The share is computed from their prices, so its correlation with them (about −1) is arithmetic, not evidence of a rotation. Such an edge shows no ρ.
 - Defaults: θ = 0.5σ, at most 16 edges and 5 per asset, minimum weight 0.3.
 
 The strongest edge is the "strongest flow". It is a statement about *simultaneous opposite
@@ -604,8 +605,9 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - key loading and redaction;
   - New York trading-day roll across DST, NYSE holidays and early closes, FX and VIX hours;
   - the ring buffers;
+  - the stitched bonds series: the 1- and 5-minute series agreeing, gaps in the proxy, and bonds without an Alpaca key in US hours;
   - σ estimators on exact synthetic series;
-  - edge weights and the risk composite;
+  - edge weights (including series built from each other) and the risk composite;
   - narrative rules (including the reference screenshot's read);
   - Fed calendar parsing;
   - RSS/Atom and news de-duplication;
@@ -661,6 +663,10 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - Thanksgiving (US shut, FX and crypto live), a Saturday (FX shut) and the 13:00 early close;
   - a real daily roll replayed from the cache;
   - token mode in the browser.
+- **Live market transitions, 24 Nov 2026:**
+  - **US close (21:00 UTC):** within 20 s bonds switched from TLT to TMF ÷ 3 and carried on from TLT's last price with no jump. HYG/IEF and the ETF reference quotes went to "closed", and the caveats appeared.
+  - **Daily roll (17:00 New York, 22:00 UTC):** TODAY switched to "since 17:00 New York Tue 24 Nov" by 22:00:02, with z-scores for all 11 assets throughout (σ > 0, nothing "warming up"). A copy with keys and one without agreed on bonds after the roll (+0.027% vs +0.026%, same σ).
+  - The dollar went "stale" for about 4 minutes after 17:00 New York, when FX quotes pause for the daily rollover. That is correct.
 - **Optional parts tested live:**
   - the Hyperliquid connector, whose Nasdaq-100 perp read z −1.08 against −1.13 from Binance's QQQ contract;
   - the copper, Russell 2000 and OpenAI nodes;
@@ -679,7 +685,9 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - labels and badges now make room for same-row neighbours on tablets;
   - **bonds' TODAY move differed by 0.1% between two copies of the service.** Found by running one with keys and one without, side by side. The one-day 1-minute bonds series restarted from TLT's raw close at the start of its window, dropping the proxy's moves since the close. It now starts from the 5-minute series, at a 5-minute boundary where the proxy's own close is known, and a gap in the proxy's data no longer drops a move. The two series now agree within 0.0002% outside US hours (in US hours both are TLT's real bars);
   - **without an Alpaca key the bonds node was blank.** It now takes TLT's history from Yahoo's chart API and follows the TMF proxy from TLT's real close. With and without keys, the TODAY baselines agreed within 0.013% and the moves within 0.007 points;
-  - **...and in US hours it would have stayed frozen at that close.** A price carried forward from history counted as "trading" during market hours, so the bonds series kept TLT's old close instead of following its proxy. A carried price now counts as trading only once live data has arrived.
+  - **...and in US hours it would have stayed frozen at that close.** A price carried forward from history counted as "trading" during market hours, so the bonds series kept TLT's old close instead of following its proxy. A carried price now counts as trading only once live data has arrived;
+  - **"Bitcoin → Stablecoins, ρ −1.00" was drawn as the strongest kind of rotation.** The stablecoin share is computed from Bitcoin's and Ether's prices, so that correlation is arithmetic. It now counts as unknown (section 3.4), which halves such an edge's weight;
+  - **for up to a minute after the daily roll, σ from the previous day was still served** (cached), so z-scores were about 6× too small (Bitcoin's σ read 2.46% instead of 0.43% until 22:00:47). Seen in the live roll; everything cached is now dropped when the trading day changes.
 
 **Verification pass on 24 Nov 2026, during US hours.**
 

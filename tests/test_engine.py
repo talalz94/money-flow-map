@@ -123,6 +123,46 @@ def test_keyless_bonds_follow_the_proxy_from_tlts_real_close(cfg, monkeypatch, t
     assert bonds.inst.active_source(t_end) is tmf
 
 
+def test_share_and_its_own_basket_are_not_a_rotation(cfg, keys, monkeypatch):
+    """The stablecoin share is computed from BTC and ETH prices, so it correlates with them at about
+    -1 by arithmetic. Flow inference must treat that as unknown (weight factor 0.5): it once drew
+    'Bitcoin -> Stablecoins, corr -1.00' as the strongest kind of rotation."""
+    from conftest import filled_engine_at
+    from moneyflow import flow
+    now = ny_ts(2026, 11, 24, 12, 0)
+    eng = filled_engine_at(cfg, keys, now)
+    assert eng._linked_pairs() == {("btc", "stables"), ("stables", "btc"), ("eth", "stables"), ("stables", "eth")}
+    seen = {}
+    real = flow.infer_edges
+
+    def spy(z, corr_fn, **kw):
+        seen.update(btc=corr_fn("btc", "stables"), eth=corr_fn("stables", "eth"), gold=corr_fn("gold", "stables"))
+        return real(z, corr_fn, **kw)
+
+    monkeypatch.setattr(flow, "infer_edges", spy)
+    eng.build_tf("today", now)
+    assert seen["btc"] is None and seen["eth"] is None
+    assert isinstance(seen["gold"], float)                  # unrelated pairs keep their correlation
+
+
+def test_daily_roll_drops_values_cached_for_the_old_day(cfg, keys):
+    """At 17:00 New York TODAY starts a new window. Values cached for the old one (σ for up to a
+    minute) were still served after it: z-scores ~6x too small, seen live on 24 Nov."""
+    import math
+    from conftest import filled_engine_at
+    from moneyflow import stats
+    before = ny_ts(2026, 11, 24, 16, 59) + 30
+    eng = filled_engine_at(cfg, keys, before)
+    btc = eng.series["btc"]
+    old = eng.read(btc, stats.window_for("today", before), before)["sigma_pct"]   # fills the cache
+    after = ny_ts(2026, 11, 24, 17, 0) + 5
+    eng.tick(after)
+    r = eng.read(btc, stats.window_for("today", after), after)
+    fresh, _, _ = stats.sigma_for("today", btc.inst, after)
+    assert r["sigma_pct"] == pytest.approx((math.exp(fresh) - 1) * 100, abs=1e-4)
+    assert abs(r["sigma_pct"] - old) > 1e-3                 # the new day's σ really differs
+
+
 def test_history_retries_until_complete(cfg, keys, monkeypatch, tmp_path):
     """If the network is down at start, history is retried rather than left empty for the session."""
     from moneyflow.connectors import binance as bn

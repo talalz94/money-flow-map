@@ -450,6 +450,12 @@ class Engine:
     # ── the clock tick ──────────────────────────────────────────────────────────────────────
     def tick(self, now: float | None = None) -> None:
         now = now or self.clock.now()
+        roll = clock.day_roll(now)
+        if roll != getattr(self, "_roll_seen", roll):
+            # 17:00 New York: TODAY starts a new window. Nothing computed for the old one may be served
+            # after it (σ was, for up to a minute: z-scores ~6x too small, seen live on 24 Nov).
+            self._cache.clear()
+        self._roll_seen = roll
         for inst in self.instruments.values():
             inst.roll(now)
         self._ensure_share_anchor(now)
@@ -641,6 +647,21 @@ class Engine:
                 "note": "Rises mechanically when crypto prices fall; supply change = real new cash."}
 
     # ── snapshots ───────────────────────────────────────────────────────────────────────────
+    def _linked_pairs(self) -> set:
+        """Series pairs where one is computed from the other's price: the stablecoin share is moved
+        by the BTC and ETH it is set against, so it correlates with them at about -1 by arithmetic.
+        Flow inference treats such a correlation as unknown instead of as proof of a rotation."""
+        if getattr(self, "_linked", None) is None:
+            by_inst = {id(s.inst): sid for sid, s in self.series.items()}
+            pairs = set()
+            for a, s in self.series.items():
+                for i in getattr(s.inst, "inputs", None) or []:
+                    b = by_inst.get(id(i))
+                    if b is not None and b != a:
+                        pairs |= {(a, b), (b, a)}
+            self._linked = pairs
+        return self._linked
+
     def _returns(self, tf: str, w, now):
         return self._cached(("rets", tf), 10 if tf == "1h" else 30,
                             lambda: {sid: stats.step_returns(s.inst, w, now) for sid, s in self.series.items()}, now)
@@ -652,8 +673,11 @@ class Engine:
         z_nodes = {sid: v for sid, v in z_all.items() if self.series[sid].node}
         rets = self._returns(tf, w, now)
         memo = {}
+        linked = self._linked_pairs()
 
         def corr_fn(a, b):
+            if (a, b) in linked:
+                return None          # one is computed from the other: arithmetic, not a rotation
             k = (a, b)
             if k not in memo:
                 memo[k] = self._cached(("corr", tf, a, b), 30, lambda: stats.corr(rets.get(a, {}), rets.get(b, {})), now)
