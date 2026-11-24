@@ -500,6 +500,10 @@ machine (its *Processes* tab, 8 logical cores).
 | **+ 1 WebSocket client** (8 min; the load of one open dashboard: a full ~87 KB snapshot every second) | **3.7% / 3.1% / 7.8%** | **0.46%** | 78-82 MB | 61-65 MB |
 | Headless, first config, first hour after the open (10 min; also streamed IEF/HYG bid/ask, since dropped) | 3.9% / 3.1% / 9.3% | 0.49% | 75-79 MB | 60-63 MB |
 
+- **25-minute soak** (after the verification fixes, with the dashboard tab connected): 50 samples, 30 s apart.
+  - Memory flat: 75.6 MB at the start, 74.2 MB at the end, 78.6 MB at most.
+  - CPU averaged 3.6% of one core (at most 7.5%).
+  - Every asset was live in every sample, with zero source errors.
 - **Start to ready:** 9-21 s from the history cache.
 - **Threads:** 18.
 - **Peaks:** occasional single-second peaks of 12-22% of one core come from the periodic jobs:
@@ -568,8 +572,14 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 | 20 s later | `history gap since 15:07:21Z refilled`. |
 | 40 s later | Every stream has reconnected (2 connects each) and all 11 nodes are **LIVE** with data ages of 0.1-5 s. |
 
+The same test was repeated **in place on the running service** after the verification fixes.
+It detected a 154 s jump and all six streams reconnected. **All 11 assets were live again 12 s
+after waking**, and the gap's history was back-filled 15 s after.
+
 Real network loss was not simulated on this PC: that needs admin rights and would cut your
 connection. It is covered by the drop and silence tests and by the same reconnect code.
+Closing the console window uses the same graceful-stop handler as Ctrl+Break, which was tested;
+closing the window itself was not.
 
 ---
 
