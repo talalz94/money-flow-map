@@ -687,7 +687,8 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - **without an Alpaca key the bonds node was blank.** It now takes TLT's history from Yahoo's chart API and follows the TMF proxy from TLT's real close. With and without keys, the TODAY baselines agreed within 0.013% and the moves within 0.007 points;
   - **...and in US hours it would have stayed frozen at that close.** A price carried forward from history counted as "trading" during market hours, so the bonds series kept TLT's old close instead of following its proxy. A carried price now counts as trading only once live data has arrived;
   - **"Bitcoin → Stablecoins, ρ −1.00" was drawn as the strongest kind of rotation.** The stablecoin share is computed from Bitcoin's and Ether's prices, so that correlation is arithmetic. It now counts as unknown (section 3.4), which halves such an edge's weight;
-  - **for up to a minute after the daily roll, σ from the previous day was still served** (cached), so z-scores were about 6× too small (Bitcoin's σ read 2.46% instead of 0.43% until 22:00:47). Seen in the live roll; everything cached is now dropped when the trading day changes.
+  - **for up to a minute after the daily roll, σ from the previous day was still served** (cached), so z-scores were about 6× too small (Bitcoin's σ read 2.46% instead of 0.43% until 22:00:47). Seen in the live roll; everything cached is now dropped when the trading day changes;
+  - after a restart in the 17:00 New York lull the dollar read "stale" for 11 minutes with no reason given. One FX pair had not ticked yet; the Finnhub source now names such pairs.
 
 **Verification pass on 24 Nov 2026, during US hours.**
 
@@ -729,6 +730,10 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
 More caveats:
 - **IEX is one exchange.** Its prices are real-time, but its volume is a sample.
 - **Outside US hours** the HYG/IEF credit component drops out of the risk meter.
+- **After a restart, the dollar needs a first tick from all six FX pairs.** Usually that takes
+  seconds. In the rollover lull just after 17:00 New York it took up to 11 minutes (24 Nov). Until
+  then the node shows ICE's last DXY, marked stale, and the Finnhub source lists the silent pairs
+  ("no tick yet from …").
 - **σ adapts to the recent regime.** After a volatile month the same % move earns a smaller σ.
 - **Edges are inference.** Several assets falling while one rises will draw edges from all of
   them. The correlation weighting keeps co-moving pairs out, but it cannot prove causation.

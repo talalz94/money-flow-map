@@ -51,6 +51,16 @@ class FinnhubStream(StreamConnector):
                     inst.on_price(float(d["p"]), d["t"] / 1000.0, recv)
         elif t == "error":
             self.error(f"Finnhub: {j.get('msg')}")
+        self.note_silent()
+
+    def note_silent(self) -> None:
+        """Name the pairs with no tick yet since the start. The DXY needs all six, and a thin pair
+        (USD/SEK) can stay silent for many minutes in the 17:00 New York rollover lull."""
+        silent = [s.split(":")[-1] for s, inst in sorted(self.subs.items()) if not inst.live_seen]
+        detail = f"no tick yet from {', '.join(silent)}" if silent and clock.fx_open(self.now()) else ""
+        if self.health.state == "connected" and self.health.detail != detail and (
+                detail or self.health.detail.startswith("no tick yet")):
+            self.health.detail = detail
 
 
 class FinnhubNews(PollConnector):

@@ -184,6 +184,27 @@ def test_quiet_markets_do_not_cause_reconnect_storms(keys):
         assert cls.heartbeat and cls.heartbeat <= 30          # the link itself is always checked
 
 
+def test_finnhub_names_pairs_with_no_tick_yet(keys):
+    """The DXY needs all six pairs. After a restart in the 17:00 New York rollover lull one thin pair
+    stayed silent for 9+ minutes and the dollar just read "stale": the feed now says which pair."""
+    import json
+    from conftest import ny_ts
+    from moneyflow.connectors.finnhub import FinnhubStream
+    from moneyflow.series import Instrument
+    t = ny_ts(2026, 11, 24, 17, 10)
+    ctx = types.SimpleNamespace(engine=types.SimpleNamespace(), clock=clock.Clock(fixed=t), keys=keys, session=None)
+    f = FinnhubStream(ctx, {})
+    for s in ("OANDA:EUR_USD", "OANDA:USD_SEK"):
+        f.add(s, Instrument(f"finnhub:{s}", "finnhub", s, "fx"))
+    f.health.state = "connected"
+    f.on_text(json.dumps({"type": "ping"}), t)
+    assert f.health.detail == "no tick yet from EUR_USD, USD_SEK"
+    f.on_text(json.dumps({"type": "trade", "data": [{"s": "OANDA:EUR_USD", "p": 1.09, "t": t * 1000}]}), t + 0.3)
+    assert f.health.detail == "no tick yet from USD_SEK"
+    f.on_text(json.dumps({"type": "trade", "data": [{"s": "OANDA:USD_SEK", "p": 10.2, "t": t * 1000}]}), t + 0.3)
+    assert f.health.detail == ""
+
+
 def test_kick_forces_an_immediate_reconnect():
     async def go():
         runner, url, hits = await start_server("silent")
