@@ -158,6 +158,12 @@ class StreamConnector(Connector):
     def url(self) -> str:
         raise NotImplementedError
 
+    def idle_limit(self) -> float:
+        """Seconds of silence after which the feed is treated as dead. Streams whose market can be
+        closed override this: a silent feed is normal then, and the websocket heartbeat (ping/pong)
+        still detects a dead connection, so there is no need to reconnect every few minutes."""
+        return self.idle_timeout
+
     def ws_headers(self) -> dict | None:
         return None
 
@@ -226,11 +232,12 @@ class StreamConnector(Connector):
             self.health.connected_since = self.now()
             await self.on_open(ws)
             while True:
+                limit = self.idle_limit()
                 try:
-                    msg = await ws.receive(timeout=self.idle_timeout)
+                    msg = await ws.receive(timeout=limit)
                 except asyncio.TimeoutError:
-                    self.health.detail = f"silent for {self.idle_timeout:.0f}s, reconnecting"
-                    self.log.info("%s silent for %.0fs: reconnecting", self.name, self.idle_timeout)
+                    self.health.detail = f"silent for {limit:.0f}s, reconnecting"
+                    self.log.info("%s silent for %.0fs: reconnecting", self.name, limit)
                     return
                 recv = self.now()
                 if msg.type == aiohttp.WSMsgType.TEXT:

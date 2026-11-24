@@ -91,6 +91,12 @@ class AlpacaStream(StreamConnector):
     def add(self, symbol: str, inst) -> None:
         self.subs[symbol.upper()] = inst
 
+    def idle_limit(self) -> float:
+        # overnight and at weekends IEX is silent by design: rely on the heartbeat, not on silence
+        if clock.market_open("us_extended", self.now()):
+            return self.idle_timeout
+        return 3600.0
+
     def available(self):
         if not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"):
             return False, "no ALPACA_KEY_ID / ALPACA_SECRET"
@@ -164,7 +170,7 @@ class AlpacaStream(StreamConnector):
 class AlpacaNews(StreamConnector):
     name = "alpaca_news"
     title = "Alpaca news (real-time)"
-    idle_timeout = 900.0
+    idle_timeout = 3600.0      # news can be quiet for long stretches; the heartbeat checks the link
     heartbeat = 25.0
 
     def available(self):

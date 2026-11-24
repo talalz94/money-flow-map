@@ -7,7 +7,7 @@ The token travels in the websocket URL, so every error string is passed through 
 """
 from __future__ import annotations
 
-from .. import jsonutil
+from .. import clock, jsonutil
 from .base import PollConnector, StreamConnector
 
 
@@ -23,6 +23,11 @@ class FinnhubStream(StreamConnector):
 
     def add(self, symbol: str, inst) -> None:
         self.subs[symbol] = inst
+
+    def idle_limit(self) -> float:
+        # Finnhub pings every 60 s (measured), but FX is shut from Friday to Sunday 17:00 New York:
+        # do not treat a quiet weekend as a dead feed (the websocket heartbeat checks the link)
+        return self.idle_timeout if clock.fx_open(self.now()) else 3600.0
 
     def available(self):
         if not self.keys.has("FINNHUB_KEY"):

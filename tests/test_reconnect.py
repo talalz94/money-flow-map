@@ -120,6 +120,27 @@ def test_handshake_429_waits_instead_of_hammering():
     assert p.retry_delay() >= 100 and "HTTP 429" in p.health.detail
 
 
+def test_quiet_markets_do_not_cause_reconnect_storms(keys):
+    """Overnight and at weekends IEX and FX are silent by design: the silence limit stretches to an
+    hour (the websocket heartbeat still detects a dead link), instead of reconnecting every 2-10 min."""
+    from conftest import ny_ts
+    from moneyflow.connectors.alpaca import AlpacaNews, AlpacaStream
+    from moneyflow.connectors.finnhub import FinnhubStream
+
+    def ctx_at(ts):
+        return types.SimpleNamespace(engine=types.SimpleNamespace(), clock=clock.Clock(fixed=ts), keys=keys, session=None)
+
+    open_ts, night_ts, saturday = ny_ts(2026, 11, 24, 11), ny_ts(2026, 11, 24, 22), ny_ts(2026, 11, 28, 12)
+    assert AlpacaStream(ctx_at(open_ts), {}).idle_limit() == 600.0
+    assert AlpacaStream(ctx_at(night_ts), {}).idle_limit() == 3600.0
+    assert AlpacaStream(ctx_at(saturday), {}).idle_limit() == 3600.0
+    assert FinnhubStream(ctx_at(open_ts), {}).idle_limit() == 120.0
+    assert FinnhubStream(ctx_at(saturday), {}).idle_limit() == 3600.0
+    assert AlpacaNews(ctx_at(open_ts), {}).idle_limit() == 3600.0
+    for cls in (AlpacaStream, AlpacaNews, FinnhubStream):
+        assert cls.heartbeat and cls.heartbeat <= 30          # the link itself is always checked
+
+
 def test_kick_forces_an_immediate_reconnect():
     async def go():
         runner, url, hits = await start_server("silent")
