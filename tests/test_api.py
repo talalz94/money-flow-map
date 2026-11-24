@@ -26,6 +26,7 @@ def filled_engine(cfg, keys) -> Engine:
                   for k in range(k_now - 35 * 288, k_now)]
         inst.seed("g5", closes, NOW, [(t, 1e6, 5e5) for t, _ in closes] if inst.v5 is not None else None)
         inst.price, inst.ts, inst.recv_ts = closes[-1][1], NOW - 0.5, NOW - 0.4
+        inst._live_seen = True                      # as if a live message had just arrived
     eng.fomc = fed.parse_fomc((DATA / "fomc_excerpt.html").read_text(encoding="utf-8"))
     eng.news.add([{"title": "Fed holds rates steady", "url": "https://example.org/a", "ts": NOW - 120, "source": "Test"}], NOW)
     for d in eng.derived:
@@ -76,6 +77,65 @@ def test_rest_endpoints_and_schema(cfg, keys):
     run(go())
 
 
+def test_webhooks_deliver_events_and_skip_startup_noise(cfg, keys):
+    import aiohttp
+    from aiohttp import web
+    from moneyflow.server import Webhooks
+
+    got = []
+
+    async def go():
+        async def hook(request):
+            got.append(await request.json())
+            return web.Response(status=204)
+        app = web.Application()
+        app.router.add_post("/hook", hook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        eng = filled_engine(cfg, keys)
+        async with aiohttp.ClientSession() as s:
+            eng.ctx.session = s
+            wh = Webhooks(eng, {"targets": [{"url": f"http://127.0.0.1:{port}/hook",
+                                             "events": ["regime_change", "strongest_flow_change", "extreme_move"]}],
+                                "min_interval_s": 0, "extreme_z": 1.0})
+            eng.seed_state["state"] = "running"
+            assert not wh.due(NOW)                                  # history not loaded: nothing sent
+            eng.seed_state["state"] = "done"
+            assert wh.due(NOW)
+            snap = eng.snapshot()
+            tf = snap["timeframes"][snap["default_timeframe"]]
+            tf["risk"]["label"] = "NO DATA"
+            for n in tf["nodes"]:
+                if n["id"] == "btc":
+                    n["z"] = 0.0                                    # btc calm at the start
+            wh.check(snap, NOW)                                     # first read: sets the baseline only
+            snap2 = json.loads(json.dumps(snap))
+            t2 = snap2["timeframes"][snap2["default_timeframe"]]
+            t2["risk"]["label"], t2["risk"]["score"] = "RISK-OFF", -70
+            wh.check(snap2, NOW + 6)                                # NO DATA -> RISK-OFF: start-up, not news
+            snap3 = json.loads(json.dumps(snap2))
+            t3 = snap3["timeframes"][snap3["default_timeframe"]]
+            t3["risk"]["label"], t3["risk"]["score"] = "RISK-ON", 65
+            for n in t3["nodes"]:
+                if n["id"] == "btc":
+                    n["z"] = 3.5
+            wh.check(snap3, NOW + 12)
+            await asyncio.sleep(0.5)
+        await runner.cleanup()
+
+    run(go())
+    events = [g["event"] for g in got]
+    assert "regime_change" in events and events.count("regime_change") == 1
+    # assets already extreme at start-up are a baseline, not news: only btc (made extreme later) fires
+    assert {g["id"] for g in got if g["event"] == "extreme_move"} == {"btc"}
+    rc = next(g for g in got if g["event"] == "regime_change")
+    assert rc["from"] == "RISK-OFF" and rc["to"] == "RISK-ON" and rc["schema"] == "moneyflow.webhook/1"
+    assert any(g["event"] == "extreme_move" and g["id"] == "btc" for g in got)
+
+
 def test_cli_read_rendering(cfg, keys):
     from moneyflow.cli import fmt_read
     from moneyflow.server import one_tf
@@ -114,9 +174,12 @@ def test_websocket_and_sse_streams(cfg, keys):
             assert m["tf"] == "1h" and m["data"]["timeframe"] == "1h"
             hub = app[HUB_KEY]
             assert hub.n_clients == 1
-            await hub.broadcast(eng.snapshot())                           # a push reaches the client
+            same = eng.snapshot()
+            await hub.broadcast(same)                                     # already sent: not repeated
+            eng.clock.advance(1.0)
+            await hub.broadcast(eng.snapshot())                           # a new snapshot reaches the client
             m = json.loads((await ws.receive(timeout=5)).data)
-            assert m["tf"] == "1h"
+            assert m["tf"] == "1h" and m["data"]["generated_ts"] != same["generated_ts"]
             await ws.close()
             r = await c.get("/sse?tf=1w")
             assert r.headers["Content-Type"].startswith("text/event-stream")

@@ -32,10 +32,12 @@ button { font: inherit; color: inherit; }
 .wire-label { flex: none; display: flex; align-items: center; padding: 0 14px; background: #d9dee5; color: #0a0c10;
   font: 700 12px/1 var(--wide); letter-spacing: .24em; }
 .wire-track { position: relative; flex: 1; overflow: hidden; }
-.wire-inner { position: absolute; white-space: nowrap; top: 0; bottom: 0; display: flex; align-items: center; gap: 34px;
-  padding-left: 100%; animation: wire 120s linear infinite; will-change: transform; }
+.wire-inner { position: absolute; white-space: nowrap; top: 0; bottom: 0; display: flex; align-items: center;
+  padding-left: 18px; animation: wire 120s linear infinite; will-change: transform; }
+.wire-copy { display: flex; align-items: center; gap: 34px; padding-right: 34px; }
 .wire:hover .wire-inner, body.hidden .wire-inner, body.still .wire-inner { animation-play-state: paused; }
-@keyframes wire { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+/* the headlines are written twice in a row: sliding by half the width loops seamlessly */
+@keyframes wire { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 .wi { display: inline-flex; align-items: center; gap: 9px; font-size: 14px; }
 .wi a { color: var(--text); text-decoration: none; }
 .wi a:hover { text-decoration: underline; }
@@ -78,6 +80,7 @@ h1 { margin: 0; font: 700 30px/1 var(--wide); letter-spacing: .2em; }
 .tip .tfrow div { background: #0b1016; border: 1px solid var(--line); border-radius: 6px; padding: 5px 2px; font: 12px var(--mono); }
 .tip .tfrow b { display: block; font: 600 10px var(--wide); letter-spacing: .12em; color: var(--muted); }
 .tip .note { color: var(--muted); margin-top: 6px; font-size: 11.5px; }
+.tipspark { display: block; width: 100%; height: 46px; margin: 2px 0 6px; background: #0b1016; border: 1px solid var(--line); border-radius: 6px; }
 .badge { display: inline-block; font: 600 10px/1 var(--mono); padding: 3px 6px; border-radius: 4px; letter-spacing: .04em; }
 .b-live { background: rgba(34,211,138,.14); color: #5ef0b0; }
 .b-delayed { background: rgba(242,184,75,.15); color: var(--amber); }
@@ -129,5 +132,12 @@ h1 { margin: 0; font: 700 30px/1 var(--wide); letter-spacing: .2em; }
 .foot .conn.ok { color: var(--in); } .foot .conn.bad { color: var(--out); }
 @media (max-width: 640px) {
   h1 { font-size: 22px; } .subtitle { font-size: 10px; letter-spacing: .18em; }
-  .layout { padding: 10px 16px; } .tiles { grid-template-columns: 1fr; } .mapwrap { min-height: 460px; }
+  .layout { padding: 10px 16px; } .tiles { grid-template-columns: 1fr; }
+  .wire-label { padding: 0 10px; font-size: 10px; letter-spacing: .16em; }
+  .tfs button, .ghost { padding: 7px 11px; }
+  /* phones: a tall map (nodes re-flow into two columns) with the legend underneath it */
+  .mapwrap { height: auto; min-height: 0; }
+  #map { height: min(175vw, 900px); }
+  .legend { position: static; padding: 8px 12px 10px; gap: 6px 12px; }
+  .window-label { font-size: 11px; }
 }

@@ -108,6 +108,63 @@ def test_kick_forces_an_immediate_reconnect():
     asyncio.run(go())
 
 
+def _alpaca_like_server(answer_code=None):
+    """A fake Alpaca stream: 'connected', then the login answer (success, or an error code)."""
+    seen = []
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str('[{"T":"success","msg":"connected"}]')
+        async for m in ws:
+            j = __import__("json").loads(m.data)
+            seen.append(j.get("action"))
+            if j.get("action") == "auth":
+                if answer_code:
+                    await ws.send_str(f'[{{"T":"error","code":{answer_code},"msg":"connection limit exceeded"}}]')
+                    await ws.close()
+                    break
+                await ws.send_str('[{"T":"success","msg":"authenticated"}]')
+            elif j.get("action") == "subscribe":
+                await ws.send_str('[{"T":"subscription","trades":["TLT"]}]')
+                await ws.send_str('[{"T":"t","S":"TLT","p":81.5,"s":100,"t":"2026-11-24T16:30:00.123456789Z"}]')
+        return ws
+    return handler, seen
+
+
+def test_alpaca_waits_for_login_and_treats_406_as_refused_not_bad_keys(cfg, keys):
+    from moneyflow.connectors.alpaca import AlpacaStream
+    from moneyflow.series import Instrument
+
+    async def go(code):
+        handler, seen = _alpaca_like_server(code)
+        app = web.Application()
+        app.router.add_get("/ws", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        async with aiohttp.ClientSession() as s:
+            ctx = types.SimpleNamespace(engine=types.SimpleNamespace(), clock=clock.Clock(), keys=keys, session=s)
+            a = AlpacaStream(ctx, {"ws_url": f"ws://127.0.0.1:{port}/ws", "quote_symbols": []})
+            tlt = Instrument("alpaca:TLT", "alpaca", "TLT", "24/7")
+            a.add("TLT", tlt)
+            t = asyncio.create_task(a.run())
+            await asyncio.sleep(0.8)
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+        await runner.cleanup()
+        return a, seen, tlt
+
+    a, seen, tlt = asyncio.run(go(406))
+    assert seen == ["auth"]                                  # never subscribed on a refused login
+    assert not a.auth_failed and a.refused_until > 0         # 406 = connection limit, keys are fine
+    assert "connection limit" in a.health.detail and a.retry_delay() >= 60
+    a, seen, tlt = asyncio.run(go(None))
+    assert seen == ["auth", "subscribe"] and tlt.price == 81.5
+
+
 def test_poller_backs_off_on_errors_and_recovers():
     class Flaky(PollConnector):
         name = "flaky"
@@ -169,6 +226,53 @@ def test_gap_after_sleep_is_redownloaded_not_left_flat(cfg, keys, monkeypatch, t
     k_mid = int((sleep_at + 1800) // G5_STEP)
     assert inst.g5.get(k_mid) == 110.0                    # the gap now holds the real (downloaded) prices
     assert inst.g5.get(int((sleep_at - 3 * 3600) // G5_STEP)) == 100.0
+
+
+def test_rate_limit_waits_and_restart_reuses_the_disk_cache(tmp_path):
+    from moneyflow.connectors.base import RateLimited
+
+    class Src(PollConnector):
+        name = "src"
+        title = "src"
+        cache_ttl = 3600.0
+
+        def __init__(self, ctx, mode):
+            super().__init__(ctx, {"interval_s": 0.05})
+            self.mode, self.fetches, self.applied, self.delays = mode, 0, [], []
+
+        async def fetch(self):
+            self.fetches += 1
+            if self.mode == "limited":
+                raise RateLimited("https://example.org/feed", 900)
+            return {"value": 42}
+
+        def apply(self, data):
+            self.applied.append((data, self.fetches))
+
+        async def sleep(self, seconds):
+            self.delays.append(seconds)
+            await asyncio.sleep(0.01)
+
+    def ctx():
+        c = ctx_for(None)
+        c.data_dir = tmp_path
+        return c
+
+    async def go(src, t=0.15):
+        task = asyncio.create_task(src.run())
+        await asyncio.sleep(t)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return src
+
+    limited = asyncio.run(go(Src(ctx(), "limited")))
+    assert limited.delays and limited.delays[0] >= 900               # waits out the rate limit
+    assert "rate limited" in limited.health.detail
+    first = asyncio.run(go(Src(ctx(), "ok")))                        # downloads and caches
+    assert first.fetches >= 1 and first.applied[0] == ({"value": 42}, 1)
+    again = asyncio.run(go(Src(ctx(), "ok"), 0.05))                  # a restart: served from the cache
+    assert again.applied[0] == ({"value": 42}, 0)                    # applied before any download
+    assert again.delays[0] > 3000                                    # then waits out the cache's life
 
 
 def test_engine_resume_resyncs_and_kicks_every_connector(cfg, keys):

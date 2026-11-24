@@ -99,24 +99,29 @@ class CoinGeckoGlobal(PollConnector):
     name = "coingecko"
     title = "CoinGecko global market cap"
     interval = 300.0
+    cache_ttl = 600.0
     URL = "https://api.coingecko.com/api/v3/global"
 
-    async def poll(self):
+    async def fetch(self):
         j = await self.get_json(self.URL, headers={"User-Agent": POLITE_UA, "Accept": "application/json"})
         d = j.get("data") or {}
         total = (d.get("total_market_cap") or {}).get("usd")
         if not total:
             raise RuntimeError("no total market cap")
+        return {"total": float(total), "pct": d.get("market_cap_percentage") or {},
+                "updated_at": float(d.get("updated_at") or self.now()),
+                "chg24": d.get("market_cap_change_percentage_24h_usd")}
+
+    def apply(self, data):
         self.health.mark_msg(self.now())
-        self.engine.on_crypto_global(float(total), d.get("market_cap_percentage") or {},
-                                     float(d.get("updated_at") or self.now()),
-                                     d.get("market_cap_change_percentage_24h_usd"))
+        self.engine.on_crypto_global(data["total"], data["pct"], data["updated_at"], data.get("chg24"))
 
 
 class DefiLlamaStables(PollConnector):
     name = "defillama"
     title = "DefiLlama stablecoin supply"
     interval = 3600.0
+    cache_ttl = 3600.0
     NOW_URL = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
     HIST_URL = "https://stablecoins.llama.fi/stablecoincharts/all"
 
@@ -126,8 +131,14 @@ class DefiLlamaStables(PollConnector):
         self.hist_at = 0.0
         self.hist: list[tuple[float, float]] = []
 
-    async def poll(self):
-        if time.time() - self.hist_at > 12 * 3600:
+    def apply(self, data):
+        self.hist = [tuple(h) for h in data["hist"]]
+        self.hist_at = data.get("hist_at", self.hist_at)
+        self.health.mark_msg(self.now())
+        self.engine.on_stable_supply(data["now"], self.hist)
+
+    async def fetch(self):
+        if time.time() - self.hist_at > 12 * 3600 or not self.hist:
             j = await self.get_json(self.HIST_URL, headers={"User-Agent": POLITE_UA}, timeout=60)
             cut = time.time() - 60 * 86400
             self.hist = [(float(x["date"]), float((x.get("totalCirculatingUSD") or {}).get("peggedUSD") or 0))
@@ -146,22 +157,26 @@ class DefiLlamaStables(PollConnector):
             if c > 1e9:
                 top.append((a.get("symbol"), c, c - ((a.get("circulatingPrevDay") or {}).get("peggedUSD") or 0)))
         top.sort(key=lambda x: -x[1])
-        self.health.mark_msg(self.now())
-        self.engine.on_stable_supply({"total": tot, "d1": tot - d1, "w1": tot - w1, "m1": tot - m1,
-                                      "top": [{"symbol": s, "supply": c, "d1": dd} for s, c, dd in top[:6]],
-                                      "observed_at": self.now()}, self.hist)
+        now = {"total": tot, "d1": tot - d1, "w1": tot - w1, "m1": tot - m1,
+               "top": [{"symbol": s, "supply": c, "d1": dd} for s, c, dd in top[:6]], "observed_at": self.now()}
+        return {"now": now, "hist": self.hist, "hist_at": self.hist_at}
 
 
 class Fred(PollConnector):
     name = "fred"
     title = "FRED daily rates"
     interval = 21600.0
+    cache_ttl = 21600.0
     URL = "https://api.stlouisfed.org/fred/series/observations"
 
     def available(self):
         return (self.keys.has("FRED_API_KEY"), "no FRED_API_KEY")
 
-    async def poll(self):
+    def apply(self, data):
+        self.health.mark_msg(self.now(), len(data))
+        self.engine.on_fred(data)
+
+    async def fetch(self):
         out = {}
         for sid in self.cfg.get("series", ["DGS10", "DGS2", "BAMLH0A0HYM2"]):
             j = await self.get_json(self.URL, params={"series_id": sid, "api_key": self.keys.get("FRED_API_KEY"),
@@ -173,8 +188,9 @@ class Fred(PollConnector):
                             "prev_value": obs[1][1] if len(obs) > 1 else None,
                             "week_ago_value": obs[min(5, len(obs) - 1)][1]}
             await asyncio.sleep(0.6)
-        self.health.mark_msg(self.now(), len(out))
-        self.engine.on_fred(out)
+        if not out:
+            raise RuntimeError("FRED returned no observations")
+        return out
 
 
 class FedCalendar(PollConnector):
@@ -210,9 +226,14 @@ class FFCalendar(PollConnector):
     name = "ffcal"
     title = "Forex Factory weekly calendar"
     interval = 7200.0
+    cache_ttl = 7200.0
     URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-    async def poll(self):
+    def apply(self, data):
+        self.health.mark_msg(self.now(), len(data))
+        self.engine.on_calendar(data)
+
+    async def fetch(self):
         j = await self.get_json(self.URL, headers={"User-Agent": POLITE_UA})
         events = []
         for e in j:
@@ -222,8 +243,7 @@ class FFCalendar(PollConnector):
                 continue
             events.append({"title": e.get("title", ""), "country": e.get("country", ""), "impact": e.get("impact", ""),
                            "ts": ts, "forecast": e.get("forecast") or None, "previous": e.get("previous") or None})
-        self.health.mark_msg(self.now(), len(events))
-        self.engine.on_calendar(events)
+        return events
 
 
 def parse_farside(page: str) -> list[dict]:
@@ -261,9 +281,14 @@ class FarsideEtf(PollConnector):
     name = "farside"
     title = "Farside spot ETF flows (daily)"
     interval = 7200.0
+    cache_ttl = 7200.0
     PAGES = {"btc": "https://farside.co.uk/btc/", "eth": "https://farside.co.uk/eth/"}
 
-    async def poll(self):
+    def apply(self, data):
+        self.health.mark_msg(self.now(), len(data))
+        self.engine.on_etf_flows(data)
+
+    async def fetch(self):
         res = {}
         for k, url in self.PAGES.items():
             async with self.session.get(url, headers={"User-Agent": BROWSER_UA},
@@ -285,8 +310,7 @@ class FarsideEtf(PollConnector):
                           "week_total_musd": round(sum(r["total_musd"] for r in rows[-5:]), 1),
                           "recent": rows[-7:], "source": url}
             await asyncio.sleep(1.0)
-        self.health.mark_msg(self.now(), len(res))
-        self.engine.on_etf_flows(res)
+        return res
 
 
 class RssFeeds(PollConnector):

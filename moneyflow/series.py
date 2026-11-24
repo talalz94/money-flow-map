@@ -138,6 +138,7 @@ class Instrument:
         self.extra: dict = {}               # bid/ask, mark/index, funding, open interest ...
         self.lat_ms: deque = deque(maxlen=400)
         self.msgs = 0
+        self._live_seen = False             # a LIVE message arrived this session (cache/history do not count)
         self._k1 = None                     # open (not yet closed) 1-minute step
         self._k5 = None                     # open 5-minute step
         self._open_any = False              # did the open steps see a real update?
@@ -145,7 +146,9 @@ class Instrument:
         self._vol_acc: dict[int, list] = {}                   # minute -> [q, tb] from trades
 
     # ── live updates ────────────────────────────────────────────────────────────────────────
-    def on_price(self, price: float, ev_ts: float | None, recv_ts: float) -> None:
+    def on_price(self, price: float, ev_ts: float | None, recv_ts: float, measure: bool = True) -> None:
+        """A live price. `measure=False` for polled values (a REST "latest trade" can be minutes old
+        on a thin ETF: that is data age, not network latency, so it must not enter the latency stats)."""
         if not isnum(price) or price <= 0:
             return
         ev = ev_ts if ev_ts is not None else recv_ts
@@ -163,11 +166,20 @@ class Instrument:
         self.ts = ev
         self.recv_ts = recv_ts
         self.msgs += 1
-        if ev_ts is not None:
-            self.lat_ms.append((recv_ts - ev_ts) * 1000.0)
+        self._live_seen = True
+        if ev_ts is not None and measure:
+            lat = (recv_ts - ev_ts) * 1000.0
+            if lat <= 60_000:
+                self.lat_ms.append(lat)
+            else:                           # a late-reported print (e.g. an IEX trade reported minutes later)
+                self.extra["late_prints"] = self.extra.get("late_prints", 0) + 1
         if self._k1 is None:
             self._k1, self._k5 = int(ev // G1_STEP), int(ev // G5_STEP)
         self._open_any = True
+
+    @property
+    def live_seen(self) -> bool:
+        return self._live_seen
 
     def note_message(self, recv_ts: float, ev_ts: float | None = None) -> None:
         """A message that proves the feed is alive without a new price (e.g. an unchanged quote)."""
@@ -354,6 +366,10 @@ class Derived(Instrument):
         lats = [x for x in lats if x is not None]
         return max(lats) if lats else None
 
+    @property
+    def live_seen(self) -> bool:
+        return all(i.live_seen for i in self.inputs)
+
 
 class DXY(Derived):
     """ICE U.S. Dollar Index formula on six FX pairs:
@@ -497,8 +513,12 @@ class Stitched(Derived):
 
     def primary_live(self, now: float) -> bool:
         p = self.primary
-        return (clock.market_open(p.hours, now) and p.ts is not None and now - p.ts <= self.primary_max_age
-                and isnum(p.price))
+        return (p.live_seen and clock.market_open(p.hours, now) and p.ts is not None
+                and now - p.ts <= self.primary_max_age and isnum(p.price))
+
+    @property
+    def live_seen(self) -> bool:
+        return (self._active or self.proxy).live_seen
 
     def value_step(self, grid: str, k: int) -> float:
         g = getattr(self, grid)

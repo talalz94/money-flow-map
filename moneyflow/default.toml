@@ -30,7 +30,9 @@ theta = 0.5          # |z| a node needs to count as an inflow or outflow
 max_edges = 16
 per_node = 5
 min_weight = 0.3
-stale_after_s = 120  # a streaming source silent this long (market open) is shown as STALE
+stale_after_s = 120  # a streaming source silent this long (market open) is shown as STALE.
+                     # Alpaca IEX gets 600 s (thin ETFs trade on IEX only every few minutes);
+                     # any [[series]] can set its own stale_after_s
 
 [risk]
 scale = 1.5          # score = 100·tanh(S / scale)

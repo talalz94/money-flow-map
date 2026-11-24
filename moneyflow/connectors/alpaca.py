@@ -21,6 +21,33 @@ def _hdr(keys) -> dict:
     return {"APCA-API-KEY-ID": keys.get("ALPACA_KEY_ID") or "", "APCA-API-SECRET-KEY": keys.get("ALPACA_SECRET") or ""}
 
 
+class StreamRefused(Exception):
+    """Alpaca answered the login with an error (406 connection limit, 402 bad keys ...)."""
+
+    def __init__(self, code, msg):
+        super().__init__(f"Alpaca error {code}: {msg}")
+        self.code = code
+
+
+async def authenticate(conn, ws) -> None:
+    """Send the login and WAIT for its answer before subscribing. (Subscribing straight away makes
+    Alpaca answer a refused login with '401 not authenticated', which hides the real reason.)"""
+    import aiohttp
+    await ws.send_str(jsonutil.dumps({"action": "auth", "key": conn.keys.get("ALPACA_KEY_ID"),
+                                      "secret": conn.keys.get("ALPACA_SECRET")}))
+    deadline = conn.now() + 15
+    while conn.now() < deadline:
+        msg = await ws.receive(timeout=max(0.5, deadline - conn.now()))
+        if msg.type != aiohttp.WSMsgType.TEXT:
+            raise RuntimeError("Alpaca closed the connection during login")
+        for m in jsonutil.loads(msg.data):
+            if m.get("T") == "success" and m.get("msg") == "authenticated":
+                return
+            if m.get("T") == "error":
+                raise StreamRefused(m.get("code"), m.get("msg"))
+    raise RuntimeError("Alpaca login timed out")
+
+
 async def fetch_bars(conn, symbols: list[str], timeframe: str, start: float, end: float | None = None,
                      feed: str = "iex") -> dict[str, list[tuple]]:
     """-> {symbol: [(bar_start_ts, close, quote_volume)]} via the multi-symbol bars endpoint."""
@@ -80,11 +107,25 @@ class AlpacaStream(StreamConnector):
         return super().retry_delay()
 
     async def on_open(self, ws):
-        await ws.send_str(jsonutil.dumps({"action": "auth", "key": self.keys.get("ALPACA_KEY_ID"),
-                                          "secret": self.keys.get("ALPACA_SECRET")}))
+        try:
+            await authenticate(self, ws)
+        except StreamRefused as e:
+            self.refused(e.code, str(e))
+            raise
+        self.health.detail = "authenticated"
         syms = sorted(self.subs)
         await ws.send_str(jsonutil.dumps({"action": "subscribe", "trades": syms,
                                           "quotes": sorted(self.quote_syms & set(syms))}))
+
+    def refused(self, code, text: str) -> None:
+        if code == 406:          # connection limit exceeded: another app (or instance) holds the stream
+            self.refused_until = self.now() + 300
+            self.health.detail = "stream refused: connection limit (another app?) - REST fallback every 20 s"
+        elif code == 402:        # auth failed: wrong keys
+            self.auth_failed = True
+            self.health.detail = "Alpaca rejected the keys (auth failed)"
+        else:
+            self.health.detail = text[:120]
 
     def on_text(self, data, recv):
         for m in jsonutil.loads(data):
@@ -112,13 +153,7 @@ class AlpacaStream(StreamConnector):
             elif T == "error":
                 code, msg = m.get("code"), m.get("msg")
                 self.error(f"Alpaca error {code}: {msg}")
-                if code == 406:          # connection limit exceeded (another app holds the stream)
-                    self.refused_until = self.now() + 300
-                    self.health.detail = "stream refused: connection limit (another app?) - REST fallback"
-                if code in (401, 402):   # auth failed / not authenticated
-                    self.auth_failed = True
-            elif T == "success" and m.get("msg") == "authenticated":
-                self.health.detail = "authenticated"
+                self.refused(code, f"Alpaca error {code}: {msg}")
 
     @staticmethod
     def _mid_ok(inst) -> bool:
@@ -143,9 +178,21 @@ class AlpacaNews(StreamConnector):
         return self.cfg.get("news_ws_url", "wss://stream.data.alpaca.markets/v1beta1/news")
 
     async def on_open(self, ws):
-        await ws.send_str(jsonutil.dumps({"action": "auth", "key": self.keys.get("ALPACA_KEY_ID"),
-                                          "secret": self.keys.get("ALPACA_SECRET")}))
+        try:
+            await authenticate(self, ws)
+        except StreamRefused as e:
+            self.health.detail = str(e)[:120]
+            if e.code == 406:
+                self.refused_until = self.now() + 300
+            raise
         await ws.send_str(jsonutil.dumps({"action": "subscribe", "news": ["*"]}))
+
+    refused_until = 0.0
+
+    def retry_delay(self):
+        if self.now() < self.refused_until:
+            return max(60.0, self.refused_until - self.now())
+        return super().retry_delay()
 
     # The stream carries every company press release (measured: ~2 a second at the US open, mostly
     # micro-caps). Only items about the map's tickers or macro themes reach the news wire.
@@ -180,6 +227,7 @@ class AlpacaFallback(PollConnector):
         super().__init__(ctx, cfg)
         self.stream = stream
         self.interval = 20.0
+        self.started = self.now()
 
     def available(self):
         return self.stream.available()
@@ -187,6 +235,9 @@ class AlpacaFallback(PollConnector):
     async def poll(self):
         if self.stream.health.state == "connected" and self.stream.ws is not None:
             self.health.detail = "standby (stream connected)"
+            return
+        if self.now() - self.started < 30 and not self.stream.refused_until:
+            self.health.detail = "standby (stream connecting)"     # give the stream time at start-up
             return
         if not any(clock.market_open(i.hours, self.now()) for i in self.stream.subs.values()):
             self.health.detail = "standby (US market closed)"
@@ -198,7 +249,7 @@ class AlpacaFallback(PollConnector):
         for sym, t in (j.get("trades") or {}).items():
             inst = self.stream.subs.get(sym)
             if inst is not None and t.get("p"):
-                inst.on_price(float(t["p"]), clock.parse_iso(t["t"]), recv)
+                inst.on_price(float(t["p"]), clock.parse_iso(t["t"]), recv, measure=False)
         self.health.mark_msg(recv)
         self.health.detail = "polling (stream down)"
 

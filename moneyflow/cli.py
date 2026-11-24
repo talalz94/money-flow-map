@@ -72,13 +72,26 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
           f"  Dashboard:  {url if dashboard else '(off: started with --no-dashboard)'}\n  Stop:       Ctrl+C\n", flush=True)
     if open_browser and dashboard:
         webbrowser.open(url)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _graceful(*_):
+        loop.call_soon_threadsafe(stop.set)
+
+    import signal
+    for name in ("SIGBREAK", "SIGTERM"):          # Ctrl+Break / closing the console window; kill
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), _graceful)
+            except (ValueError, OSError):
+                pass
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await stop.wait()
     finally:
-        log.info("stopping...")
+        log.info("stopping (saving the history cache)...")
         await engine.stop()
         await runner.cleanup()
+        log.info("stopped")
 
 
 def fmt_read(snap: dict) -> str:
@@ -202,6 +215,13 @@ def main(argv=None) -> int:
     setup_logging(cfg, keys, getattr(args, "log_level", None))
     if cmd == "check":
         from . import latency
+        from .client import is_running
+        if is_running(f"http://127.0.0.1:{cfg['server']['port']}"):
+            print("moneyflow is running: stop it first (Alpaca's free plan allows one stream connection,\n"
+                  "so a second one would be refused and the check would measure the REST fallback).\n"
+                  "While it runs, the dashboard and /api/sources already show live latency per source.",
+                  file=sys.stderr)
+            return 2
         return asyncio.run(latency.main(cfg, keys, args.seconds, args.out))
     dashboard = bool(cfg["server"].get("dashboard", True))
     open_browser = bool(getattr(args, "open", False) or cfg["server"].get("open_browser", False))

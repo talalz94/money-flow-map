@@ -72,6 +72,18 @@ def traded_in_window(inst: Instrument, w: Window, now: float) -> bool:
     return False
 
 
+def first_data_ts(inst: Instrument) -> float | None:
+    """Start of the oldest 5-minute step holding a price (when an asset's history begins)."""
+    g = inst.g5
+    if g.last_k is None:
+        return None
+    for k in range(g.first_k(), g.last_k + 1):
+        v = g.get(k)
+        if v == v:
+            return k * g.step
+    return None
+
+
 def window_return(inst: Instrument, w: Window, now: float) -> tuple[float, float, float]:
     """(log return, percent change, reference price) from the window start to the live price."""
     p1 = inst.price
@@ -145,9 +157,20 @@ def sigma_today(inst: Instrument, now: float, days: int = 30, min_n: int = 8) ->
     if len(rs) >= min_n:
         return _rms(rs), len(rs), "same-clock"
     # fallback: realized variance of 5-minute returns, scaled to the elapsed part of the day
+    var_day = realized_var_per_day(inst, now)
+    if not isnum(var_day):
+        return NaN, len(rs), "insufficient history"
+    frac = max(off / 86400.0, 1.0 / 24.0)
+    return math.sqrt(var_day * frac), len(rs), "realized-variance fallback"
+
+
+def realized_var_per_day(inst: Instrument, now: float, max_days: int = 20) -> float:
+    """Sum of squared 5-minute log returns per calendar day with data (the variance a day usually
+    accumulates). Used when an asset is too new for return-based σ (e.g. a fresh listing)."""
+    g = inst.g5
     k_now = g.k_of(now) - 1
     sq, live_steps, first_valid = 0.0, 0, None
-    k0 = max(g.first_k() or k_now, k_now - 20 * 288)
+    k0 = max(g.first_k() or k_now, k_now - max_days * 288)
     for k in range(k0 + 1, k_now + 1):
         if g.is_live(k):
             a, b = g.get(k), g.get(k - 1)
@@ -158,17 +181,19 @@ def sigma_today(inst: Instrument, now: float, days: int = 30, min_n: int = 8) ->
                     first_valid = k
     days_cov = 0.0 if first_valid is None else (k_now - first_valid + 1) / 288.0   # calendar days with data
     if live_steps < 100 or days_cov < 1:
-        return NaN, len(rs), "insufficient history"
-    var_day = sq / days_cov
-    frac = max(off / 86400.0, 1.0 / 24.0)
-    return math.sqrt(var_day * frac), len(rs), "realized-variance fallback"
+        return NaN
+    return sq / days_cov
 
 
-def sigma_1w(inst: Instrument, now: float) -> tuple[float, int]:
+def sigma_1w(inst: Instrument, now: float) -> tuple[float, int, str]:
     rs = daily_returns(inst, now)
-    if len(rs) < 14:
-        return NaN, len(rs)
-    return _rms(rs) * math.sqrt(7), len(rs)
+    if len(rs) >= 14:
+        return _rms(rs) * math.sqrt(7), len(rs), "daily RMS × √7"
+    var_day = realized_var_per_day(inst, now)
+    days = len(rs)
+    if isnum(var_day) and days >= 2:
+        return math.sqrt(var_day * 7), days, "realized-variance fallback"
+    return NaN, days, "insufficient history"
 
 
 def sigma_for(tf: str, inst: Instrument, now: float) -> tuple[float, int, str]:
@@ -178,8 +203,7 @@ def sigma_for(tf: str, inst: Instrument, now: float) -> tuple[float, int, str]:
     if tf == "today":
         return sigma_today(inst, now)
     if tf == "1w":
-        s, n = sigma_1w(inst, now)
-        return s, n, "daily RMS × √7"
+        return sigma_1w(inst, now)
     raise ValueError(tf)
 
 

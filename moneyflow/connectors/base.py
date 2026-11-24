@@ -133,6 +133,12 @@ class Connector:
         async with self.session.get(url, params=params, headers=headers,
                                     timeout=aiohttp.ClientTimeout(total=timeout)) as r:
             body = await r.read()
+            if r.status == 429:
+                try:
+                    wait = float(r.headers.get("Retry-After", "") or 900)
+                except ValueError:
+                    wait = 900.0
+                raise RateLimited(url.split("?")[0], min(max(wait, 300.0), 3600.0))
             if r.status != 200:
                 raise RuntimeError(f"HTTP {r.status} {body[:160]!r}")
             return jsonutil.loads(body)
@@ -190,7 +196,8 @@ class StreamConnector(Connector):
                 self.backoff.reset()
             delay = self.retry_delay()
             self.health.state = "reconnecting"
-            self.health.detail = f"retry in {delay:.0f}s"
+            reason = self.health.detail if any(w in self.health.detail for w in ("refused", "rejected", "error")) else ""
+            self.health.detail = f"{reason} - retry in {delay:.0f}s" if reason else f"retry in {delay:.0f}s"
             await self.sleep(delay)
 
     def retry_delay(self) -> float:
@@ -234,17 +241,63 @@ class StreamConnector(Connector):
                     raise ws.exception() or RuntimeError("websocket error")
 
 
+class RateLimited(RuntimeError):
+    """The server answered 429 (too many requests): wait `retry_after` seconds before asking again."""
+
+    def __init__(self, what: str, retry_after: float = 900.0):
+        super().__init__(f"{what}: HTTP 429 rate limited; next try in {retry_after:.0f}s")
+        self.retry_after = retry_after
+
+
 class PollConnector(Connector):
+    """A REST source polled every `interval` seconds.
+
+    Subclasses either override `poll()`, or implement `fetch()` (download -> JSON-able data) and
+    `apply(data)` (hand it to the engine). With `cache_ttl` set, fetched data is also kept on disk
+    (data/cache/poll_<name>.json): a restart within the TTL reuses it instead of downloading again,
+    which keeps frequent restarts far from the sources' rate limits.
+    """
     kind = "poll"
     interval = 300.0
+    cache_ttl: float = 0.0
 
     def __init__(self, ctx, cfg):
         super().__init__(ctx, cfg)
         self.interval = float(cfg.get("interval_s", self.interval))
         self.backoff = Backoff(base=10.0, cap=900.0)
 
-    async def poll(self) -> None:
+    async def fetch(self):
         raise NotImplementedError
+
+    def apply(self, data) -> None:
+        raise NotImplementedError
+
+    async def poll(self) -> None:
+        data = await self.fetch()
+        self.apply(data)
+        if self.cache_ttl:
+            self._cache_write(data)
+
+    def _cache_path(self):
+        return self.ctx.data_dir / "cache" / f"poll_{self.name}.json"
+
+    def _cache_write(self, data) -> None:
+        import json
+        try:
+            p = self._cache_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"saved_at": time.time(), "data": data}), encoding="utf-8")
+        except (OSError, TypeError, ValueError) as e:
+            self.log.debug("cache write failed: %s", e)
+
+    def cached(self):
+        """(data, age_s) from the disk cache, or (None, None)."""
+        import json
+        try:
+            d = json.loads(self._cache_path().read_text(encoding="utf-8"))
+            return d["data"], max(0.0, time.time() - float(d["saved_at"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None, None
 
     def next_interval(self) -> float:
         return self.interval
@@ -254,6 +307,16 @@ class PollConnector(Connector):
         if not ok:
             self.health.state, self.health.detail = "disabled", why
             return
+        if self.cache_ttl:
+            data, age = self.cached()
+            if data is not None and age < self.cache_ttl:
+                try:
+                    self.apply(data)
+                    self.health.state, self.health.last_ok = "ok", self.now() - age
+                    self.health.detail = f"from cache ({age / 60:.0f} min old)"
+                    await self.sleep(max(1.0, self.cache_ttl - age))
+                except Exception as e:  # noqa: BLE001 - a bad cache must not stop the poller
+                    self.error(e, "cache")
         while True:
             try:
                 self.health.state = "polling"
@@ -267,6 +330,11 @@ class PollConnector(Connector):
                 delay = self.next_interval()
             except asyncio.CancelledError:
                 raise
+            except RateLimited as e:
+                self.error(e, "poll")
+                self.health.state = "error"
+                self.health.detail = "rate limited by the source: waiting before the next request"
+                delay = max(e.retry_after, self.next_interval())
             except Exception as e:  # noqa: BLE001
                 self.error(e, "poll")
                 self.health.state = "error"

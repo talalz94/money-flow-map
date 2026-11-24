@@ -35,6 +35,20 @@ def test_instrument_rolls_steps_and_carries_forward():
     assert inst.latency_ms() == pytest.approx(100.0, abs=1)
 
 
+def test_latency_excludes_polled_prices_and_late_prints():
+    t0 = ny_ts(2026, 11, 24, 10, 0)
+    inst = Instrument("x:A", "x", "A", "24/7")
+    inst.on_price(10.0, t0 - 90, t0, measure=False)          # REST "latest trade", 90 s old: data age only
+    assert inst.latency_ms() is None and inst.live_seen and inst.age(t0) == 90
+    thin = Instrument("x:B", "x", "B", "24/7")
+    thin.on_price(20.0, t0 - 200, t0)                         # a print reported 200 s late
+    assert thin.latency_ms() is None and thin.extra["late_prints"] == 1 and thin.price == 20.0
+    thin.on_price(20.1, t0 + 0.9, t0 + 1.0)                   # a live tick, 100 ms in transit
+    assert thin.latency_ms() == pytest.approx(100.0, abs=1)
+    thin.on_price(19.9, t0 - 30, t0 + 2.0)                    # out of order (older than the last tick): ignored
+    assert thin.price == 20.1
+
+
 def test_minute_volumes_sum_into_five_minute_steps():
     t0 = ny_ts(2026, 11, 24, 10, 0)
     inst = Instrument("x:A", "x", "A", "24/7", volume=True)

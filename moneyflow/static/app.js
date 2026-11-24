@@ -80,7 +80,11 @@
     drawStatic();
     buildParticles();
     if (Date.now() - S.lastPanel > 900 || !S.lastPanel) { renderPanel(); S.lastPanel = Date.now(); }
-    if (d.news_version !== S.newsVersion) { renderWire(); S.newsVersion = d.news_version; }
+    if (d.news_version !== S.newsVersion) {
+      // new headlines join at the end of the current scroll cycle, so the ticker never jumps back
+      if (S.newsVersion < 0 || !$("wireInner").querySelector(".wi")) renderWire(); else S.wirePending = true;
+      S.newsVersion = d.news_version;
+    }
     if (!S.motion || S.hidden) blit();
     if (S.hover) showTip(S.hover);
   }
@@ -106,12 +110,37 @@
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const W = Math.max(320, r.width), H = Math.max(300, r.height);
     for (const c of [canvas, S.staticCanvas]) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
-    const R = Math.max(17, Math.min(38, Math.min(W * 0.6, H) * 0.046));
-    S.layout = { W, H, dpr, R, padX: R * 3.2, padTop: R * 1.5, padBot: R + 58 };
+    const narrow = W < 560;                                   // phones: two columns, compact labels
+    const R = narrow ? 17 : Math.max(17, Math.min(38, Math.min(W * 0.6, H) * 0.046));
+    S.layout = narrow ? { W, H, dpr, R, narrow, padX: R * 2.6, padTop: R + 30, padBot: R + 70 }
+                      : { W, H, dpr, R, narrow, padX: R * 3.2, padTop: R * 1.5, padBot: R + 58 };
+    S.narrowPos = null;
+  }
+  /* On narrow screens the configured x/y would crowd three nodes into a row: nodes are re-flowed
+     into a left and a right column (by their configured side, top to bottom); a node configured in
+     the middle (x = 0.5) takes the top row on its own. The Fed stays in the centre. */
+  function narrowPositions(nodes) {
+    const mid = nodes.filter((n) => Math.abs((n.x ?? 0.5) - 0.5) < 0.05);
+    const left = nodes.filter((n) => (n.x ?? 0.5) < 0.45).sort((a, b) => a.y - b.y);
+    const right = nodes.filter((n) => (n.x ?? 0.5) > 0.55).sort((a, b) => a.y - b.y);
+    const rows = Math.max(left.length, right.length) + (mid.length ? 1 : 0);
+    const out = {}, step = rows > 1 ? 1 / (rows - 1) : 0;
+    mid.forEach((n, i) => { out[n.id] = { x: 0.5 + (i - (mid.length - 1) / 2) * 0.3, y: 0 }; });
+    const off = mid.length ? 1 : 0;
+    left.forEach((n, i) => { out[n.id] = { x: 0.12, y: (i + off) * step }; });
+    right.forEach((n, i) => { out[n.id] = { x: 0.88, y: (i + off) * step }; });
+    return out;
   }
   function pos(n) {
     const L = S.layout;
-    return { x: L.padX + (n.x ?? 0.5) * (L.W - 2 * L.padX), y: L.padTop + (n.y ?? 0.5) * (L.H - L.padTop - L.padBot) };
+    let x = n.x ?? 0.5, y = n.y ?? 0.5;
+    if (L.narrow && n.id) {
+      const td = tfData();
+      if (!S.narrowPos && td) S.narrowPos = narrowPositions(td.nodes);
+      const p = S.narrowPos && S.narrowPos[n.id];
+      if (p) { x = p.x; y = p.y; }
+    }
+    return { x: L.padX + x * (L.W - 2 * L.padX), y: L.padTop + y * (L.H - L.padTop - L.padBot) };
   }
   function nodeColor(n) {
     if (n.z == null) return COL.neu;
@@ -187,11 +216,14 @@
     // label; then sigma, change and an inline sparkline on one line (keeps the block short)
     const fs = Math.round(Math.max(11, Math.min(14, R * 0.40)));
     g.fillStyle = COL.text; g.font = `600 ${fs}px "Segoe UI", sans-serif`;
-    g.fillText(n.label, p.x, p.y + R + fs + 3);
+    const label = S.layout.narrow ? n.label.replace(/\s*\(.*\)\s*$/, "") : n.label;   // "Stablecoins (cash in crypto)" -> "Stablecoins"
+    const lw = g.measureText(label).width;
+    const lx = Math.max(lw / 2 + 2, Math.min(S.layout.W - lw / 2 - 2, p.x));          // never clipped at the edges
+    g.fillText(label, lx, p.y + R + fs + 3);
     const y2 = p.y + R + 2 * fs + 7;
     g.font = `600 ${fs - 1}px Consolas, monospace`;
     const zs = fmtZ(n.z), cs = fmtPct(n.change_pct);
-    const hasSpark = n.spark && n.spark.length > 2, sw = hasSpark ? Math.round(fs * 3.4) : 0;
+    const hasSpark = !S.layout.narrow && n.spark && n.spark.length > 2, sw = hasSpark ? Math.round(fs * 3.4) : 0;
     const wz = g.measureText(zs).width, wc = g.measureText(cs).width, gap = 8;
     const x0 = p.x - (wz + wc + gap + (sw ? sw + gap : 0)) / 2;
     g.textAlign = "left";
@@ -203,9 +235,18 @@
     const lat = n.latency_ms == null ? "" : ` ${Math.round(n.latency_ms)}ms ·`;
     const btxt = `${n.source.short || n.source.id}${n.source.proxy ? "*" : ""}${lat} ${age}`;
     g.font = `600 10px Consolas, monospace`;
-    const bw = g.measureText(btxt).width + 10;
+    let bw = g.measureText(btxt).width + 10, bx, by;
+    if (S.layout.narrow) {                                       // phones: compact badge under the numbers
+      const short = `${n.source.short || n.source.id}${n.source.proxy ? "*" : ""} ${age}`;
+      bw = g.measureText(short).width + 10; bx = p.x - bw / 2; by = y2 + 17;
+      drawBadge(g, n, short, bx, by, bw);
+      return;
+    }
     const right = p.x + R + 6 + bw < S.layout.W - 4;
-    const bx = right ? p.x + R + 6 : p.x - R - 6 - bw, by = p.y - R * 0.35;
+    bx = right ? p.x + R + 6 : p.x - R - 6 - bw; by = p.y - R * 0.35;
+    drawBadge(g, n, btxt, bx, by, bw);
+  }
+  function drawBadge(g, n, btxt, bx, by, bw) {
     const bcol = { live: "rgba(34,211,138,0.16)", delayed: "rgba(242,184,75,0.18)", closed: "rgba(139,151,168,0.18)" }[n.status] || "rgba(255,77,109,0.18)";
     const tcol = { live: "#79f0bd", delayed: COL.amber, closed: "#b3bdca" }[n.status] || "#ff8aa0";
     roundRect(g, bx, by - 11, bw, 15, 4); g.fillStyle = bcol; g.fill();
@@ -265,14 +306,16 @@
   });
 
   // ── hover tooltip ───────────────────────────────────────────────────────────────────
-  canvas.addEventListener("mousemove", (ev) => {
-    if (!S.nodePos) return;
+  function pointerAt(ev) {
     const r = canvas.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
     let hit = null;
-    for (const n of S.nodePos) if (Math.hypot(n.x - x, n.y - y) < S.layout.R + 8) hit = n.id;
+    for (const n of S.nodePos || []) if (Math.hypot(n.x - x, n.y - y) < S.layout.R + (ev.pointerType === "touch" ? 16 : 8)) hit = n.id;
     if (hit !== S.hover) { S.hover = hit; drawStatic(); if (!S.motion || S.hidden) blit(); }
     if (hit) showTip(hit, x, y); else $("tip").hidden = true;
-  });
+  }
+  canvas.addEventListener("mousemove", pointerAt);
+  // touch screens have no hover: a tap on a node opens its card, a tap elsewhere closes it
+  canvas.addEventListener("pointerdown", (ev) => { if (ev.pointerType !== "mouse") pointerAt(ev); });
   canvas.addEventListener("mouseleave", () => { S.hover = null; $("tip").hidden = true; drawStatic(); blit(); });
 
   function showTip(id, mx, my) {
@@ -288,6 +331,8 @@
     h += `<div class="tfrow">` + ["1h", "today", "1w"].map((t) => { const x = all[t];
       return `<div><b>${t === "today" ? "TODAY" : t.toUpperCase()}</b><span class="${cls(x && x.change_pct)}">${fmtPct(x && x.change_pct)}</span><br>` +
         `<span class="${cls(x && x.z)}">${fmtZ(x && x.z)}</span></div>`; }).join("") + `</div>`;
+    if (n.history_from) h += `<div class="row"><span>History starts</span><span>${esc(new Date(n.history_from).toLocaleDateString(undefined, { day: "numeric", month: "short" }))} — too new for this window</span></div>`;
+    h += sparkSvg(n.spark, nodeColor(n));
     h += `<div class="row"><span>Typical move (1σ) for this window</span><span>${n.sigma_pct == null ? "—" : n.sigma_pct.toFixed(2) + "%"}</span></div>`;
     h += `<div class="row"><span>σ estimated from</span><span>${esc(n.sigma_method || "—")} (${n.sigma_samples ?? 0})</span></div>`;
     if (v) {
@@ -315,6 +360,19 @@
       tip.style.left = Math.max(6, Math.min(wrap.width - tw - 6, mx + 18)) + "px";
       tip.style.top = Math.max(6, Math.min(wrap.height - th - 6, my - th / 2)) + "px";
     }
+  }
+
+  function sparkSvg(xs, col) {
+    const v = (xs || []).filter((a) => a != null);
+    if (v.length < 3) return "";
+    const w = 300, h = 46, lo = Math.min(...v, 0), hi = Math.max(...v, 0), span = hi - lo || 1;
+    const pts = xs.map((a, i) => a == null ? null : `${(i / (xs.length - 1) * w).toFixed(1)},${(h - 3 - (a - lo) / span * (h - 6)).toFixed(1)}`)
+      .filter(Boolean).join(" ");
+    const zy = (h - 3 - (0 - lo) / span * (h - 6)).toFixed(1);
+    return `<svg class="tipspark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-label="move over the window">` +
+      `<line x1="0" x2="${w}" y1="${zy}" y2="${zy}" stroke="#5b6777" stroke-dasharray="3 4" stroke-width="1"/>` +
+      `<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8" vector-effect="non-scaling-stroke"/>` +
+      `<text x="2" y="10" fill="#8592a3" font-size="9">${hi.toFixed(2)}%</text><text x="2" y="${h - 2}" fill="#8592a3" font-size="9">${lo.toFixed(2)}%</text></svg>`;
   }
 
   // ── right panel ─────────────────────────────────────────────────────────────────────
@@ -420,10 +478,18 @@
       items.push(`<span class="wi">${tag}${title}<span class="src">${esc(n.source)} · ${fmtAge(n.age_s)} ago</span></span>`);
     }
     const inner = $("wireInner");
-    inner.innerHTML = items.join("") || `<span class="muted">waiting for headlines…</span>`;
-    const w = inner.scrollWidth || 2000;
+    if (!items.length) { inner.innerHTML = `<span class="muted">waiting for headlines…</span>`; return; }
+    const one = items.join("");
+    inner.innerHTML = `<div class="wire-copy">${one}</div><div class="wire-copy" aria-hidden="true">${one}</div>`;
+    const w = (inner.scrollWidth || 4000) / 2;
     inner.style.animationDuration = Math.max(40, w / 70) + "s";            // ~70 px per second
+    S.wirePending = false;
   }
+  $("wireInner").addEventListener("animationiteration", () => { if (S.wirePending && !S.hidden) renderWire(); });
+
+  // read-only hooks for tests and the console (no effect on the page)
+  window.__mfDebug = { nodePos: () => S.nodePos, layout: () => S.layout, tf: () => S.tf, motion: () => S.motion,
+    particles: () => S.particles.length, generated: () => S.data && S.data.generated_at };
 
   // ── boot ────────────────────────────────────────────────────────────────────────────
   let resizeTimer = null;

@@ -47,6 +47,7 @@ class Hub:
         self.push_interval = push_interval
         self.ws_clients: dict = {}      # ws -> tf ("all" or one tf)
         self.sse_clients: dict = {}     # queue -> tf
+        self.last_sent: dict = {}       # ws -> (generated_ts, tf) of the last snapshot it received
         self.last_push = 0.0
         self.webhooks = Webhooks(engine, webhooks or {})
         engine.listeners.append(self.on_tick)
@@ -77,14 +78,20 @@ class Hub:
                 cache[tf] = jsonutil.dumps({"type": "snapshot", "tf": tf, "data": data})
             return cache[tf]
 
+        gen = snap.get("generated_ts")
         for ws, tf in list(self.ws_clients.items()):
             if ws.closed:
                 self.ws_clients.pop(ws, None)
                 continue
+            if self.last_sent.get(ws) == (gen, tf):         # this client already has this snapshot
+                continue
             try:
                 await asyncio.wait_for(ws.send_str(payload(tf)), timeout=5)
+                self.last_sent[ws] = (gen, tf)
             except (ConnectionResetError, asyncio.TimeoutError, RuntimeError):
                 self.ws_clients.pop(ws, None)
+        for ws in [w for w in self.last_sent if w not in self.ws_clients]:
+            self.last_sent.pop(ws, None)
         for q, tf in list(self.sse_clients.items()):
             if q.qsize() > 5:                     # slow client: drop stale updates
                 while not q.empty():
@@ -107,7 +114,10 @@ class Webhooks:
         self.failed = 0
 
     def due(self, now: float) -> bool:
-        return bool(self.targets) and now - self.last_check >= 5.0
+        # nothing is sent until the history is in: a read without it would only produce a spurious
+        # "NO DATA -> RISK-OFF" regime change at every start-up
+        return (bool(self.targets) and now - self.last_check >= 5.0
+                and self.engine.seed_state.get("state") == "done")
 
     def check(self, snap: dict, now: float) -> None:
         self.last_check = now
@@ -115,7 +125,7 @@ class Webhooks:
         cur = snap["timeframes"][tf]
         events = []
         regime = (cur["risk"] or {}).get("label")
-        if self.prev.get("regime") not in (None, regime):
+        if self.prev.get("regime") not in (None, regime, "NO DATA") and regime != "NO DATA":
             events.append({"event": "regime_change", "from": self.prev["regime"], "to": regime,
                            "score": cur["risk"].get("score")})
         top = (cur["edges"][0]["from"], cur["edges"][0]["to"]) if cur["edges"] else None
@@ -126,6 +136,8 @@ class Webhooks:
             n = next(x for x in cur["nodes"] if x["id"] == nid)
             events.append({"event": "extreme_move", "id": nid, "label": n["label"], "z": n["z"],
                            "change_pct": n["change_pct"]})
+        if not self.prev:                       # first read after start-up: a baseline, not a change
+            events = []
         events.append({"event": "snapshot"})
         self.prev = {"regime": regime, "top": top, "extreme": ext}
         for t in self.targets:
@@ -290,6 +302,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
             s = engine.snapshot()
             data = s if hub.ws_clients[ws] == "all" else one_tf(s, hub.ws_clients[ws])
             await ws.send_str(jsonutil.dumps({"type": "snapshot", "tf": hub.ws_clients[ws], "data": data}))
+            hub.last_sent[ws] = (s.get("generated_ts"), hub.ws_clients[ws])
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
@@ -302,8 +315,10 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
                         s = engine.snapshot()
                         await ws.send_str(jsonutil.dumps({"type": "snapshot", "tf": t,
                                                           "data": s if t == "all" else one_tf(s, t)}))
+                        hub.last_sent[ws] = (s.get("generated_ts"), t)
         finally:
             hub.ws_clients.pop(ws, None)
+            hub.last_sent.pop(ws, None)
         return ws
 
     async def sse_handler(request):

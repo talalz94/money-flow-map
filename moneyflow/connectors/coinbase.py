@@ -39,6 +39,8 @@ class CoinbaseStream(StreamConnector):
             inst = self.subs.get(j.get("product_id", ""))
             if inst is not None and j.get("price"):
                 ts = clock.parse_iso(j["time"]) if j.get("time") else None
-                inst.on_price(float(j["price"]), ts, recv)
+                # the batch channel delivers the last trade every ~5 s: its age is not transport latency
+                inst.on_price(float(j["price"]), ts, recv,
+                              measure=self.cfg.get("channel", "ticker_batch") == "ticker")
         elif t == "error":
             self.error(f"Coinbase: {j.get('message')} {j.get('reason', '')}")

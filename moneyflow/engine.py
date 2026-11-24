@@ -28,6 +28,11 @@ SOURCE_NAMES = {
 SOURCE_SHORT = {"binance_spot": "BNC", "binance_fut": "BNC-F", "alpaca": "IEX", "finnhub": "FX", "coinbase": "CB",
                 "hyperliquid": "HL", "yahoo": "YH", "computed": "CALC"}
 FLOW_STATUSES = ("live", "delayed", "closed")
+# How long a source may stay silent (while its market is open) before it is shown as STALE.
+# IEX carries ~2-3% of US volume, so thin ETFs (IEF, HYG, USO ...) can go minutes between IEX
+# trades: measured 24 Nov 2026, IEF went 150 s without one at 11:30 New York. Their price is
+# still the latest real trade, and its true age is always shown.
+SOURCE_STALE_S = {"alpaca": 600.0}
 DISCLAIMER = ("A heuristic read of public prices, not a fact and not advice. Flows between assets are inferred from "
               "simultaneous opposite moves; nobody can see where each dollar actually goes.")
 
@@ -425,8 +430,24 @@ class Engine:
         now = now or self.clock.now()
         for inst in self.instruments.values():
             inst.roll(now)
+        self._ensure_share_anchor(now)
         for d in self.derived:
             d.refresh(now)
+
+    def _ensure_share_anchor(self, now: float) -> None:
+        """Anchor the stablecoin share as soon as everything it needs is in: the total market cap,
+        the supply AND the basket's price history (cached values can arrive before any price)."""
+        g, sup = self.crypto_global, self.stable_supply
+        if not g or not sup or self.seed_state.get("state") != "done":
+            return
+        for d in self.derived:
+            if isinstance(d, StablecoinShare) and not d.anchor_px:
+                d.set_supply(sup["total"], sup.get("observed_at", now), d.supply_hist or None)
+                d.set_weights({n: g["pct"].get(n.lower()) for n in d.basket})
+                d.set_anchor(g["total_usd"], min(g["updated_at"], now))
+                if d.anchor_px:
+                    d.rebuild(now)
+                    self._cache.clear()
 
     def _cached(self, key, ttl: float, fn, now: float):
         hit = self._cache.get(key)
@@ -437,6 +458,11 @@ class Engine:
         return v
 
     # ── reading one series ──────────────────────────────────────────────────────────────────
+    def stale_limit(self, inst: Instrument, s: SeriesDef | None = None) -> float:
+        if s is not None and s.cfg.get("stale_after_s"):
+            return float(s.cfg["stale_after_s"])
+        return SOURCE_STALE_S.get(inst.source, self.stale_after)
+
     def status_of(self, s: SeriesDef, now: float) -> str:
         inst = s.inst
         if not isnum(inst.price):
@@ -447,12 +473,16 @@ class Engine:
             src = inst.active_source(now)
             if not isnum(src.price):
                 return "no_data"
+            if not src.live_seen:                      # only cached / downloaded history so far
+                return "stale"
             age = src.age(now)
-            return "live" if age is not None and age <= self.stale_after else "stale"
+            return "live" if age is not None and age <= self.stale_limit(src, s) else "stale"
         if not clock.market_open(inst.hours, now):
             return "closed"
+        if not inst.live_seen:                         # history from the cache is not live data
+            return "stale"
         age = inst.age(now)
-        if age is None or age > self.stale_after:
+        if age is None or age > self.stale_limit(inst, s):
             return "stale"
         return "live"
 
@@ -461,10 +491,13 @@ class Engine:
         if isinstance(inst, Stitched):
             a = inst.active_source(now)
             proxy = a is inst.proxy
+            p = inst.primary
+            why = (f"{p.symbol} market closed" if not clock.market_open(p.hours, now)
+                   else f"no live {p.symbol} data: Alpaca key missing or stream down")
             return {"id": a.source, "name": SOURCE_NAMES.get(a.source, a.source), "short": SOURCE_SHORT.get(a.source, ""),
                     "symbol": a.symbol, "field": a.extra.get("field", "last"), "proxy": proxy,
-                    "description": (f"{inst.proxy.symbol} {inst.proxy.extra.get('field', '')} ÷ {inst.beta:g} (24/7 proxy; "
-                                    f"{inst.primary.symbol} market closed)") if proxy else f"{inst.primary.symbol} on IEX (real-time)"}
+                    "description": (f"{inst.proxy.symbol} {inst.proxy.extra.get('field', '')} ÷ {inst.beta:g} "
+                                    f"(24/7 proxy; {why})") if proxy else f"{p.symbol} on IEX (real-time)"}
         if isinstance(inst, DXY):
             return {"id": "finnhub", "name": "computed from OANDA FX via Finnhub", "short": "FX", "symbol": "DXY",
                     "field": "ICE formula", "proxy": False,
@@ -510,6 +543,10 @@ class Engine:
             "updated_at": clock.iso(inst.ts) if inst.ts else None,
             "source": self.source_info(s, now), "note": s.note,
         }
+        if not isnum(p0):                       # e.g. a new listing: no price yet at the window start
+            first = self._cached(("first", s.id), 600, lambda: stats.first_data_ts(inst), now)
+            if first is not None and first > w.start:
+                out["history_from"] = clock.iso(first)
         vol_src = inst.primary if isinstance(inst, Stitched) and clock.market_open(inst.primary.hours, now) else (
             inst.proxy if isinstance(inst, Stitched) else inst)
         out["volume"] = self._cached(("vol", s.id, tf), 30 if tf != "1w" else 120,
@@ -559,7 +596,7 @@ class Engine:
             st = "no_data"
         elif not clock.market_open(ri.hours, now):
             st = "closed"
-        elif ri.age(now) is not None and ri.age(now) > self.stale_after:
+        elif not ri.live_seen or (ri.age(now) is not None and ri.age(now) > self.stale_limit(ri)):
             st = "stale"
         else:
             st = "live"
@@ -631,7 +668,10 @@ class Engine:
                        f"{', '.join(eq)} are read from Binance's 24/7 perpetuals.")
         b = reads.get("bonds")
         if b and b["source"].get("proxy"):
-            cav.append("Bonds are read from the TMF perpetual (3× TLT, thin) until US trading resumes.")
+            cav.append("Bonds are read from the TMF perpetual (3× TLT, thin) until US trading resumes."
+                       if sess != "regular" else
+                       "Bonds are read from the TMF perpetual (3× TLT, thin): no live TLT data "
+                       "(Alpaca key missing or its stream is down).")
         if not clock.fx_open(now) and "usd" in reads:
             cav.append("FX market closed for the weekend: the dollar index holds Friday's close.")
         ctx["caveats"] = cav
@@ -771,11 +811,28 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._housekeeping(), name="housekeeping"))
 
     async def _seed_then_track(self):
-        try:
-            await self.seed_history()
-        except Exception as e:  # noqa: BLE001
-            self.seed_state.update(state="failed", errors=[self.keys.redact(e)])
-            log.exception("history seeding failed")
+        """Load history; if anything failed (e.g. the PC started before the network was up), retry
+        every few minutes until every instrument has its history."""
+        delay = 60.0
+        first = True
+        while True:
+            try:
+                await self.seed_history(incremental=not first)
+            except Exception as e:  # noqa: BLE001
+                self.seed_state.update(state="failed", errors=[self.keys.redact(e)])
+                log.exception("history seeding failed")
+            first = False
+            missing = [i.key for i in self.instruments.values()
+                       if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
+                       and i.g5.last_k is None and i.symbol not in self._funding_only()
+                       and not (i.source == "alpaca" and not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"))]
+            if self.seed_state.get("state") == "done" and not self.seed_state.get("errors") and not missing:
+                return
+            self.seed_state["retry_in_s"] = delay
+            log.info("history incomplete (%d errors, %d instruments without history): retrying in %.0f s",
+                     len(self.seed_state.get("errors") or []), len(missing), delay)
+            await asyncio.sleep(delay)
+            delay = min(900.0, delay * 2)
 
     async def _loop(self):
         while True:

@@ -44,7 +44,8 @@ Ctrl+C or by closing the window.
 python -m moneyflow run --no-dashboard --port 8800
 python -m moneyflow read --tf 1h # print the current read in the terminal
 python -m moneyflow keys         # which API keys were found (values are never shown)
-python -m moneyflow check        # measure every source's latency and freshness
+python tools/selftest.py         # check a RUNNING service end to end (about 270 checks)
+python -m moneyflow check        # measure every source's latency (with the service stopped)
 ```
 
 What to expect:
@@ -81,9 +82,18 @@ Windows. Everything is in `requirements.txt`.
 | **News wire** | Headlines from several feeds, newest first. Each shows its source and how long ago it was published. |
 | **Status strip** | Every connector with its state, median latency and message rate. |
 
-Every asset reports one of these statuses: `live`, `delayed`, `closed` (its market is shut),
-`stale` (its market is open but the feed is silent), `warming_up` (not enough history for σ)
-or `no_data`. **Delayed or closed data is never shown as live.**
+Every asset reports one of these statuses:
+
+| Status | Meaning |
+|---|---|
+| `live` | Receiving live data. |
+| `delayed` | The source is delayed by design (the VIX level). |
+| `closed` | Its market is shut. |
+| `stale` | Its market is open but the feed has been silent too long: 2 min for most feeds, 10 min for IEX ETFs, which can go minutes between trades on that one exchange. A price loaded from the history cache also counts as stale until the first live message arrives. |
+| `warming_up` | Not enough history for σ. A brand-new listing carries `history_from` instead. |
+| `no_data` | Nothing received. |
+
+**Delayed, cached or closed data is never shown as live.**
 
 ---
 
@@ -447,7 +457,9 @@ external requests** (no CDNs, no web fonts).
   for reduced motion. The news wire pauses too.
 
 **Interaction**
-- Hover a node to see its price, source, data age and latency.
+- Hover a node (or **tap** it on a touch screen) to see its price, source, data age and latency, plus a larger chart of the move.
+- On a **phone** the map re-flows into two columns with shorter labels and compact badges. The legend moves below the map.
+- The news wire shows headlines immediately and loops seamlessly. New headlines join at the end of a loop, so it never jumps back.
 - The hover card also shows:
   - the move and σ in all three windows, and the typical 1σ move;
   - relative volume and net taker flow;
@@ -530,6 +542,15 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - It then clears the DNS cache, re-syncs the clock by NTP and **kicks every connector** into an immediate reconnect.
   - After gaps over 2 minutes it **downloads the missing history** for every instrument.
 - **Pollers** back off on errors (10 s doubling to 15 min) and recover by themselves.
+- **Rate limits:** a `429 Too Many Requests` answer makes that source wait at least 5 minutes (or its `Retry-After`) before asking again.
+- **Restarts reuse fresh data:** the slow sources are cached in `data/cache/`, so frequent restarts stay far from the sources' limits:
+  - market cap 10 min, stablecoin supply 1 h, FRED 6 h, calendar 2 h;
+  - the FOMC calendar is also cached.
+- **No network at start-up:** history is retried every 1 min (then 2, 4 … up to 15 min) until every instrument has it.
+- **Another app holds Alpaca's single stream:** the free plan allows one, and Alpaca refuses the second with code 406. The service waits 5 min between retries and meanwhile polls the latest IEX trades over REST every 20 s.
+  - It waits for Alpaca's login answer before subscribing, so a refusal is never mistaken for bad keys.
+  - Tested live: the bonds node stayed **live** through the REST fallback, at a data age of about 20 s.
+- **Closing the window or Ctrl+C / Ctrl+Break:** a graceful stop that saves the history cache. Tested: exit code 0 in 1.2 s, cache written.
 - **History** is saved to `data/cache/` every 30 minutes and on exit.
 - **Tests:** `tests/test_reconnect.py` checks:
   - reconnection after server drops, after silence and after a `kick()`;
@@ -573,9 +594,47 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   around the US open, replayed through the real connector parsers, the engine and the snapshot
   builder. The test checks prices, the DXY formula, latency and the schema.
 - **Tools:**
+  - `tools/selftest.py`: checks a **running** service end to end.
   - `tools/record.py`: record live frames for replay.
   - `tools/check_latency.py` (= `python -m moneyflow check`): latency and freshness report.
   - `tools/measure_resources.py`: CPU and RAM report.
+
+**What `tools/selftest.py` checks:**
+- every endpoint and error code, and the JSON Schema for every window;
+- each asset's status, data age, z and σ;
+- that every edge runs from an outflow to an inflow;
+- the risk range, the Fed date, news de-duplication, and that connectors are up;
+- latency, CORS, the Host guard, and the WebSocket and SSE streams;
+- **prices against independent sources:**
+  - Binance REST (BTC, ETH, the index prices);
+  - Yahoo's ICE DXY and VIX;
+  - CoinGecko's stablecoin share;
+  - Alpaca's latest TLT trade and the SPY basis.
+
+**Verification pass on 24 Nov 2026, during US hours.**
+
+- **Self-test:** 268 of 268 checks passed.
+- **Failure scenarios, run live:**
+
+  | Scenario | Result |
+  |---|---|
+  | Busy port | Clear message, exit 1 |
+  | `check` while the service runs | Refuses with an explanation |
+  | Second instance (Alpaca stream refused) | REST fallback kept bonds live |
+  | No API keys at all | Runs on the keyless sources, says why each key-based one is off |
+  | Process frozen 150 s (sleep) | Recovered within 40 s |
+  | Ctrl+Break | Graceful stop |
+  | 25-minute soak | See section 8 |
+- **Bugs this pass found and fixed, each now covered by a test:**
+  - Cached history could count as "live".
+  - A refused Alpaca login was taken for bad keys, which delayed retries by an hour.
+  - REST-polled prices were counted as network latency.
+  - The stablecoin share could start empty for 10 minutes.
+  - Webhooks fired a false regime change at start-up.
+  - A new listing showed "warming up" without saying why.
+  - Thin IEX ETFs went stale every few minutes.
+  - The phone layout overlapped.
+  - The news wire jumped back on every headline.
 
 ---
 

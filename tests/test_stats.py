@@ -45,9 +45,16 @@ def test_sigma_today_same_clock_and_z_of_one():
 
 def test_sigma_1w_from_daily_returns():
     inst = drifting(NOW)
-    s, n = stats.sigma_1w(inst, NOW)
+    s, n, method = stats.sigma_1w(inst, NOW)
     # one of the 34 days is the 25-hour day when US clocks fell back (1 Nov 2026)
-    assert s == pytest.approx(288 * A * math.sqrt(7), rel=0.01) and n >= 30
+    assert s == pytest.approx(288 * A * math.sqrt(7), rel=0.01) and n >= 30 and method == "daily RMS × √7"
+
+
+def test_sigma_1w_new_listing_uses_realized_variance():
+    inst = drifting(NOW, days=7)                 # e.g. a stock that listed a week ago
+    s, n, method = stats.sigma_1w(inst, NOW)
+    assert method == "realized-variance fallback" and n < 14
+    assert s == pytest.approx(math.sqrt(288 * A * A * 7), rel=0.02)
 
 
 def test_realized_variance_fallback_for_short_history():
@@ -60,8 +67,8 @@ def test_realized_variance_fallback_for_short_history():
 
 def test_insufficient_history_gives_nan():
     inst = drifting(NOW, days=0.5)
-    s, n = stats.sigma_1w(inst, NOW)
-    assert s != s
+    s, n, method = stats.sigma_1w(inst, NOW)
+    assert s != s and method == "insufficient history"
 
 
 def test_traded_in_window_for_closed_markets():
