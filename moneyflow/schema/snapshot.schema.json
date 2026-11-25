@@ -34,6 +34,10 @@
   },
   "$defs": {
     "num": {"type": ["number", "null"]},
+    "screen_numbers": {"type": "object", "description": "the notable-stock screen's own estimates (hourly index bars), which chose the stock",
+      "properties": {"z": {"$ref": "#/$defs/num"}, "change_pct": {"$ref": "#/$defs/num"}, "sigma_pct": {"$ref": "#/$defs/num"},
+                     "rvol": {"$ref": "#/$defs/num"}, "score": {"$ref": "#/$defs/num"},
+                     "from": {"enum": ["map", "hourly bars"], "description": "map: a stock the map already reads, ranked on its node's own numbers"}}},
     "window": {"type": "object", "required": ["start", "end", "label"], "properties": {
       "start": {"type": "string"}, "end": {"type": "string"}, "label": {"type": "string"}}},
     "series": {
@@ -75,7 +79,9 @@
           "index": {"type": "integer"}, "symbol": {"type": "string"}, "perpetual": {"type": "string"},
           "why": {"type": "string"}, "universe": {"type": "integer"}, "ready": {"type": "boolean"},
           "eased": {"type": "boolean", "description": "its move on the map no longer clears the rule (it faded since the last screen)"},
-          "screen": {"type": "object", "description": "the screen's own estimates (z, change_pct, sigma_pct, rvol, score)"}}}],
+          "rank": {"type": "integer", "description": "its rank in the screen (slot 1 can hold number 2 while number 1 loads)"},
+          "screened": {"type": "integer", "description": "how many large caps the screen read"},
+          "screen": {"$ref": "#/$defs/screen_numbers"}}}],
           "description": "set on a notable-stock node (id stock1, stock2, ...): which stock fills the slot and why"},
         "extra": {"type": "object"}, "note": {"type": "string"}
       }
@@ -84,8 +90,13 @@
       "slots": {"type": "integer"}, "universe": {"type": "integer", "description": "large caps screened (those with a Binance perpetual)"},
       "screened": {"type": "integer"}, "scanned_at": {"type": ["string", "null"]},
       "rule": {"type": "object", "properties": {"z_min": {"type": "number"}, "score_min": {"type": "number"}}},
-      "picks": {"type": "array", "items": {"type": "object", "required": ["slot", "symbol", "why"]}},
-      "candidates": {"type": "array", "items": {"type": "object"}, "description": "the five highest screen scores, picked or not"},
+      "picks": {"type": "array", "items": {"type": "object", "required": ["slot", "symbol", "why", "screen"], "properties": {
+        "slot": {"type": "integer"}, "symbol": {"type": "string"},
+        "why": {"type": "string", "description": "in the map's own numbers (its node), like node.slot.why"},
+        "screen": {"$ref": "#/$defs/screen_numbers"}}}},
+      "candidates": {"type": "array", "items": {"type": "object", "required": ["symbol", "screen"], "properties": {
+        "symbol": {"type": "string"}, "screen": {"$ref": "#/$defs/screen_numbers"}}},
+        "description": "the five highest screen scores, picked or not"},
       "not_listed": {"type": "array", "items": {"type": "string"}, "description": "configured tickers without a perpetual"},
       "positions": {"type": "array"}, "note": {"type": "string"},
       "loading": {"type": "array", "items": {"type": "string"}, "description": "picked stocks whose history and live feed are still loading (shown once in)"}}},

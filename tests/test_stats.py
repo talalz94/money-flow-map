@@ -176,3 +176,88 @@ def test_sparkline_is_percent_from_window_start():
     _, pct, _ = stats.window_return(inst, w, NOW)
     assert 30 <= len(sp) <= 80
     assert abs(sp[0]) < 0.1 and sp[-1] == pytest.approx(pct, abs=1e-3)
+
+
+# ── calendars, outliers and grouping, through the real estimators (kills the mutants that survived a2f3856) ──
+import datetime as _dt                                         # noqa: E402
+
+HOLIDAYS = {_dt.date(2026, 11, 26)}                            # Thanksgiving: the only NYSE holiday in the window
+
+
+def _session_of(t):
+    """The test's own calendar (independent of clock.py): the session ends at 17:00 New York."""
+    return (_dt.datetime.fromtimestamp(t, clock.NY) + _dt.timedelta(hours=7)).date()
+
+
+def _trades(t):
+    d = _session_of(t)
+    return d.weekday() < 5 and d not in HOLIDAYS
+
+
+def _sessions(now, per_session, days=34, spike=None):
+    """A perpetual on a US stock: on each NYSE session it moves `per_session` evenly (1/288 of it every
+    5 minutes); weekends and holidays are flat. `spike`: (session date, factor) for one one-off day."""
+    def move(t):
+        t -= G5_STEP / 2                                            # the step's midpoint: 16:55-17:00 is the old session's
+        if not _trades(t):
+            return 0.0
+        f = spike[1] if spike and _session_of(t) == spike[0] else 1.0
+        return per_session * f / 24                                 # per hour
+    return _shaped(now, "us_equity", move, days=days)
+
+
+def test_week_sigma_counts_the_sessions_in_the_window():
+    """1W adds up the daily moves of the trading sessions in the window: 5 in a normal week, 4 in
+    Thanksgiving week (√4, not √5: z was 11% too small), 7 for crypto; trading days only (M2, M5)."""
+    m = 0.01
+    normal = ny_ts(2026, 11, 18, 9, 0)                          # Wed, the week before Thanksgiving
+    assert stats.sessions_in("us_equity", normal - 7 * 86400, normal) == pytest.approx(5.0)
+    s, n, method = stats.sigma_1w(_sessions(normal, m), normal)
+    assert s == pytest.approx(m * math.sqrt(5), rel=1e-6) and method == "daily RMS × √5"
+    thanks = ny_ts(2026, 12, 2, 9, 0)                           # Wed after: Thu 26 Nov was shut
+    assert stats.sessions_in("us_equity", thanks - 7 * 86400, thanks) == pytest.approx(4.0)
+    assert stats.sessions_in("weekdays", thanks - 7 * 86400, thanks) == pytest.approx(5.0)   # gold trades it
+    assert stats.sessions_in("all", thanks - 7 * 86400, thanks) == pytest.approx(7.0)
+    s, n, method = stats.sigma_1w(_sessions(thanks, m), thanks)
+    assert s == pytest.approx(m * 2.0, rel=1e-6) and method == "daily RMS × √4"
+
+
+def test_today_and_week_sigma_cap_a_one_off_day():
+    """The one-off cap works through the real TODAY and 1W estimators, not only in robust_rms (M9)."""
+    m, now = 0.01, ny_ts(2026, 11, 24, 9, 0)                   # 16 h into the session
+    plain = _sessions(now, m)
+    spiky = _sessions(now, m, spike=(_dt.date(2026, 11, 18), 12.0))   # one 12x day (an earnings gap)
+    t_plain, t_spiky = stats.sigma_today(plain, now)[0], stats.sigma_today(spiky, now)[0]
+    assert t_plain == pytest.approx(m * 16 / 24, rel=1e-6) and t_spiky == pytest.approx(t_plain, rel=1e-6)
+    w_plain, w_spiky = stats.sigma_1w(plain, now)[0], stats.sigma_1w(spiky, now)[0]
+    assert w_spiky == pytest.approx(w_plain, rel=1e-6)
+
+
+def test_one_off_day_seen_by_all_five_hour_windows_is_one_day():
+    """1H samples are grouped by day: one day's event, seen by all five windows around the clock time,
+    is capped as ONE day (M10); flattened, five big samples would outvote the cap."""
+    m, now = 0.012, ny_ts(2026, 11, 24, 10, 0)
+    plain = stats.sigma_1h(_sessions(now, m), now)[0]
+    assert plain == pytest.approx(m / 24, rel=1e-6)               # every hour of a session: m/24
+    spiky = stats.sigma_1h(_sessions(now, m, spike=(_dt.date(2026, 11, 18), 12.0)), now)[0]
+    assert spiky == pytest.approx(plain, rel=1e-6)
+
+
+def test_week_and_today_ignore_a_holiday_and_the_weekend():
+    """Thanksgiving and weekends are not samples: a flat holiday would otherwise pull σ down (M2, M5)."""
+    m, now = 0.01, ny_ts(2026, 12, 3, 9, 0)                    # Thu after Thanksgiving week
+    inst = _sessions(now, m)
+    assert stats.sigma_today(inst, now)[0] == pytest.approx(m * 16 / 24, rel=1e-6)
+    assert stats.sigma_1w(inst, now)[0] == pytest.approx(m * math.sqrt(stats.week_k("us_equity", now)), rel=1e-6)
+    assert all(abs(r) == pytest.approx(m) for r in stats.daily_returns(inst, now))   # no zero days
+
+
+def test_an_hour_belongs_to_the_session_of_its_midpoint():
+    """At 17:00 New York the hour 16:00-17:00 is the closing session's: Friday's counts, Sunday's does
+    not (by its END, 17:00 is already the next session: Sunday counted, Friday dropped, σ ~10% low)."""
+    mon = ny_ts(2026, 11, 23, 17, 0)
+    ends = stats.comparable_ends(mon, "us_equity", 20, span=3600)
+    days = {_dt.datetime.fromtimestamp(t, clock.NY).date() for t in ends}
+    assert _dt.date(2026, 11, 20) in days and _dt.date(2026, 11, 22) not in days     # Fri in, Sun out
+    by_end = {_dt.datetime.fromtimestamp(t, clock.NY).date() for t in stats.comparable_ends(mon, "us_equity", 20)}
+    assert _dt.date(2026, 11, 22) in by_end and _dt.date(2026, 11, 20) not in by_end

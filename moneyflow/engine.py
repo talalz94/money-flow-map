@@ -99,6 +99,7 @@ class Engine:
         self.stock_screen: dict = {}             # tf -> {"picks", "top", "screened"} of the latest screen
         self.stock_meta: dict = {"at": None, "universe": 0, "missing": []}
         self._stocks: dict[str, dict] = {}       # perpetual -> {"inst", "ticker", "picked_at", "ready", "owned"}
+        self._eased: dict[tuple, float] = {}     # (window, perpetual) -> the screen run at which its move eased
         self.build()
 
     # ── construction ────────────────────────────────────────────────────────────────────────
@@ -239,17 +240,37 @@ class Engine:
         """A fresh screen of the universe: rank each window, start live data for new picks."""
         from . import stocks
         sc, slots = self.stock_cfg, self.stock_slots()
-        res = {tf: stocks.screen(book, tf, now, float(sc.get("z_min", 2.0)), float(sc.get("score_min", 2.5)), slots)
+        res = {tf: stocks.screen(book, tf, now, float(sc.get("z_min", 2.0)), float(sc.get("score_min", 2.5)), slots,
+                                 exact=self._node_reads(tf, now))
                for tf in stats.TIMEFRAMES}
         before = {tf: [p["symbol"] for p in (self.stock_screen.get(tf) or {}).get("picks", [])] for tf in res}
         self.stock_screen = res
         self.stock_meta = {"at": now, "universe": len(book.hourly), "missing": list(missing)}
+        self._eased.clear()                        # a new screen: whatever eased is judged afresh
         for r in res.values():
             for p in r["picks"]:
                 self._want_stock(p["symbol"], p["ticker"], now)
         self._prune_stocks(now)
         if any(before[tf] != [p["symbol"] for p in res[tf]["picks"]] for tf in res):
             self._cache.clear()
+
+    def _node_reads(self, tf: str, now: float) -> dict:
+        """The map's own numbers for the stocks it already reads (current and recent picks, loaded):
+        {perpetual: (log return, σ, rvol, live price)}, for the screen to rank them on exactly those."""
+        out, w = {}, stats.window_for(tf, now)
+        for sym, ent in self._stocks.items():
+            inst = ent["inst"]
+            if not ent.get("ready") or not isnum(inst.price):
+                continue
+            try:
+                r = stats.window_return(inst, w, now)[0]
+                sig = stats.sigma_for(tf, inst, now)[0]
+                vol = stats.volume_read(inst, w, now) if inst.v5 is not None else None
+            except Exception:  # noqa: BLE001 - the hourly screen still covers it
+                continue
+            if isnum(r) and isnum(sig) and sig > 0:
+                out[sym] = (r, sig, (vol or {}).get("rvol"), inst.price)
+        return out
 
     def _want_stock(self, sym: str, ticker: str, now: float) -> None:
         ent = self._stocks.get(sym)
@@ -345,31 +366,53 @@ class Engine:
         z_min, at = float(self.stock_cfg.get("z_min", 2.0)), self.stock_meta.get("at")
         for i, (sdef, p, ent) in enumerate(self.slot_series(tf)):
             r = self.read(sdef, w, now)
-            why, eased = p["why"], False
+            why, eased, rank = p["why"], False, p.get("rank", i + 1)
             if r["z"] is not None and r["change_pct"] is not None:
                 # the node's own numbers, so the map, the hover and the panel say the same thing (the
                 # screen's numbers, from the same estimator on hourly bars, stay under slot.screen).
                 # The screen runs every few minutes and a 1H move can fade in between: then say so.
                 node = {"ticker": p["ticker"], "z": r["z"], "change_pct": r["change_pct"],
-                        "rvol": (r.get("volume") or {}).get("rvol"), "rank": p.get("rank", i + 1)}
-                eased = abs(r["z"]) < z_min
+                        "rvol": (r.get("volume") or {}).get("rvol"), "rank": rank}
+                eased = self._eased_since_screen(tf, p, r, z_min, at)
                 why = (stocks.eased_text(node, p, tf, screened, None if at is None else now - at) if eased
                        else stocks.why_text(node, tf, screened))
             r["note"] = why
             r["slot"] = {"index": i + 1, "symbol": p["ticker"], "perpetual": p["symbol"], "why": why, "eased": eased,
+                         "rank": rank, "screened": screened,
                          "universe": self.stock_meta.get("universe", 0), "ready": ent["ready"],
-                         "screen": {k: None if p.get(k) is None else round(p[k], 3)
-                                    for k in ("z", "change_pct", "sigma_pct", "rvol", "score")}}
+                         "screen": {**{k: None if p.get(k) is None else round(p[k], 3)
+                                       for k in ("z", "change_pct", "sigma_pct", "rvol", "score")},
+                                    "from": "map" if p.get("exact") else "hourly bars"}}
             out.append((r, ent["inst"]))
         return out
+
+    EASED_MOVE = 0.75     # "eased": the map's move is under 3/4 of the move the screen picked (or turned)
+
+    def _eased_since_screen(self, tf: str, p: dict, r: dict, z_min: float, at: float | None) -> bool:
+        """Has the picked stock's move faded since the screen picked it? Only if the MOVE shrank (the
+        node's log return under 3/4 of the screen's, or turned around) and its z no longer clears the
+        rule. The screen's σ (hourly bars) and the node's (5-minute data) differ by up to ~25% at some
+        clock times, which alone must not call an unchanged move "eased" (it did, in 6-7 of 10 cases
+        at 10:45 New York). Once eased it stays so until the next screen: no flicker at the threshold."""
+        key = (tf, p["symbol"])
+        if at is not None and self._eased.get(key) == at:
+            return True
+        rs, rn = math.log1p(p["change_pct"] / 100.0), r.get("log_return")
+        shrank = rn is None or rn * rs <= 0 or abs(rn) < self.EASED_MOVE * abs(rs)
+        eased = shrank and abs(r["z"]) < z_min
+        if eased and at is not None:
+            self._eased[key] = at
+        return eased
 
     def _stocks_info(self, tf: str, node_why: dict | None = None) -> dict:
         sc, res, meta = self.stock_cfg, self.stock_screen.get(tf) or {}, self.stock_meta
         node_why = node_why or {}
         slots = self.stock_slots()
         rule = {"z_min": float(sc.get("z_min", 2.0)), "score_min": float(sc.get("score_min", 2.5))}
-        rnd = lambda p: {"symbol": p["ticker"], **{k: None if p.get(k) is None else round(p[k], 3)  # noqa: E731
-                                                   for k in ("z", "change_pct", "sigma_pct", "rvol", "score")}}
+        # the screen's own numbers sit under "screen" (as on node.slot): a pick's "why" quotes the map's node
+        rnd = lambda p: {"symbol": p["ticker"], "screen": {  # noqa: E731
+            **{k: None if p.get(k) is None else round(p[k], 3) for k in ("z", "change_pct", "sigma_pct", "rvol", "score")},
+            "from": "map" if p.get("exact") else "hourly bars"}}
         if not slots:
             note = "The notable-stock slot is switched off ([stocks] slots = 0 or no universe)."
         elif meta.get("at") is None:
@@ -1060,10 +1103,35 @@ class Engine:
         if fedc is not None:
             fedc.load_cache()
         for name, c in self.connectors.items():
-            self._tasks.append(asyncio.create_task(c.run(), name=f"conn:{name}"))
+            self._tasks.append(asyncio.create_task(self._supervise(name, c), name=f"conn:{name}"))
         self._tasks.append(asyncio.create_task(self._seed_then_track(), name="seed"))
         self._tasks.append(asyncio.create_task(self._loop(), name="tick"))
         self._tasks.append(asyncio.create_task(self._housekeeping(), name="housekeeping"))
+
+    RESTART_FIRST, RESTART_MAX = 5.0, 300.0
+
+    async def _supervise(self, name: str, c) -> None:
+        """Run one connector and restart it if it crashes. A bug in one feed must not end that feed
+        silently for the rest of the session: on 25 Nov Finnhub's reconnect raised a TypeError, its
+        task died and the dollar stayed stale until a restart. The crash is logged with its traceback
+        (keys redacted), shown on the source, and the connector restarts after 5 s, doubling to 5 min."""
+        delay = self.RESTART_FIRST
+        while True:
+            started = time.monotonic()
+            try:
+                await c.run()
+                return                               # e.g. a disabled connector returns at once
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - anything else is a bug in that connector
+                if time.monotonic() - started > 600:
+                    delay = self.RESTART_FIRST         # it had been running fine: start the back-off again
+                c.error(e, "crashed")
+                log.error("connector %s crashed: restarting it in %.0f s", name, delay, exc_info=True)
+                c.health.state = "restarting"
+                c.health.detail = f"crashed ({type(e).__name__}): restarting in {delay:.0f}s"
+                await asyncio.sleep(delay)
+                delay = min(self.RESTART_MAX, delay * 2)
 
     async def _seed_then_track(self):
         """Load history; if anything failed (e.g. the PC started before the network was up), retry

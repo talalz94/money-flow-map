@@ -54,9 +54,9 @@ components = [
 [stocks]                           # the "notable stock" slot(s): the large-cap stock whose move is most
 enabled = true                     # unusual in the window, if any (it may be none). See README 3.8.
 slots = 1                          # how many stocks may be shown at once (0 = off, at most 5)
-z_min = 2.0                        # |z| a stock's move needs (screen: same-clock σ from hourly bars)...
+z_min = 2.0                        # |z| a stock's move needs (screen: the map's σ from hourly index bars)...
 score_min = 2.5                    # ...and |z| x sqrt(relative volume, clipped 0.5-4) at least this
-scan_interval_s = 300              # bulk price snapshot of the universe (one request, weight 2)
+scan_interval_s = 300              # bulk index-price snapshot of the universe (one request, weight 10)
 keep_s = 7200                      # keep a dropped pick's live feed this long (it may come back)
 positions = [[0.92, 0.29], [0.70, 0.55], [0.30, 0.55]]   # map positions of slots 1, 2, 3 (0..1)
 # Large caps (S&P 100 and Nasdaq-100 names, plus big ADRs). Only those with a Binance 24/7 TradFi

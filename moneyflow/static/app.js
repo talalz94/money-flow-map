@@ -394,9 +394,11 @@
     h += `<div class="note">${esc(st.note || "")}</div>`;
     h += `<div class="row"><span>Rule</span><span>|z| ≥ ${st.rule ? st.rule.z_min : "—"} and score ≥ ${st.rule ? st.rule.score_min : "—"} ` +
          `<span class="muted">(score = |z| × √volume ratio)</span></span></div>`;
-    for (const c of (st.candidates || []).slice(0, 3))
-      h += `<div class="row"><span>${esc(c.symbol)}</span><span><span class="${cls(c.z)}">${fmtPct(c.change_pct)} · ${fmtZ(c.z)}</span>` +
-           ` <span class="muted">vol ${c.rvol == null ? "—" : c.rvol.toFixed(1) + "×"} · score ${c.score.toFixed(1)}</span></span></div>`;
+    for (const cand of (st.candidates || []).slice(0, 3)) {         // the screen's own numbers
+      const c = cand.screen || {};
+      h += `<div class="row"><span>${esc(cand.symbol)}</span><span><span class="${cls(c.z)}">${fmtPct(c.change_pct)} · ${fmtZ(c.z)}</span>` +
+           ` <span class="muted">vol ${c.rvol == null ? "—" : c.rvol.toFixed(1) + "×"} · score ${c.score == null ? "—" : c.score.toFixed(1)}</span></span></div>`;
+    }
     h += `<div class="row"><span>Screened</span><span>${st.screened || 0} of ${st.universe || 0} large caps` +
          `${st.scanned_at ? " · " + esc(new Date(st.scanned_at).toLocaleTimeString()) : ""}</span></div>`;
     tip.innerHTML = h; tip.hidden = false; placeTip(tip, mx, my);

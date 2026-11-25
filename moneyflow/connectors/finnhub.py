@@ -25,7 +25,9 @@ class FinnhubStream(StreamConnector):
         self.last_trade: dict[str, float] = {}     # symbol -> local time of its latest trade message
         self.refused_at: float | None = None       # Finnhub answered "Invalid symbol" (refused subscriptions)
         self.retry_at: float | None = None
-        self.retry_delay = self.RETRY_FIRST
+        # how long to wait before reconnecting after a refusal (NOT `retry_delay`: that name is the
+        # base class's reconnect method, and shadowing it killed the feed on its first reconnect)
+        self.refusal_wait = self.RETRY_FIRST
 
     def add(self, symbol: str, inst) -> None:
         self.subs[symbol] = inst
@@ -64,8 +66,8 @@ class FinnhubStream(StreamConnector):
                 # the link up with pings, so no FX tick ever came and the dollar went stale for good.
                 # A fresh connection a little later gets them back: retry, backing off to 15 minutes.
                 self.refused_at = recv
-                self.retry_at = recv + self.retry_delay
-                self.retry_delay = min(self.RETRY_MAX, self.retry_delay * 2)
+                self.retry_at = recv + self.refusal_wait
+                self.refusal_wait = min(self.RETRY_MAX, self.refusal_wait * 2)
         self.note_silent()
         self.retry_if_refused(recv)
 
@@ -77,7 +79,7 @@ class FinnhubStream(StreamConnector):
         quiet = [s for s in self.subs if self.last_trade.get(s, 0.0) < self.refused_at]
         if not quiet:                                    # all pairs flow again
             self.refused_at = self.retry_at = None
-            self.retry_delay = self.RETRY_FIRST
+            self.refusal_wait = self.RETRY_FIRST
             return
         if self.retry_at is not None and now >= self.retry_at:
             self.log.warning("Finnhub refused %d pair(s) and they stayed silent: reconnecting", len(quiet))

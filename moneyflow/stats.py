@@ -11,12 +11,14 @@ for FX and CME futures, NYSE days for US stocks and the perpetuals on them; a qu
 otherwise drag an equity's σ down and make every weekday move look bigger than it is):
   1h     1-hour moves ending at the same clock time (±30 min) on the previous 20 trading days
          (the last 10 days for crypto, so its yardstick follows the current regime): pre-open
-         hours against pre-open hours, the opening hour against opening hours. Fallback for a
-         recent listing: every live 60-minute move of 10 days
+         hours against pre-open hours, the opening hour against opening hours. An hour belongs to
+         the session of its midpoint (16:00-17:00 is the closing session's, not the next one's).
+         Fallback for a recent listing: every live 60-minute move of 10 days
   today  the move from each previous trading day's roll to the SAME clock time ("same-clock"),
          20 trading days (30 for crypto); fallback when < 8 such days exist: daily realized
          variance scaled by elapsed time
-  1w     daily (roll-to-roll) moves on trading days × √(trading days a week: 5, or 7 for crypto)
+  1w     daily (roll-to-roll) moves on the trading days of the last 30 days × √(the trading
+         sessions in the window: 5 in a normal week, 4 in Thanksgiving week, 7 for crypto)
 Every σ is robust to ONE one-off: the single day whose moves are more than twice any other day's
 (an earnings gap, a crash day) counts as that next-largest day; a stock with several big days keeps
 them. The notable-stock screen (stocks.py) uses the same functions on hourly bars.
@@ -137,13 +139,16 @@ def robust_rms(days) -> float:
     return math.sqrt(sum(m * k for m, k in zip(ms, n)) / sum(n))
 
 
-def comparable_ends(now: float, calendar: str, days: int, max_back: int = MAX_BACK_DAYS) -> list[float]:
-    """The same New York clock time on the previous `days` comparable days (see clock.CALENDARS)."""
+def comparable_ends(now: float, calendar: str, days: int, max_back: int = MAX_BACK_DAYS,
+                    span: float = 0.0) -> list[float]:
+    """The same New York clock time on the previous `days` comparable days (see clock.CALENDARS). A
+    window of `span` seconds ending then belongs to the session of its MIDPOINT: the hour 16:00-17:00
+    is Friday's closing hour, not Saturday's, and Sunday's 16:00-17:00 is a weekend hour, not Monday's."""
     out, n = [], 0
     while len(out) < days and n < max_back:
         n += 1
         t = clock.same_clock_before(now, n)
-        if clock.trading_day(calendar, t):
+        if clock.trading_day(calendar, t - span / 2):
             out.append(t)
     return out
 
@@ -154,7 +159,7 @@ def same_clock_hour_returns(price_at, now: float, calendar: str, days: int, offs
     day: the hour before the US open is judged against pre-open hours, the first hour of trading
     against first hours, and a quiet weekend never counts for an exchange-traded asset."""
     out = []
-    for t_end in comparable_ends(now, calendar, days):
+    for t_end in comparable_ends(now, calendar, days, span=3600.0):
         rs = []
         for off in offsets:
             t1 = t_end + off
@@ -208,6 +213,27 @@ def roll_daily_returns(price_at, now: float, calendar: str, max_days: int = MAX_
 
 def days_per_week(calendar: str) -> int:
     return 7 if calendar == "all" else 5
+
+
+def sessions_in(calendar: str, t0: float, t1: float) -> float:
+    """Trading sessions (17:00-to-17:00 New York days of `calendar`) inside [t0, t1], the partial ones
+    at either end by the share of their 24 hours inside. A normal week holds 5 for an exchange, 7 for
+    crypto; Thanksgiving week holds 4, so a week's σ is √4 days, not √5 (z was 11% too small)."""
+    if calendar == "all":
+        return (t1 - t0) / 86400.0
+    total, r = 0.0, clock.day_roll(t0)
+    while r < t1:
+        nxt = clock.day_roll(r + 90000.0)               # the next roll (a DST day lasts 23 or 25 hours)
+        inside = min(nxt, t1) - max(r, t0)
+        if inside > 0 and clock.trading_day(calendar, r + 1):
+            total += inside / (nxt - r)
+        r = nxt
+    return total
+
+
+def week_k(calendar: str, now: float) -> float:
+    """The number of daily moves a 1W window adds up (√k scales the daily σ), rounded to 0.1."""
+    return round(sessions_in(calendar, now - 7 * 86400.0, now), 1) or float(days_per_week(calendar))
 
 
 def sigma_1h(inst: Instrument, now: float, min_n: int = 30) -> tuple[float, int, str]:
@@ -292,9 +318,9 @@ def realized_var_per_day(inst: Instrument, now: float, max_days: int = 20) -> fl
 
 def sigma_1w(inst: Instrument, now: float) -> tuple[float, int, str]:
     rs = daily_returns(inst, now)
-    k = days_per_week(getattr(inst, "calendar", "all"))     # a week holds 5 trading days of an exchange
+    k = week_k(getattr(inst, "calendar", "all"), now)      # trading days in the window: 5, 4 in a holiday week
     if len(rs) >= 14:
-        return robust_rms(rs) * math.sqrt(k), len(rs), f"daily RMS × √{k}"
+        return robust_rms(rs) * math.sqrt(k), len(rs), f"daily RMS × √{k:g}"
     var_day = realized_var_per_day(inst, now)
     days = len(rs)
     if isnum(var_day) and days >= 2:
@@ -352,7 +378,7 @@ def volume_read(inst: Instrument, w: Window, now: float) -> dict | None:
             if len(past) >= 20:
                 break
             t0 = clock.same_clock_before(w.start, d) if w.tf == "1h" else clock.roll_n_days_before(clock.day_roll(now), d)
-            if not clock.trading_day(cal, t0 + (span if w.tf == "1h" else 1)):
+            if not clock.trading_day(cal, t0 + (span / 2 if w.tf == "1h" else 1)):   # midpoint / the session
                 continue
             a, _, m = _vol_sum(inst, t0, t0 + span)
             if m >= max(1, n * 0.8):

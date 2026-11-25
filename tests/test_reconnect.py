@@ -237,9 +237,100 @@ def test_finnhub_reconnects_when_its_pairs_are_refused(keys):
     f.on_text(msg(type="ping"), t + 205)
     assert kicks == [1, 1]
     f.on_text(both(t + 300), t + 300)                         # the pairs flow again
-    assert f.refused_at is None and f.retry_delay == f.RETRY_FIRST
+    assert f.refused_at is None and f.refusal_wait == f.RETRY_FIRST
     f.on_text(msg(type="ping"), t + 2000)
     assert kicks == [1, 1]
+
+
+def _all_stream_classes():
+    from moneyflow.connectors import alpaca, binance, coinbase, finnhub, hyperliquid  # noqa: F401 (registers them)
+
+    def walk(c):
+        for s in c.__subclasses__():
+            yield s
+            yield from walk(s)
+    return sorted({c for c in walk(StreamConnector) if c.__module__.startswith("moneyflow.")
+                   and not c.__name__.startswith("_")}, key=lambda c: c.__name__)
+
+
+def test_every_stream_connector_keeps_reconnecting_through_its_real_run_loop(keys):
+    """Each stream's REAL run() loop through a session that ends (closed by the peer, or kick()) and one
+    that fails (network down): both must lead to another try. On 25 Nov Finnhub's loop died on its first
+    reconnect (an attribute named like the base's retry_delay() method: TypeError), so the dollar stayed
+    stale until a restart; the old test of that feature mocked kick() and never ran the loop."""
+    classes = _all_stream_classes()
+    assert {"AlpacaNews", "AlpacaStream", "BinanceFutures", "BinanceSpot", "CoinbaseStream", "FinnhubStream",
+            "HyperliquidStream"} <= {c.__name__ for c in classes}
+    for cls in classes:
+        ctx = types.SimpleNamespace(engine=types.SimpleNamespace(), clock=clock.Clock(), keys=keys, session=None)
+        c = cls(ctx, {})
+        calls = []
+
+        async def session_once(c=c, calls=calls):
+            calls.append(c.health.state)
+            if len(calls) == 1:
+                return                                         # the peer closed it, or kick()
+            if len(calls) == 2:
+                raise OSError("network down")
+            raise asyncio.CancelledError                       # end the test
+
+        async def no_sleep(seconds):
+            return None
+
+        c.available = lambda: (True, "")
+        c._session_once = session_once
+        c.sleep = no_sleep
+
+        async def go(c=c):
+            try:
+                await c.run()
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(go())
+        assert len(calls) == 3, cls.__name__                   # reconnected after each, without crashing
+        assert c.health.state == "reconnecting" and "network down" in (c.health.last_error or ""), cls.__name__
+
+
+def test_no_connector_attribute_shadows_a_base_method(keys):
+    """The Finnhub bug's class of error, for every connector: an instance attribute set in __init__ must
+    not hide a method of the class (the loop then calls a number)."""
+    from moneyflow.connectors.base import Connector
+    from moneyflow.connectors import pollers  # noqa: F401
+
+    def walk(c):
+        for s in c.__subclasses__():
+            yield s
+            yield from walk(s)
+    for cls in {c for c in walk(Connector) if c.__module__.startswith("moneyflow.")}:
+        ctx = types.SimpleNamespace(engine=types.SimpleNamespace(), clock=clock.Clock(), keys=keys, session=None)
+        try:
+            c = cls(ctx, {})
+        except TypeError:                                      # needs more arguments (e.g. AlpacaFallback)
+            continue
+        hidden = [a for a, v in vars(c).items() if callable(getattr(cls, a, None)) and not callable(v)]
+        assert not hidden, (cls.__name__, hidden)
+
+
+def test_a_crashed_connector_is_logged_and_restarted(cfg, keys, caplog):
+    """Whatever the bug, a crashed feed comes back: the engine logs the crash with its traceback, shows it
+    on the source and restarts the connector with back-off."""
+    eng = Engine(cfg, keys, clock.Clock())
+    eng.RESTART_FIRST = 0.01
+    p = Probe(ctx_for(None), "ws://unused")
+    runs = []
+
+    async def run():
+        runs.append(1)
+        if len(runs) == 1:
+            raise TypeError("'float' object is not callable")
+        p.health.state = "connected"                           # the second run keeps going normally
+
+    p.run = run
+    with caplog.at_level("ERROR", logger="moneyflow.engine"):
+        asyncio.run(eng._supervise("probe", p))
+    assert runs == [1, 1] and p.health.errors == 1 and "crashed" in p.health.last_error
+    rec = next(r for r in caplog.records if "connector probe crashed" in r.getMessage())
+    assert "TypeError" in rec.getMessage() or "TypeError" in (rec.exc_text or "") or rec.exc_info
 
 
 def test_kick_forces_an_immediate_reconnect():

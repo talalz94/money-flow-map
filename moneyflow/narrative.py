@@ -149,9 +149,12 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
             continue                               # (eased: its move has faded since the screen picked it)
         rv = (v.get("volume") or {}).get("rvol")      # the node's own volume ratio, as on the map
         vol = f" on {rv:.1f}× its usual volume" if rv is not None and rv >= 1.05 else ""
-        # the map's own numbers (the screen used the same estimator on hourly bars to pick it)
-        add("notable_stock", f"Notable stock: {sl['symbol']} {fmt_pct(v['change_pct'])} {phrase}{vol}, the most "
-                             f"unusual move among {sl.get('universe') or 'the'} large caps.",
+        # the map's own numbers (the screen used the same estimator on hourly bars to pick it), and the
+        # same count and rank as its reason text (slot 1 can hold the runner-up while the top one loads)
+        n = sl.get("screened") or sl.get("universe") or "the"
+        where = (f"the most unusual move among {n} large caps" if sl.get("rank", 1) == 1
+                 else f"number {sl['rank']} of {n} large caps for how unusual its move is")
+        add("notable_stock", f"Notable stock: {sl['symbol']} {fmt_pct(v['change_pct'])} {phrase}{vol}, {where}.",
             "down" if v["change_pct"] < 0 else "up")
     if _ok(oil) and abs(oil) >= Z2:
         add("oil_move", f"Crude oil is {fmt_z(oil)} {phrase}: "

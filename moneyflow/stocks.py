@@ -101,6 +101,16 @@ class Hourly:
                 return self.close[j]
         return NaN
 
+    def price_interp(self, t: float) -> float:
+        """The price at `t` between the two hourly closes around it (interpolated in log): the node
+        reads 5-minute prices, so a window starting at 10:40 must not start from the 10:00 close."""
+        e = math.floor(t / H) * H
+        a, f = self.price_at(e), (t - e) / H
+        if f <= 0 or not _ok(a):
+            return a
+        b = self.price_at(e + H)
+        return math.exp((1 - f) * math.log(a) + f * math.log(b)) if _ok(b) and a > 0 and b > 0 else a
+
     def volume(self, t1: float, t2: float) -> float:
         """Quote volume of the bars lying fully inside [t1, t2) (NaN if any of them is missing)."""
         if self.h0 is None or t2 - t1 < H:
@@ -137,16 +147,33 @@ def ring_price(ring, t: float, tol: float) -> float:
     return best[1] if best else NaN
 
 
-def _sigma_now(sig_at, e: float, now: float) -> float:
-    """σ at `now` from hourly bars: σ at the hour boundaries either side of now (past days' bars exist
-    for both), interpolated in variance. Without this the screen's yardstick lagged the node's by up
-    to an hour: at 08:59 New York it still excluded a past day's jump at 08:55 that the node, on
-    5-minute data, counted a minute later (PANW: −2.5σ on the screen, −2.0σ on the map)."""
-    a, f = sig_at(e), (now - e) / H
-    if f <= 0 or not _ok(a) or clock.day_roll(e + H) != clock.day_roll(now):   # never across the 17:00 roll
-        return a
-    b = sig_at(e + H)
-    return math.sqrt((1 - f) * a * a + f * b * b) if _ok(b) else a
+def _sigma_now(sig_at, now: float, offsets=(0.0,), stop: float | None = None) -> float:
+    """σ at `now` from hourly bars, read the way the node reads it at this minute. For each window end
+    now + offset (the node's ±30 minutes for 1H; just now for TODAY), the variance at the whole hours
+    either side is interpolated (exact when variance accrues evenly within an hour), and the offsets
+    are averaged. Without this the screen's yardstick lagged the node's by up to an hour (at 08:59 New
+    York it still left out a past day's jump at 08:55 that the node counted a minute later: PANW
+    −2.5σ on the screen, −2.0σ on the map), and its 1H read one exact clock hour where the node reads
+    five windows around now. `stop` (TODAY: the next 17:00 roll) is never interpolated across."""
+    memo: dict[float, float] = {}
+
+    def var(x: float) -> float:
+        if x not in memo:
+            s = sig_at(x)
+            memo[x] = s * s if _ok(s) else NaN
+        return memo[x]
+
+    vs = []
+    for o in offsets:
+        t = now + o
+        e = math.floor(t / H) * H
+        v, f = var(e), (t - e) / H
+        if f > 0 and _ok(v) and (stop is None or e + H < stop):
+            b = var(e + H)
+            v = (1 - f) * v + f * b if _ok(b) else v
+        if _ok(v):
+            vs.append(v)
+    return math.sqrt(sum(vs) / len(vs)) if vs else NaN
 
 
 def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: float = 450.0,
@@ -159,18 +186,17 @@ def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: flo
     e = math.floor(now / H) * H                     # the last hour boundary: history is hour-aligned
     days = stats.SAME_CLOCK_DAYS.get(calendar, 20)
     if tf == "1h":
-        p0 = ring_price(ring, now - H, tol)
-        if not _ok(p0):                             # first hour after a start: interpolate the hourly closes
-            a, b = h.price_at(now - H), h.price_at(now - H + H)
-            frac = ((now - H) % H) / H
-            p0 = a + (b - a) * frac if _ok(a) and _ok(b) else a
+        p0 = ring_price(ring, now - H, tol)         # the scans' ring (seeded from 5-minute bars at a start)
+        if not _ok(p0):
+            p0 = h.price_interp(now - H)
 
         def sig_at(t: float) -> float:
             rs = stats.same_clock_hour_returns(h.price_at, t, calendar, stats.SAME_CLOCK_DAYS_1H.get(calendar, 20),
                                                offsets=(0,))
             return stats.robust_rms(rs) if sum(len(d) for d in rs) >= 10 else NaN  # rs: grouped by day
-        sig = _sigma_now(sig_at, e, now)
-        rvol = _ratio(h.volume(e - H, e), [h.volume(t - H, t) for t in stats.comparable_ends(e, calendar, days)])
+        sig = _sigma_now(sig_at, now, offsets=stats.HOUR_OFFSETS)
+        rvol = _ratio(h.volume(e - H, e),
+                      [h.volume(t - H, t) for t in stats.comparable_ends(e, calendar, days, span=H)])
     elif tf == "today":
         roll = clock.day_roll(now)
         p0 = h.price_at(roll)
@@ -178,15 +204,15 @@ def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: flo
         def sig_at(t: float) -> float:
             rs = stats.same_clock_today_returns(h.price_at, t, calendar, days)
             return stats.robust_rms(rs) if len(rs) >= 8 else NaN
-        sig = _sigma_now(sig_at, e, now)
+        sig = _sigma_now(sig_at, now, stop=clock.day_roll(roll + 90000.0))     # never across the next roll
         done = e - roll
         rolls = [r for r in (clock.roll_n_days_before(roll, n) for n in range(1, stats.MAX_BACK_DAYS + 1))
                  if clock.trading_day(calendar, r + 1)][:days]
         rvol = _ratio(h.volume(roll, e), [h.volume(r, r + done) for r in rolls]) if done >= H else None
     elif tf == "1w":
-        p0 = h.price_at(now - 7 * D)
+        p0 = h.price_interp(now - 7 * D)            # the node's start is to the minute, not the hour
         rs = stats.roll_daily_returns(h.price_at, e, calendar, max_days=stats.DAILY_DAYS)
-        sig = stats.robust_rms(rs) * math.sqrt(stats.days_per_week(calendar)) if len(rs) >= 10 else NaN
+        sig = stats.robust_rms(rs) * math.sqrt(stats.week_k(calendar, now)) if len(rs) >= 10 else NaN
         week, prior = h.volume(e - 7 * D, e), h.volume(e - 28 * D, e - 7 * D)
         rvol = week / (prior / 3.0) if _ok(week) and _ok(prior) and prior > 0 else None
     else:
@@ -200,14 +226,30 @@ def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: flo
             "rvol": rvol, "score": abs(z) * vf, "price": price}
 
 
-def screen(book: "StockBook", tf: str, now: float, z_min: float, score_min: float, slots: int) -> dict:
-    """Rank the universe for one window: {"picks": [...], "top": [...], "screened": n}."""
+def from_node(r: float, sig: float, rvol, price: float) -> dict | None:
+    """A screen row from the map's own reading of a stock it already shows (5-minute data, live price)."""
+    if not (_ok(r) and _ok(sig) and sig > 0):
+        return None
+    z = r / sig
+    vf = math.sqrt(min(4.0, max(0.5, rvol))) if rvol is not None else 1.0
+    return {"z": z, "change_pct": math.expm1(r) * 100, "sigma_pct": math.expm1(sig) * 100, "rvol": rvol,
+            "score": abs(z) * vf, "price": price, "exact": True}
+
+
+def screen(book: "StockBook", tf: str, now: float, z_min: float, score_min: float, slots: int,
+           exact: dict | None = None) -> dict:
+    """Rank the universe for one window: {"picks": [...], "top": [...], "screened": n}. `exact` holds the
+    map's own numbers, {perpetual: (log return, σ, rvol, price)}, for stocks it already reads (the
+    current and recent picks): those are ranked on exactly what their node shows, so a pick never
+    disagrees with its node after the next screen. The others use the hourly bars."""
     rows = []
     for sym, h in book.hourly.items():
         px = book.last.get(sym)
         if px is None or now - px[1] > 3 * book.scan_interval + 120:
             continue
-        s = screen_one(h, px[0], now, tf, book.ring.get(sym), tol=book.scan_interval * 1.5)
+        s = from_node(*exact[sym]) if exact and sym in exact else None
+        if s is None:
+            s = screen_one(h, px[0], now, tf, book.ring.get(sym), tol=book.scan_interval * 1.5)
         if s is None:
             continue
         s.update(symbol=sym, ticker=book.ticker.get(sym, sym.removesuffix("USDT")))
@@ -266,6 +308,13 @@ class StockBook:
             if sym in self.hourly and _ok(p) and p > 0:
                 self.last[sym] = (p, ts)
                 self.ring.setdefault(sym, deque(maxlen=keep)).append((ts, p))
+
+    def seed_ring(self, sym: str, points) -> None:
+        """Merge earlier prices [(ts, price)] into a stock's ring, in time order (after a start or a wake)."""
+        keep = max(int(H / self.scan_interval) + 4, 16)
+        pts = sorted({(float(t), float(p)) for t, p in list(points) + list(self.ring.get(sym, ()))
+                      if _ok(p) and p > 0})
+        self.ring[sym] = deque(pts, maxlen=keep)
 
 
 class StockScanner(PollConnector):
@@ -327,6 +376,30 @@ class StockScanner(PollConnector):
 
         await asyncio.gather(*(one(s, h) for s, h in list(self.book.hourly.items())))
 
+    async def _seed_ring(self, now: float) -> None:
+        """At a start, or after a sleep, the ring of scan prices does not reach back an hour, and a 1H
+        move would start from a line drawn between two hourly closes (±0.4σ against the node, for up to
+        52 minutes). Fetch such stocks' last 70 minutes of 5-minute index closes instead (weight 1 each)."""
+        from .connectors import binance as bn
+        tol = self.book.scan_interval * 1.5
+        need = [s for s in self.book.hourly if not _ok(ring_price(self.book.ring.get(s), now - H, tol))]
+        if not need:
+            return
+        sem = asyncio.Semaphore(4)
+
+        async def one(sym: str) -> None:
+            async with sem:
+                rows = await bn.rest_get(self.session, bn.FUT_REST, "/fapi/v1/indexPriceKlines",
+                                         {"pair": sym, "interval": "5m", "startTime": int((now - H - 600) * 1000),
+                                          "limit": 20}, bn.FUT_GATE)
+            self.book.seed_ring(sym, [(r[0] / 1000.0 + 300.0, float(r[4])) for r in rows
+                                      if r[0] / 1000.0 + 300.0 <= now])
+
+        res = await asyncio.gather(*(one(s) for s in need), return_exceptions=True)
+        bad = [r for r in res if isinstance(r, Exception)]
+        if bad:                                    # those keep the hourly fallback until the ring fills
+            self.error(bad[0], f"5-minute start prices for {len(bad)} of {len(need)} stocks")
+
     async def _prices(self, now: float) -> None:
         """Every stock's index price in one request (weight 10, ~25 KB compressed): the price of the
         underlying stock, as the node shows it, not the perpetual's last trade. A thin perpetual's last
@@ -349,6 +422,7 @@ class StockScanner(PollConnector):
         now = self.now()
         await self._universe()
         await self._hourly(now)
+        await self._seed_ring(now)
         await self._prices(now)
         self.health.mark_msg(now)
         self.engine.on_stock_screen(self.book, now, missing=self.missing)

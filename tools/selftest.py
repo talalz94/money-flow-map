@@ -144,7 +144,8 @@ def main() -> int:
             rule = stk.get("rule") or {}
             picks = stk.get("picks") or []
             check(len(picks) <= stk.get("slots", 0), f"{tf}: no more stocks than slots", f"{len(picks)} > {stk.get('slots')}")
-            check(all(abs(p["z"]) >= rule.get("z_min", 0) and p["score"] >= rule.get("score_min", 0) for p in picks),
+            check(all(abs(p["screen"]["z"]) >= rule.get("z_min", 0) and p["screen"]["score"] >= rule.get("score_min", 0)
+                      for p in picks),
                   f"{tf}: every picked stock clears the rule", json.dumps(picks)[:300])
             shown = {n["slot"]["symbol"] for n in s["nodes"] if n.get("slot")}
             loading = set(stk.get("loading") or [])            # just picked: history and live feed loading
@@ -153,7 +154,7 @@ def main() -> int:
             check(not (shown & loading), f"{tf}: a stock is shown only once its data is in", str(sorted(shown & loading)))
             if stk.get("scanned_at"):
                 check(stk.get("universe", 0) >= 20, f"{tf}: large-cap universe screened", f"universe={stk.get('universe')}")
-            print(f"      {tf}: notable stock: {', '.join(p['symbol'] + ' ' + format(p['z'], '+.1f') + 'σ' for p in picks) or 'none'}"
+            print(f"      {tf}: notable stock: {', '.join(p['symbol'] + ' ' + format(p['screen']['z'], '+.1f') + 'σ' for p in picks) or 'none'}"
                   f" ({stk.get('note', '')[:110]})")
         r = s["risk"]
         check(r["score"] is None or -100 <= r["score"] <= 100, f"{tf}: risk score within -100..100", str(r["score"]))

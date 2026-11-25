@@ -153,6 +153,7 @@ def local_label(name: str = "") -> str:
 ROLL_HOUR_NY = 17   # the global FX/futures day roll: 17:00 New York
 
 
+@lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def day_roll(ts: float) -> float:
     """Epoch of the latest 17:00 New York at or before `ts` (start of the current trading day)."""
     d = dt.datetime.fromtimestamp(ts, NY)
@@ -160,6 +161,7 @@ def day_roll(ts: float) -> float:
     return dt.datetime(day.year, day.month, day.day, ROLL_HOUR_NY, tzinfo=NY).timestamp()  # DST-safe
 
 
+@lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def roll_n_days_before(roll_ts: float, n: int) -> float:
     d = dt.datetime.fromtimestamp(roll_ts, NY).date() - dt.timedelta(days=n)
     return dt.datetime(d.year, d.month, d.day, ROLL_HOUR_NY, tzinfo=NY).timestamp()
@@ -253,11 +255,13 @@ CALENDARS = ("all", "weekdays", "us_equity")
 CALENDAR_LABELS = {"all": "all days", "weekdays": "weekdays", "us_equity": "NYSE trading days"}
 
 
+@lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def session_date(ts: float) -> dt.date:
     """The trading day a moment belongs to: days roll at 17:00 New York, so Sunday 20:00 is Monday."""
     return (dt.datetime.fromtimestamp(ts, NY) + dt.timedelta(hours=24 - ROLL_HOUR_NY)).date()
 
 
+@lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def trading_day(calendar: str, ts: float) -> bool:
     if calendar == "all":
         return True
@@ -273,6 +277,7 @@ def default_calendar(hours: str) -> str:
     return {"fx": "weekdays", "vix": "weekdays", "us_regular": "us_equity", "us_extended": "us_equity"}.get(hours, "all")
 
 
+@lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def same_clock_before(ts: float, n: int) -> float:
     """The same New York wall-clock time `n` calendar days earlier (DST-safe)."""
     return (dt.datetime.fromtimestamp(ts, NY) - dt.timedelta(days=n)).timestamp()
