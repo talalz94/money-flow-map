@@ -205,6 +205,43 @@ def test_finnhub_names_pairs_with_no_tick_yet(keys):
     assert f.health.detail == ""
 
 
+def test_finnhub_reconnects_when_its_pairs_are_refused(keys):
+    """Seen live on 25 Nov: after a 502 on reconnecting, Finnhub answered "Invalid symbol" for every
+    pair and kept the link up with pings alone, so the dollar went stale for good. It now reconnects
+    60 s later (doubling to 15 min) while the refused pairs stay silent, and resets once they flow."""
+    import json
+    from conftest import ny_ts
+    from moneyflow.connectors.finnhub import FinnhubStream
+    from moneyflow.series import Instrument
+    t = ny_ts(2026, 11, 25, 7, 30)
+    ctx = types.SimpleNamespace(engine=types.SimpleNamespace(), clock=clock.Clock(fixed=t), keys=keys, session=None)
+    f = FinnhubStream(ctx, {})
+    for s in ("OANDA:EUR_USD", "OANDA:USD_SEK"):
+        f.add(s, Instrument(f"finnhub:{s}", "finnhub", s, "fx"))
+    f.health.state = "connected"
+    kicks = []
+    f.kick = lambda: kicks.append(1)
+    msg = lambda **m: json.dumps(m)  # noqa: E731
+    both = lambda ts: msg(type="trade", data=[{"s": "OANDA:EUR_USD", "p": 1.09, "t": ts * 1000},  # noqa: E731
+                                             {"s": "OANDA:USD_SEK", "p": 10.2, "t": ts * 1000}])
+    f.on_text(both(t), t)
+    f.on_text(msg(type="error", msg="Invalid symbol OANDA:EUR_USD"), t + 10)
+    f.on_text(msg(type="error", msg="Invalid symbol OANDA:USD_SEK"), t + 10)
+    f.on_text(msg(type="ping"), t + 50)
+    assert kicks == []                                        # waits 60 s first
+    f.on_text(msg(type="ping"), t + 75)
+    assert kicks == [1] and "refused" in f.health.detail
+    f.on_text(msg(type="error", msg="Invalid symbol OANDA:EUR_USD"), t + 80)   # refused again
+    f.on_text(msg(type="ping"), t + 180)
+    assert kicks == [1]                                       # now waits twice as long (120 s)
+    f.on_text(msg(type="ping"), t + 205)
+    assert kicks == [1, 1]
+    f.on_text(both(t + 300), t + 300)                         # the pairs flow again
+    assert f.refused_at is None and f.retry_delay == f.RETRY_FIRST
+    f.on_text(msg(type="ping"), t + 2000)
+    assert kicks == [1, 1]
+
+
 def test_kick_forces_an_immediate_reconnect():
     async def go():
         runner, url, hits = await start_server("silent")

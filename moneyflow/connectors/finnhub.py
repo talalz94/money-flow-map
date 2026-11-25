@@ -17,9 +17,15 @@ class FinnhubStream(StreamConnector):
     idle_timeout = 120.0     # Finnhub sends {"type":"ping"} even when FX is closed
     heartbeat = 30.0
 
+    RETRY_FIRST, RETRY_MAX = 60.0, 900.0
+
     def __init__(self, ctx, cfg):
         super().__init__(ctx, cfg)
         self.subs: dict[str, object] = {}
+        self.last_trade: dict[str, float] = {}     # symbol -> local time of its latest trade message
+        self.refused_at: float | None = None       # Finnhub answered "Invalid symbol" (refused subscriptions)
+        self.retry_at: float | None = None
+        self.retry_delay = self.RETRY_FIRST
 
     def add(self, symbol: str, inst) -> None:
         self.subs[symbol] = inst
@@ -49,9 +55,35 @@ class FinnhubStream(StreamConnector):
                 inst = self.subs.get(d.get("s"))
                 if inst is not None and d.get("p"):
                     inst.on_price(float(d["p"]), d["t"] / 1000.0, recv)
+                    self.last_trade[d["s"]] = recv
         elif t == "error":
-            self.error(f"Finnhub: {j.get('msg')}")
+            msg = str(j.get("msg") or "")
+            self.error(f"Finnhub: {msg}")
+            if "invalid symbol" in msg.lower() and self.retry_at is None:
+                # Seen live (25 Nov): after a 502 on reconnecting, Finnhub refused all six pairs and kept
+                # the link up with pings, so no FX tick ever came and the dollar went stale for good.
+                # A fresh connection a little later gets them back: retry, backing off to 15 minutes.
+                self.refused_at = recv
+                self.retry_at = recv + self.retry_delay
+                self.retry_delay = min(self.RETRY_MAX, self.retry_delay * 2)
         self.note_silent()
+        self.retry_if_refused(recv)
+
+    def retry_if_refused(self, now: float) -> None:
+        """Reconnect when refused pairs have not ticked since the refusal (checked on every message;
+        Finnhub pings every minute)."""
+        if self.refused_at is None:
+            return
+        quiet = [s for s in self.subs if self.last_trade.get(s, 0.0) < self.refused_at]
+        if not quiet:                                    # all pairs flow again
+            self.refused_at = self.retry_at = None
+            self.retry_delay = self.RETRY_FIRST
+            return
+        if self.retry_at is not None and now >= self.retry_at:
+            self.log.warning("Finnhub refused %d pair(s) and they stayed silent: reconnecting", len(quiet))
+            self.health.detail = f"subscriptions refused (Invalid symbol): reconnected at {clock.iso(now)[11:19]} UTC"
+            self.retry_at = None                         # the next refusal schedules the next try
+            self.kick()
 
     def note_silent(self) -> None:
         """Name the pairs with no tick yet since the start. The DXY needs all six, and a thin pair

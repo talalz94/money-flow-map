@@ -49,6 +49,8 @@ entry, service or watchdog. Start it again with `start.bat` when you want it.
 
 - An app using the API keeps it alive: an open WebSocket/SSE stream, or any request (or webhook
   delivery) within the 5 minutes.
+- A dashboard tab that is only minimized or in the background still counts as a viewer, so close
+  the tab (or the browser) to let it stop.
 - To keep it always on: `.\start.ps1 -StayRunning`, `python -m moneyflow run --stay-running`, or
   `idle_shutdown_minutes = 0` under `[server]` in `moneyflow.local.toml`. Another delay:
   `idle_shutdown_minutes = 15` or `--idle-minutes 15`.
@@ -839,7 +841,14 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
 - **Also found and fixed in this round:**
   - the stock screen's weekly σ included the current day, which is the move being measured;
   - the hover mixed up two stocks when the slot held different ones in different windows;
-  - the phone layout kept stale positions when the slot appeared on switching windows.
+  - the phone layout kept stale positions when the slot appeared on switching windows;
+  - a newly picked stock appeared as "no data" for the few seconds its history was loading
+    (seen when the pick switched from DELL to SHOP). It is now shown once its data is in, and
+    meanwhile listed as `loading`;
+  - **after a Finnhub server error (HTTP 502 on reconnecting) Finnhub refused all six FX pairs
+    ("Invalid symbol") and kept the connection up with pings alone, so the dollar went stale for
+    good** (seen live at 12:30 UTC, still stale 11 min later). While refused pairs stay silent the
+    service now reconnects after 60 s, backing off to 15 min.
 
 **Auto-stop, tested live on 25 Nov 2026.** A 1-minute delay was used unless noted. The service was
 watched through the process list and open ports only, because a request would itself count as use.
@@ -850,6 +859,7 @@ watched through the process list and open ports only, because a request would it
 | Dashboard opened, kept open, then closed | Opened 12:09:45 and still running 100 s later. Tab closed 12:11:41. At 12:12:43: "no dashboard tab or app connected for 1 minute: stopping"; exited at 12:12:45, code 0; port free 65 s after the close. |
 | An app streaming the API for 150 s | 148 snapshots received; the service stayed up throughout, long past the delay. The app left at 12:15:47; the service stopped at 12:16:52 and exited at 12:16:54, code 0. |
 | `--stay-running` (given together with `--idle-minutes 1`) | Still running 100 s after start with nobody connected ("auto-stop off"). |
+| A hidden tab left open (port 8765, default 5 min) | The test browser kept a hidden dashboard tab open, so the service rightly stayed up. That tab was closed at 12:43:16. At 12:48:20: "no dashboard tab or app connected for 5 minutes: stopping"; exited at 12:48:24, code 0. The browser's idle keep-alive connections did not count. |
 | Afterwards | No Python process left on the PC, no port listening. No scheduled task (of 196), Startup-folder item, Run/RunOnce registry entry or Windows service refers to the app. |
 
 ---
