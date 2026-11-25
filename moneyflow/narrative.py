@@ -68,7 +68,7 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
 
     g = z.get
     spx, bonds, usd, gold = g("spx"), g("bonds"), g("usd"), g("gold")
-    btc, eth, stables, oil, ndx, ant, vixp = g("btc"), g("eth"), g("stables"), g("oil"), g("ndx"), g("ant"), g("vix_proxy")
+    btc, eth, stables, oil, ndx, vixp = g("btc"), g("eth"), g("stables"), g("oil"), g("ndx"), g("vix_proxy")
     crypto = None
     if _ok(btc) and _ok(eth):
         crypto = (btc + eth) / 2
@@ -143,9 +143,15 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
         s = f" ({abs(streak)} days in a row)" if abs(streak) >= 2 else ""
         add("btc_etf_flows", f"US spot Bitcoin ETFs: {fmt_usd(v * 1e6)} on {etf.get('last_date')}, {word}{s}.",
             "down" if v < 0 else "up")
-    if _ok(ant) and abs(ant) >= Z2:
-        add("ai_equity", f"Anthropic (ANT) is {fmt_z(ant)} {phrase}: AI-equity sentiment is "
-                         f"{'souring' if ant < 0 else 'running hot'}.", "down" if ant < 0 else "up")
+    for k, v in live.items():                      # the notable-stock slot, if a stock stands out
+        sl = v.get("slot")
+        if not sl or sl.get("index") != 1 or not nodes[k].get("node", True):
+            continue
+        rv = (sl.get("screen") or {}).get("rvol")
+        vol = f" on {rv:.1f}× its usual volume" if rv is not None and rv >= 1.05 else ""
+        add("notable_stock", f"Notable stock: {sl['symbol']} is {fmt_z(v['z'])} {phrase} "
+                             f"({fmt_pct(v['change_pct'])}){vol}, the most unusual move among "
+                             f"{sl.get('universe') or 'the'} large caps.", "down" if v["z"] < 0 else "up")
     if _ok(oil) and abs(oil) >= Z2:
         add("oil_move", f"Crude oil is {fmt_z(oil)} {phrase}: "
                         f"{'an inflation / supply risk' if oil > 0 else 'a demand-scare or supply-glut signal'}.", "info")

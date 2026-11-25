@@ -202,7 +202,7 @@ class AlpacaNews(StreamConnector):
 
     # The stream carries every company press release (measured: ~2 a second at the US open, mostly
     # micro-caps). Only items about the map's tickers or macro themes reach the news wire.
-    MACRO_TAGS = {"FED", "MACRO", "BONDS", "USD", "OIL", "GOLD", "BTC", "ETH", "STABLE", "ANT", "ETF"}
+    MACRO_TAGS = {"FED", "MACRO", "BONDS", "USD", "OIL", "GOLD", "BTC", "ETH", "STABLE", "ETF"}
 
     def on_text(self, data, recv):
         from ..news import tags_for

@@ -94,6 +94,11 @@ class Engine:
                                                    c.get("label", "")) for c in rc.get("components", [])] or None
         self.risk_scale = float(rc.get("scale", 1.5))
         self.risk_clip = float(rc.get("clip", 4.0))
+        # the notable-stock slot(s), see stocks.py
+        self.stock_cfg = cfg.get("stocks", {}) or {}
+        self.stock_screen: dict = {}             # tf -> {"picks", "top", "screened"} of the latest screen
+        self.stock_meta: dict = {"at": None, "universe": 0, "missing": []}
+        self._stocks: dict[str, dict] = {}       # perpetual -> {"inst", "ticker", "picked_at", "ready", "owned"}
         self.build()
 
     # ── construction ────────────────────────────────────────────────────────────────────────
@@ -218,7 +223,146 @@ class Engine:
         ycfg = cfgmod.connector_cfg(cfg, "yahoo")
         if ycfg.get("enabled") and ycfg.get("vix_quote", True):
             c["yahoo_vix"] = pollers.YahooVix(self.ctx, ycfg)
+        if self.stock_slots() and "binance_fut" in c:
+            from . import stocks
+            c["stocks"] = stocks.StockScanner(self.ctx, self.stock_cfg)
         self.connectors = c
+
+    # ── the notable-stock slot(s) ───────────────────────────────────────────────────────────
+    def stock_slots(self) -> int:
+        sc = self.stock_cfg
+        return max(0, int(sc.get("slots", 1))) if sc.get("enabled", True) and sc.get("universe") else 0
+
+    def on_stock_screen(self, book, now: float, missing=()) -> None:
+        """A fresh screen of the universe: rank each window, start live data for new picks."""
+        from . import stocks
+        sc, slots = self.stock_cfg, self.stock_slots()
+        res = {tf: stocks.screen(book, tf, now, float(sc.get("z_min", 2.0)), float(sc.get("score_min", 2.5)), slots)
+               for tf in stats.TIMEFRAMES}
+        before = {tf: [p["symbol"] for p in (self.stock_screen.get(tf) or {}).get("picks", [])] for tf in res}
+        self.stock_screen = res
+        self.stock_meta = {"at": now, "universe": len(book.hourly), "missing": list(missing)}
+        for r in res.values():
+            for p in r["picks"]:
+                self._want_stock(p["symbol"], p["ticker"], now)
+        self._prune_stocks(now)
+        if any(before[tf] != [p["symbol"] for p in res[tf]["picks"]] for tf in res):
+            self._cache.clear()
+
+    def _want_stock(self, sym: str, ticker: str, now: float) -> None:
+        ent = self._stocks.get(sym)
+        if ent is None:
+            key = f"binance_fut:{sym}"
+            owned = key not in self.instruments            # a configured node may already read it
+            inst = self.instrument("binance_fut", sym, "24/7", True, ticker, "index")
+            ent = self._stocks[sym] = {"inst": inst, "ticker": ticker, "picked_at": now, "owned": owned,
+                                       "ready": not owned}
+            if owned:
+                self._spawn(self._start_stock(sym), f"stock:{sym}")
+        ent["picked_at"] = now
+
+    def _spawn(self, coro, name: str) -> None:
+        """Run a background task, keeping a reference to it (an unreferenced task can be collected)."""
+        try:
+            task = asyncio.get_running_loop().create_task(coro, name=name)
+        except RuntimeError:                                 # no event loop (offline use, tests)
+            coro.close()
+            return
+        self._tasks = [t for t in self._tasks if not t.done()] + [task]
+
+    async def _start_stock(self, sym: str) -> None:
+        """History (cache first, then the missing tail) and the live index price of a picked stock."""
+        ent = self._stocks.get(sym)
+        if ent is None:
+            return
+        inst, now = ent["inst"], self.clock.now()
+        try:
+            history.load(self.cache_dir, inst, now)
+            last = history.last_good_ts(inst)
+            days = int(self.cfg.get("general", {}).get("history_days", 35))
+            since5 = max(now - days * 86400, (last or 0) - 600)
+            await self._binance_history(inst, since5, max(now - 86400 + 60, since5 - 600), now)
+            inst.roll(self.clock.now())
+            bf = self.connectors.get("binance_fut")
+            if bf is not None and sym in self._stocks:
+                await bf.subscribe(sym, inst, "index", volume=True)
+            ent["ready"] = True
+            self._cache.clear()
+            log.info("notable stock %s: history loaded, live feed on", ent["ticker"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("notable stock %s: %s", ent["ticker"], self.keys.redact(e))
+
+    def _prune_stocks(self, now: float) -> None:
+        """Drop the live feed of a stock no longer picked anywhere for `keep_s` (default 2 h)."""
+        picked = {p["symbol"] for r in self.stock_screen.values() for p in r["picks"]}
+        keep = float(self.stock_cfg.get("keep_s", 7200))
+        for sym, ent in list(self._stocks.items()):
+            if sym in picked or now - ent["picked_at"] < keep:
+                continue
+            del self._stocks[sym]
+            if ent["owned"]:
+                self.instruments.pop(ent["inst"].key, None)
+                bf = self.connectors.get("binance_fut")
+                if bf is not None and self._running():
+                    self._spawn(bf.unsubscribe(sym), f"unsub:{sym}")
+                elif bf is not None:
+                    bf.subs.pop(sym, None)
+
+    def slot_series(self, tf: str) -> list[tuple[SeriesDef, dict, dict]]:
+        """The window's picked stock(s) as series: [(SeriesDef with id stock1.., pick, entry)]."""
+        out = []
+        pos = self.stock_cfg.get("positions") or [[0.92, 0.29]]
+        for i, p in enumerate((self.stock_screen.get(tf) or {}).get("picks", [])):
+            ent = self._stocks.get(p["symbol"])
+            if ent is None:
+                continue
+            x, y = pos[min(i, len(pos) - 1)]
+            sdef = SeriesDef(f"stock{i + 1}", f"{p['ticker']} (notable stock)", p["ticker"], "equities", True, "price",
+                             ent["inst"], {"x": x, "y": y, "source": "binance_fut", "symbol": p["symbol"],
+                                           "field": "index"}, [], p["why"])
+            out.append((sdef, p, ent))
+        return out
+
+    @staticmethod
+    def _running() -> bool:
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def _slot_reads(self, tf: str, w, now: float) -> list[tuple[dict, Instrument]]:
+        """The window's picked stock(s) as map nodes (read like every other node)."""
+        out = []
+        for i, (sdef, p, ent) in enumerate(self.slot_series(tf)):
+            r = self.read(sdef, w, now)
+            r["slot"] = {"index": i + 1, "symbol": p["ticker"], "perpetual": p["symbol"], "why": p["why"],
+                         "universe": self.stock_meta.get("universe", 0), "ready": ent["ready"],
+                         "screen": {k: None if p.get(k) is None else round(p[k], 3)
+                                    for k in ("z", "change_pct", "sigma_pct", "rvol", "score")}}
+            out.append((r, ent["inst"]))
+        return out
+
+    def _stocks_info(self, tf: str) -> dict:
+        sc, res, meta = self.stock_cfg, self.stock_screen.get(tf) or {}, self.stock_meta
+        slots = self.stock_slots()
+        rule = {"z_min": float(sc.get("z_min", 2.0)), "score_min": float(sc.get("score_min", 2.5))}
+        rnd = lambda p: {"symbol": p["ticker"], **{k: None if p.get(k) is None else round(p[k], 3)  # noqa: E731
+                                                   for k in ("z", "change_pct", "sigma_pct", "rvol", "score")}}
+        if not slots:
+            note = "The notable-stock slot is switched off ([stocks] slots = 0 or no universe)."
+        elif meta.get("at") is None:
+            note = "The large-cap screen has not run yet (it starts once the map's history is loaded)."
+        elif not res.get("picks"):
+            note = (f"No large-cap stock stands out: none of {res.get('screened', 0)} moved |z| ≥ {rule['z_min']:g} "
+                    f"with a score ≥ {rule['score_min']:g}.")
+        else:
+            note = res["picks"][0]["why"]
+        return {"slots": slots, "universe": meta.get("universe", 0), "screened": res.get("screened", 0),
+                "scanned_at": clock.iso(meta["at"]) if meta.get("at") else None, "rule": rule,
+                "picks": [dict(rnd(p), slot=i + 1, why=p["why"]) for i, p in enumerate(res.get("picks", []))],
+                "candidates": [rnd(p) for p in res.get("top", [])], "not_listed": meta.get("missing", []),
+                "positions": (sc.get("positions") or [[0.92, 0.29]])[:max(1, slots)], "note": note}
 
     # ── callbacks from connectors ───────────────────────────────────────────────────────────
     def on_news(self, items: list[dict]) -> None:
@@ -226,10 +370,11 @@ class Engine:
 
     def watch_symbols(self) -> set[str]:
         """Tickers on the map (for filtering company-news feeds down to what matters here)."""
-        out = {"SPY", "QQQ", "TLT", "IEF", "HYG", "GLD", "SLV", "USO", "UUP", "VIXY", "ANT", "BTCUSD", "ETHUSD",
+        out = {"SPY", "QQQ", "TLT", "IEF", "HYG", "GLD", "SLV", "USO", "UUP", "VIXY", "BTCUSD", "ETHUSD",
                "IBIT", "ETHA", "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "TSLA", "COIN", "MSTR"}
         for i in self.instruments.values():
             out.add(i.symbol.replace("USDT", "").upper())
+        out |= {e["ticker"] for e in self._stocks.values()}       # the notable stock(s) of the moment
         return out
 
     def on_vix(self, d: dict) -> None:
@@ -286,11 +431,24 @@ class Engine:
                         self._cache.clear()
 
     # ── history ─────────────────────────────────────────────────────────────────────────────
+    async def _binance_history(self, inst: Instrument, since5: float, since1: float, now: float) -> None:
+        """5-minute (with volume) and 1-minute history of one Binance instrument, from `since`."""
+        from .connectors import binance as bn
+        mk = "spot" if inst.source == "binance_spot" else "fut"
+        pr = "index" if (mk == "fut" and inst.extra.get("field", "last") == "index") else "last"
+        k5 = await bn.fetch_klines(self.ctx.session, mk, inst.symbol, "5m", int(since5 * 1000), int(now * 1000), pr)
+        vol = k5
+        if pr == "index":
+            vol = await bn.fetch_klines(self.ctx.session, mk, inst.symbol, "5m", int(since5 * 1000), int(now * 1000), "last")
+        k1 = await bn.fetch_klines(self.ctx.session, mk, inst.symbol, "1m", int(since1 * 1000), int(now * 1000), pr)
+        inst.seed("g5", [(t, c) for t, c, _, _ in k5], now, [(t, q, tb) for t, _, q, tb in vol])
+        inst.seed("g1", [(t, c) for t, c, _, _ in k1], now)
+
     async def seed_history(self, incremental: bool = False, since: float | None = None) -> None:
         """Fill the grids: disk cache first, then REST for whatever is missing. `since` (after a sleep)
         forces a re-download from that time: the gap was filled with the last pre-sleep price by the
         clock tick, so "the newest cached step" would wrongly say there is nothing to fetch."""
-        from .connectors import alpaca as alp, binance as bn, hyperliquid as hl, pollers
+        from .connectors import alpaca as alp, hyperliquid as hl, pollers
         now = self.clock.now()
         days = int(self.cfg.get("general", {}).get("history_days", 35))
         horizon = now - days * 86400
@@ -314,19 +472,10 @@ class Engine:
                 try:
                     since5 = start_of(inst)
                     since1 = max(now - 86400 + 60, since5 - 600 if incremental else now - 86400 + 60)
-                    field_ = inst.extra.get("field", "last")
                     if inst.source in ("binance_spot", "binance_fut"):
-                        mk = "spot" if inst.source == "binance_spot" else "fut"
-                        if mk == "fut" and inst.symbol in self._funding_only():
+                        if inst.source == "binance_fut" and inst.symbol in self._funding_only():
                             return
-                        pr = "index" if (mk == "fut" and field_ == "index") else "last"
-                        k5 = await bn.fetch_klines(self.ctx.session, mk, inst.symbol, "5m", int(since5 * 1000), int(now * 1000), pr)
-                        vol = k5
-                        if pr == "index":
-                            vol = await bn.fetch_klines(self.ctx.session, mk, inst.symbol, "5m", int(since5 * 1000), int(now * 1000), "last")
-                        k1 = await bn.fetch_klines(self.ctx.session, mk, inst.symbol, "1m", int(since1 * 1000), int(now * 1000), pr)
-                        inst.seed("g5", [(t, c) for t, c, _, _ in k5], now, [(t, q, tb) for t, _, q, tb in vol])
-                        inst.seed("g1", [(t, c) for t, c, _, _ in k1], now)
+                        await self._binance_history(inst, since5, since1, now)
                     elif inst.source == "hyperliquid":
                         k5 = await hl.fetch_candles(self.connectors["hyperliquid"], inst.symbol, "5m", since5, now)
                         k1 = await hl.fetch_candles(self.connectors["hyperliquid"], inst.symbol, "1m", since1, now)
@@ -436,6 +585,7 @@ class Engine:
             for i in [s.inst] + [r[1] for r in s.refs] + list(getattr(s.inst, "inputs", [])):
                 if i.source == "binance_fut":
                     used.add(i.symbol)
+        used |= set(self._stocks)                 # picked stocks: refilled after a sleep like any node
         return {i.symbol for i in self.instruments.values() if i.source == "binance_fut"} - used
 
     def save_cache(self) -> None:
@@ -669,9 +819,17 @@ class Engine:
     def build_tf(self, tf: str, now: float) -> dict:
         w = stats.window_for(tf, now)
         reads = {sid: self.read(s, w, now) for sid, s in self.series.items()}
+        slots = self._slot_reads(tf, w, now)
+        for r, _ in slots:
+            reads[r["id"]] = r
         z_all = {sid: r["z"] for sid, r in reads.items() if r["z"] is not None and r["status"] in FLOW_STATUSES}
-        z_nodes = {sid: v for sid, v in z_all.items() if self.series[sid].node}
+        z_nodes = {sid: v for sid, v in z_all.items() if reads[sid]["node"]}
         rets = self._returns(tf, w, now)
+        if slots:
+            rets = dict(rets)
+            for r, inst in slots:
+                rets[r["id"]] = self._cached(("rets", tf, r["id"], inst.key), 10 if tf == "1h" else 30,
+                                             lambda inst=inst: stats.step_returns(inst, w, now), now)
         memo = {}
         linked = self._linked_pairs()
 
@@ -684,21 +842,42 @@ class Engine:
             return memo[k]
 
         fc = self.flow_cfg
+        why: dict = {}
         edges = flow.infer_edges(z_nodes, corr_fn, theta=fc.get("theta", 0.5), max_edges=fc.get("max_edges", 16),
-                                 per_node=fc.get("per_node", 5), min_weight=fc.get("min_weight", 0.3))
+                                 per_node=fc.get("per_node", 5), min_weight=fc.get("min_weight", 0.3), why=why)
         risk = flow.risk_composite(z_all, self.risk_components, self.risk_scale, self.risk_clip)
         edges_d = [e.as_dict() for e in edges]
         ctx = self._narrative_ctx(tf, w, reads, now)
         bullets = narrative.build(tf, reads, edges_d, risk, ctx)
         nodes = [r for r in reads.values() if r["node"]]
         aux = [r for r in reads.values() if not r["node"]]
+        names = {sid: r["label"] for sid, r in reads.items()}
         for n in nodes:
             n["inflow_share"] = round(sum(e.share for e in edges if e.dst == n["id"]), 3)
             n["outflow_share"] = round(sum(e.share for e in edges if e.src == n["id"]), 3)
+            n["no_edge"] = self._no_edge_info(n, why.get(n["id"]), names, any(n["id"] in (e.src, e.dst) for e in edges))
         return {"timeframe": tf, "label": stats.TF_LABELS[tf],
                 "window": {"start": clock.iso(w.start), "end": clock.iso(w.end), "label": w.label},
                 "nodes": nodes, "aux": aux, "edges": edges_d, "risk": risk, "narrative": bullets,
-                "tiles": self._tiles(tf, w, reads, now)}
+                "tiles": self._tiles(tf, w, reads, now), "stocks": self._stocks_info(tf)}
+
+    @staticmethod
+    def _no_edge_info(n: dict, r: dict | None, names: dict, has_edge: bool) -> dict | None:
+        """Why a node has no arrow in this window (None if it has one)."""
+        if has_edge:
+            return None
+        if r is not None:
+            return {"code": r["code"], "text": flow.no_edge_text(r, names)}
+        st = n["status"]
+        if n["z"] is None:
+            if st == "closed":
+                return {"code": "closed", "text": "No arrow: its market was closed for the whole window, so there "
+                                                  "is no move to read."}
+            if st == "no_data":
+                return {"code": "no_data", "text": "No arrow: no data yet."}
+            return {"code": "warming_up", "text": "No arrow yet: not enough history to judge a move in this window."}
+        return {"code": "not_live", "text": f"No arrow while its data is {st.replace('_', ' ')}: only live prices "
+                                            f"(or a closed market's last price) take part in the flows."}
 
     def _narrative_ctx(self, tf, w, reads, now) -> dict:
         ctx = {"stable_supply": self.stable_supply or {}, "etf": self.etf, "fed": self.fed_info(now) or {},
@@ -871,6 +1050,7 @@ class Engine:
             missing = [i.key for i in self.instruments.values()
                        if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
                        and i.g5.last_k is None and i.symbol not in self._funding_only()
+                       and i.symbol not in self._stocks         # picked stocks load their own history
                        and not (i.source == "alpaca" and not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"))]
             if self.seed_state.get("state") == "done" and not self.seed_state.get("errors") and not missing:
                 return

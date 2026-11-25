@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "moneyflow.snapshot/1",
   "title": "moneyflow snapshot (one timeframe)",
-  "description": "Returned by GET /api/snapshot?tf=1h|today|1w and pushed over /ws and /sse. With tf=all the per-timeframe fields (timeframe, label, window, nodes, aux, edges, risk, narrative, tiles) are nested under `timeframes.<tf>` instead (see $defs.all). A heuristic read, not a fact.",
+  "description": "Returned by GET /api/snapshot?tf=1h|today|1w and pushed over /ws and /sse. With tf=all the per-timeframe fields (timeframe, label, window, nodes, aux, edges, risk, narrative, tiles, stocks) are nested under `timeframes.<tf>` instead (see $defs.all). A heuristic read, not a fact.",
   "type": "object",
   "required": ["schema", "version", "generated_at", "generated_ts", "timeframe", "window", "nodes", "edges", "risk", "narrative", "tiles", "market", "sources", "meta"],
   "properties": {
@@ -20,6 +20,7 @@
     "risk": {"$ref": "#/$defs/risk"},
     "narrative": {"type": "array", "items": {"$ref": "#/$defs/bullet"}},
     "tiles": {"type": "object"},
+    "stocks": {"$ref": "#/$defs/stocks"},
     "fed": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/fed"}]},
     "events": {"type": "array", "items": {"type": "object"}},
     "news": {"type": "array", "items": {"$ref": "#/$defs/news"}},
@@ -65,9 +66,26 @@
           "status": {"type": "string"}}}},
         "spark": {"type": "array", "items": {"type": ["number", "null"]}},
         "inflow_share": {"type": "number"}, "outflow_share": {"type": "number"},
+        "no_edge": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["code", "text"], "properties": {
+          "code": {"enum": ["neutral", "no_counterpart", "co_moved", "too_weak", "closed", "no_data", "warming_up", "not_live"]},
+          "text": {"type": "string"}}}],
+          "description": "why this map node has no arrow in the window (null when it has one)"},
+        "slot": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["index", "symbol", "why"], "properties": {
+          "index": {"type": "integer"}, "symbol": {"type": "string"}, "perpetual": {"type": "string"},
+          "why": {"type": "string"}, "universe": {"type": "integer"}, "ready": {"type": "boolean"},
+          "screen": {"type": "object", "description": "the screen's own estimates (z, change_pct, sigma_pct, rvol, score)"}}}],
+          "description": "set on a notable-stock node (id stock1, stock2, ...): which stock fills the slot and why"},
         "extra": {"type": "object"}, "note": {"type": "string"}
       }
     },
+    "stocks": {"type": "object", "required": ["slots", "picks", "note"], "description": "the notable-stock screen for this window", "properties": {
+      "slots": {"type": "integer"}, "universe": {"type": "integer", "description": "large caps screened (those with a Binance perpetual)"},
+      "screened": {"type": "integer"}, "scanned_at": {"type": ["string", "null"]},
+      "rule": {"type": "object", "properties": {"z_min": {"type": "number"}, "score_min": {"type": "number"}}},
+      "picks": {"type": "array", "items": {"type": "object", "required": ["slot", "symbol", "why"]}},
+      "candidates": {"type": "array", "items": {"type": "object"}, "description": "the five highest screen scores, picked or not"},
+      "not_listed": {"type": "array", "items": {"type": "string"}, "description": "configured tickers without a perpetual"},
+      "positions": {"type": "array"}, "note": {"type": "string"}}},
     "edge": {"type": "object", "required": ["from", "to", "weight", "share", "from_z", "to_z"], "properties": {
       "from": {"type": "string"}, "to": {"type": "string"},
       "weight": {"type": "number", "description": "sqrt(|z_from| * z_to) * (1 - corr) / 2"},

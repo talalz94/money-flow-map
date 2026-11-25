@@ -1,7 +1,8 @@
 # Money Flow Map
 
 A real-time, **heuristic** read of where money is moving across markets right now: stocks, bonds,
-the dollar, gold, silver, oil, Anthropic, Bitcoin, Ether and stablecoins. It runs as **one
+the dollar, gold, silver, oil, Bitcoin, Ether and stablecoins, plus whichever **single large-cap
+stock** is moving most unusually at that moment (if any). It runs as **one
 lightweight Python process** that listens to free, low-latency public data feeds. It serves the
 read as a **local JSON API** (REST, WebSocket, SSE, webhooks) for other apps, plus an
 **optional dashboard**.
@@ -71,7 +72,8 @@ Windows. Everything is in `requirements.txt`.
 | **%** under a node | The plain percent change over the window. |
 | **Sparkline** | The path of the move over the window. |
 | **Badge** (e.g. `BNC-F* 144ms · 0.4s`) | The data source, its **median latency** (exchange timestamp to receipt) and the **age of its newest data**. Green = live, amber = delayed, grey = market closed, red = stale. `*` = a proxy (e.g. a perpetual standing in for the ETF). |
-| **Curved edge with moving dots** | An **inferred** flow from an outflow asset to an inflow asset in the same window. Thicker means stronger. |
+| **Curved edge with moving dots** | An **inferred** flow from an outflow asset to an inflow asset in the same window. Thicker means stronger. Hover over an asset to see its arrows, or, if it has none, why not (for example "it moved −0.4σ, inside ±0.5σ, too small to count"). |
+| **Notable stock** (right of the map) | The large-cap US stock whose move is most unusual in the window, with why it was picked (section 3.8). It changes with the window and the moment; when no stock clears the threshold the spot shows "none stands out now". |
 | **The Fed** (centre) | Days to the next FOMC rate decision. |
 | **1H / TODAY / 1W** | The window: the last 60 minutes; since **17:00 New York** yesterday (the global trading-day roll, i.e. the US close); the last 7 days. |
 | **Risk-on / risk-off meter** | A −100…+100 composite of documented components (section 3). |
@@ -120,7 +122,7 @@ was open. History is seeded at start-up from REST and cached on disk.
 | Window | σ estimated from |
 |---|---|
 | 1H | RMS of rolling 60-minute log returns over the last 10 days. Only windows where its market was open count. |
-| TODAY | **Same-clock σ**: RMS, over the previous 30 days, of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. Fallback (fewer than 8 such days, e.g. ANT after its IPO): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
+| TODAY | **Same-clock σ**: RMS, over the previous 30 days, of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. Fallback (fewer than 8 such days, e.g. a recent listing): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
 | 1W | RMS of daily (roll-to-roll) log returns over calendar days, × √7. |
 
 - **RMS, not standard deviation:** the mean of short-horizon returns is about 0, and estimating it adds noise.
@@ -142,7 +144,18 @@ weight(A→B) = sqrt(|z_A| · z_B) · (1 − ρ_AB) / 2
 - Assets that merely moved together (ρ → +1) get **no edge**.
 - Unknown ρ counts as 0 (factor 0.5).
 - So does the stablecoin share against BTC and ETH. The share is computed from their prices, so its correlation with them (about −1) is arithmetic, not evidence of a rotation. Such an edge shows no ρ.
-- Defaults: θ = 0.5σ, at most 16 edges and 5 per asset, minimum weight 0.3.
+- **Which edges are drawn.** First, every asset that has a qualifying edge (weight ≥ 0.3) keeps its single strongest one. Then the strongest of the rest are added, up to 16 in all and 5 per asset. Until 25 Nov 2026 the caps applied to everything, so an asset sold into the same haven as five stronger sellers lost its only arrow. That was often gold (section 10).
+- Defaults: θ = 0.5σ, minimum weight 0.3, at most 16 edges and 5 per asset beyond each asset's strongest.
+
+**An asset without an arrow** is always explained (hover over it on the map, or `no_edge` in the API):
+
+| Code | Plain words |
+|---|---|
+| `neutral` | It moved less than θ (±0.5σ): too small to count as money moving in or out. |
+| `no_counterpart` | It was sold (or bought), but nothing on the map moved the other way by θ or more. |
+| `co_moved` | Its best partner moved in step with it (ρ > 0): moving together is not a rotation, so the weight stays under 0.3. |
+| `too_weak` | Its strongest possible edge weighs under 0.3. |
+| `closed`, `warming_up`, `no_data`, `not_live` | No usable move in this window (market shut all window, too little history, no data, or stale data). |
 
 The strongest edge is the "strongest flow". It is a statement about *simultaneous opposite
 moves*, not about where any particular dollar went.
@@ -178,7 +191,6 @@ Each component is in σ units, clipped to ±4. Weights are in the config (`[risk
 - **US Bonds (TLT).** A *stitched* series. While US markets are open it uses TLT on IEX. Outside them it uses the TMF perpetual's index ÷ 3 (TMF is 3× TLT). At the open it snaps back to the real price, so the opening gap is real.
   - **Without an Alpaca key** there is no live TLT. The service then downloads TLT's 5-minute (60 days) and 1-minute (2 days) bars from Yahoo's chart API at start-up, so the proxy is anchored on TLT's real last close. From then on the node follows TMF ÷ 3 around the clock, and the hover says so.
   - The 1-minute series (one day) and the 5-minute series (35 days) are kept consistent: the 1-minute chain starts from the 5-minute value at a 5-minute boundary, and a gap in the proxy's data never drops its move.
-- **Anthropic (ANT).** Anthropic listed on Nasdaq in November 2026. The node uses Binance's 24/7 ANT perpetual, with the IEX quote as a reference. Its σ starts on the realized-variance fallback because its history is short.
 
 ### 3.7 "What the flow says"
 These are deterministic rules in `narrative.py`; each bullet carries its rule id. Examples:
@@ -193,7 +205,43 @@ These are deterministic rules in `narrative.py`; each bullet carries its rule id
 - **Negative funding.**
 - **Oil shocks.**
 - **Tech lagging.**
+- **Notable stock**: the stock in the slot, its move and how unusual it is.
 - **Plus:** the risk regime, the Fed countdown, the next US high-impact release, and caveats about proxies and closed markets.
+
+### 3.8 The notable-stock slot
+The fixed nodes are asset classes. A single stock is not one: on the reference map "Anthropic" was
+simply the stock that stood out at that moment. So one slot (`[stocks] slots`, 0 to 5) shows **the
+large-cap stock whose move is most unusual in the window**, and only when one clears the rule. It
+can be a different stock in 1H, TODAY and 1W, and it can be empty.
+
+- **Universe.** The configured large caps (138 S&P 100 and Nasdaq-100 names plus big ADRs, editable
+  in `[stocks] universe`) that have a Binance 24/7 TradFi perpetual: **78 of them** on 25 Nov 2026.
+  The API lists the other 60 (`stocks.not_listed`: MA, PG, PEP, CVX, ...). The perpetual is what
+  makes the chosen stock readable around the clock, like the Nasdaq-100 and S&P 500 nodes, with no key.
+- **The screen** runs every 5 minutes and is cheap:
+  - one bulk request returns every last price (all 817 perpetuals in 50 KB, weight 2);
+  - each stock's hourly bars are fetched once (20 days, weight 2) and topped up hourly (weight 1).
+  - For each window and stock:
+
+    ```
+    r     = ln(price now / price at the window start)
+    σ     = same clock: RMS of the same window's move on each of the previous 20 days
+            (1H: the same clock hour; TODAY: the same time since 17:00 New York; 1W: daily × √7)
+    z     = r / σ
+    rvol  = the window's quote volume / the median of the same on previous days
+    score = |z| · √clip(rvol, 0.5, 4)      (unusual volume strengthens a move, thin volume weakens it)
+    ```
+  - **Rule:** a stock qualifies with **|z| ≥ 2 and score ≥ 2.5**; the highest scores fill the slots.
+    The API shows the five best candidates in every case, picked or not (`stocks.candidates`).
+- **The chosen stock becomes a full node.** Its 35-day history and its live 1-second index price
+  are loaded within seconds of the pick. Its z on the map comes from the same estimators as every
+  other node; the screen's numbers only choose it, and the hover shows both. A stock no longer
+  picked keeps its live feed for 2 hours (`keep_s`) in case it comes back, then it is dropped.
+- **Seen live on 25 Nov 2026 (pre-market):**
+  - TODAY: **DELL**, −9.2% since 17:00 New York on 4.1× its usual volume (screen −2.9σ, map −3.3σ),
+    after a 12.4% fall in Tuesday's session (Alpaca), an arrow into bonds, the dollar and stablecoins;
+  - 1H: **WMT** (−3.0σ for that pre-market hour, 6.7× volume);
+  - 1W: none (best: ZS +18% but only +1.4σ, its weekly swings being large).
 
 ---
 
@@ -205,7 +253,7 @@ These are deterministic rules in `narrative.py`; each bullet carries its rule id
 |---|---|---|---|
 | Nasdaq 100 | Binance **QQQUSDT** perpetual, *index price* (Binance's fair price of QQQ, 1 s) | QQQ on Alpaca IEX | 24/7 (weekends = perp price discovery) |
 | S&P 500 | Binance **SPYUSDT** perpetual, index | SPY on IEX | 24/7 |
-| Anthropic (ANT) | Binance **ANTUSDT** perpetual, index | ANT on IEX (Nasdaq listed) | 24/7 |
+| Notable stock (slot) | Binance **TradFi perpetual** of the picked stock, index (e.g. DELLUSDT) | | 24/7 |
 | Gold | Binance **XAUUSDT** perpetual, index | GLD (IEX), PAXG (Binance spot) | 24/7 |
 | Silver | Binance **XAGUSDT**, index | SLV | 24/7 |
 | Crude oil (WTI) | Binance **CLUSDT**, index | USO | 24/7 |
@@ -314,6 +362,7 @@ Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON
   - Public market data needs no key.
   - REST weight limits: 6,000/min (spot) and 2,400/min (futures). The service watches the used-weight header and pauses at 50%.
   - Up to 1,024 streams per websocket; Binance closes each connection every 24 h, and the service reconnects.
+  - The notable-stock screen adds about 110 weight an hour (one bulk price call every 5 min at weight 2, plus one small hourly-bar request per stock an hour), and 160 once at start-up. A picked stock joins the open stream with `SUBSCRIBE`, without reconnecting (measured).
   - Market data only. API Terms of Use: <https://www.binance.com/en/terms>
 - **Alpaca Basic (free)**
   - Real-time IEX feed; **one** connection per stream type; 200 REST calls/min.
@@ -366,6 +415,9 @@ served:
 - `[[series]]` entries merge by `id`. To add an asset (for example the disabled `copper`, `iwm`
   or `openai` series), set `enabled = true`, or add a new entry with a `source` and `symbol`.
 - Connectors are switched in `[connectors.*]`.
+- The notable-stock slot is set in `[stocks]`: `slots` (0 switches it off, up to 5), `z_min` and
+  `score_min` (the rule), `scan_interval_s`, `keep_s`, `positions` (where each slot sits on the
+  map) and `universe` (your own list of tickers replaces the default one).
 
 ```toml
 [[series]]
@@ -374,6 +426,10 @@ enabled = true
 
 [connectors.hyperliquid]
 enabled = true
+
+[stocks]
+slots = 2          # show up to two notable stocks
+z_min = 2.5        # and only really unusual moves
 ```
 
 ---
@@ -385,9 +441,9 @@ The service listens on `http://127.0.0.1:8765` (localhost only). Everything is r
 | Endpoint | Returns |
 |---|---|
 | `GET /api/snapshot?tf=today` | Everything for one window (`1h`, `today`, `1w`), or `tf=all` for all three |
-| `GET /api/nodes?tf=1h` · `/api/nodes/{id}` | Assets (`bonds usd gold silver oil ndx spx ant btc eth stables`, aux: `vix_proxy hyg ief`) |
+| `GET /api/nodes?tf=1h` · `/api/nodes/{id}` | Assets (`bonds usd gold silver oil ndx spx btc eth stables`, plus `stock1` when a stock is picked; aux: `vix_proxy hyg ief`) |
 | `GET /api/edges?tf=` · `/api/risk?tf=` · `/api/narrative?tf=` · `/api/tiles?tf=` | Parts of the read |
-| `GET /api/history/{id}?grid=5m&hours=24` | Stored closes of one series (5m: 35 days, 1m: 1 day), each `[step end time, close, market open 1/0]`, for drawing your own charts |
+| `GET /api/history/{id}?grid=5m&hours=24` | Stored closes of one series (5m: 35 days, 1m: 1 day), each `[step end time, close, market open 1/0]`, for drawing your own charts. `stock1` gives the stock now in that slot (`&tf=` picks the window, default `today`) |
 | `GET /api/news?limit=30` · `/api/fed` · `/api/events` | Headlines, next FOMC decision, scheduled releases |
 | `GET /api/sources` · `/api/health` | Connector states and latency; process CPU/RAM, clock offset |
 | `GET /api/schema` | The JSON Schema (`moneyflow/schema/snapshot.schema.json`) |
@@ -429,8 +485,18 @@ ws.onmessage = (m) => { const s = JSON.parse(m.data).data; console.log(s.risk.la
             "source": {"id": "binance_fut", "name": "Binance USD-M perpetual", "symbol": "QQQUSDT", "proxy": true},
             "volume": {"rvol": 1.92, "net_taker": -15307890, "taker_buy_ratio": 0.48},
             "reference": [{"symbol": "QQQ", "source": "alpaca", "price": 635.76, "status": "closed"}],
-            "spark": [-0.04, 0.03, "..."]}],
+            "spark": [-0.04, 0.03, "..."], "no_edge": null},
+           {"id": "oil", "label": "Crude Oil (WTI)", "z": -0.4, "...": "...",
+            "no_edge": {"code": "neutral", "text": "No arrow: it moved -0.4σ, inside ±0.5σ, too small to count as money moving in or out."}},
+           {"id": "stock1", "label": "DELL (notable stock)", "short": "DELL", "z": -3.29, "change_pct": -9.22, "...": "...",
+            "slot": {"index": 1, "symbol": "DELL", "perpetual": "DELLUSDT", "universe": 78,
+                     "why": "DELL -9.20% today (-2.9σ) on 4.1× its usual volume: the most unusual move among 77 large caps (screen score 5.8).",
+                     "screen": {"z": -2.92, "rvol": 4.06, "score": 5.85}}}],
  "edges": [{"from": "spx", "to": "stables", "weight": 1.53, "share": 0.18, "corr": -0.65}],
+ "stocks": {"slots": 1, "universe": 78, "screened": 77, "rule": {"z_min": 2.0, "score_min": 2.5},
+            "picks": [{"slot": 1, "symbol": "DELL", "z": -2.92, "score": 5.85, "why": "..."}],
+            "candidates": [{"symbol": "DELL", "...": "..."}, {"symbol": "MDB", "...": "..."}], "not_listed": ["MA", "PG", "..."],
+            "note": "..."},
  "risk": {"score": -83, "label": "RISK-OFF", "coverage": 1.0, "components": ["..."]},
  "narrative": [{"id": "bonds_bid_safety", "text": "Bonds are bid (yields falling) while stocks fall: a classic safety trade.", "level": "down"}],
  "tiles": {"vix": {"level": 29.59, "status": "delayed"}, "dxy": {"level": 103.86}, "us10y": {"value": 4.92, "date": "2026-11-20"}},
@@ -507,6 +573,9 @@ machine (its *Processes* tab, 8 logical cores).
 | **Headless, final config** (8 min) | **2.5% / 1.6% / 6.2%** | **0.31%** | **75-83 MB** | 62-67 MB |
 | **+ 1 WebSocket client** (8 min; the load of one open dashboard: a full ~87 KB snapshot every second) | **3.7% / 3.1% / 7.8%** | **0.46%** | 78-82 MB | 61-65 MB |
 | Headless, first config, first hour after the open (10 min; also streamed IEF/HYG bid/ask, since dropped) | 3.9% / 3.1% / 9.3% | 0.49% | 75-79 MB | 60-63 MB |
+| **With the notable-stock slot** (25 Nov, pre-market, 10 min; 2 picked stocks live, 1 dashboard open) | **2.65%** / — / 6.2% | **0.33%** | 81-87 MB | — |
+
+The large-cap screen costs no measurable CPU (one 50 KB request every 5 minutes, about 0.3 s each, and a small hourly top-up) and about 5 MB of memory.
 
 - **25-minute soak** (after the verification fixes, with the dashboard tab connected): 50 samples, 30 s apart.
   - Memory flat: 75.6 MB at the start, 74.2 MB at the end, 78.6 MB at most.
@@ -607,7 +676,9 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - the ring buffers;
   - the stitched bonds series: the 1- and 5-minute series agreeing, gaps in the proxy, and bonds without an Alpaca key in US hours;
   - σ estimators on exact synthetic series;
-  - edge weights (including series built from each other) and the risk composite;
+  - edge weights (including series built from each other), which edges are kept, the plain-language reason for every asset without an arrow, and the risk composite;
+  - **every node, gold and the stock slot included, as the strongest outflow and the strongest inflow, in all three windows**, through the real engine (`tests/test_every_node.py`: 66 forced cases);
+  - the notable-stock screen on exact synthetic hourly bars (σ, volume ratio, score, the rule, "may be none"), the universe filter, and the slot as a full node (snapshot, schema, narrative, history id);
   - narrative rules (including the reference screenshot's read);
   - Fed calendar parsing;
   - RSS/Atom and news de-duplication;
@@ -622,6 +693,7 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - `tools/record.py`: record live frames for replay.
   - `tools/check_latency.py` (= `python -m moneyflow check`): latency and freshness report.
   - `tools/measure_resources.py`: CPU and RAM report.
+  - `tools/replay_flows.py`: replays the flow map over the cached history (offline) and reports how often each asset had an arrow in each window, and when it had none, which rule left it out.
 
 **What `tools/selftest.py` checks:**
 - every endpoint and error code, and the JSON Schema for every window;
@@ -715,13 +787,45 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - The phone layout overlapped.
   - The news wire jumped back on every headline.
 
+**Third round (25 Nov 2026): "why is Anthropic always on the map, and why does gold never get an arrow?"**
+- **Anthropic** was a fixed node, yet it was only the stock that stood out on the reference map. It
+  is replaced by the notable-stock slot (section 3.8). On its first live screen (pre-market) it
+  picked DELL for TODAY, −9.2% on 4.1× volume, cross-checked against Alpaca (DELL closed Tuesday
+  −12.4%) and Binance's REST index (within 0.01%). It picked WMT for 1H, and nothing for 1W.
+- **Gold, the evidence.** The flow map was replayed over the cached history with the dashboard's
+  own engine (every 15 minutes for 24 h, every hour for 7 days):
+
+  | Gold has an arrow | 1H (24 h) | TODAY (24 h) | TODAY (7 d) | 1W (7 d) |
+  |---|---|---|---|---|
+  | Before the fix | 37% | 47% | 46% | 100% |
+  | After | 42% | 61% | 51% | 100% |
+
+  - The data path was sound: gold's price matched Binance's REST index, and its z-score and status
+    were normal.
+  - Most arrow-less moments are **legitimate**: gold moved less than ±0.5σ (34 of 38 in TODAY over 24 h).
+  - **A selection flaw** removed the rest. With 5 arrows per asset, the havens (bonds, stablecoins,
+    the dollar) filled up with stronger sellers, and gold (often the weakest seller) lost its only
+    arrow: 9 of 51 arrow-less TODAY moments in 24 h. Every clearly sold or bought asset now keeps its
+    strongest arrow, as on the reference map, where bonds and stablecoins each take 6-7 arrows.
+  - **Drawing**: the arrows were drawn (pixel-checked on the canvas), but a typical one was 2 px wide
+    at half opacity. They are now thicker and brighter. On phones, arrows between neighbours in a
+    column were hidden under the spheres and labels; they now bow clear of them.
+  - Hovering an asset now lists its arrows or says exactly why it has none (section 3.4). On
+    25 Nov 11:35 UTC gold had arrows in all three windows (1H: the window's strongest, gold → stablecoins).
+  - `tests/test_every_node.py` proves every node, gold and the stock slot included, can be the
+    strongest outflow and inflow in each window.
+- **Also found and fixed in this round:**
+  - the stock screen's weekly σ included the current day, which is the move being measured;
+  - the hover mixed up two stocks when the slot held different ones in different windows;
+  - the phone layout kept stale positions when the slot appeared on switching windows.
+
 ---
 
 ## 11. Limits: what is real-time and what is not
 
 | Truly real-time (≤ 0.4 s) | Real-time **proxies** | Delayed or slow (labelled) |
 |---|---|---|
-| Bitcoin, Ether (Binance spot) | Nasdaq 100, S&P 500, ANT, gold, silver, oil: **Binance perpetual index prices**, not the cash index or ETF. Weekend prices are perpetual price discovery. | **VIX level: 15 min delayed** (licence) |
+| Bitcoin, Ether (Binance spot) | Nasdaq 100, S&P 500, the notable stock, gold, silver, oil: **Binance perpetual index prices**, not the cash index or ETF. Weekend prices are perpetual price discovery. | **VIX level: 15 min delayed** (licence) |
 | Binance perpetual index and mark prices (1 s) | Bonds outside US hours: **TMF perpetual ÷ 3** (thin, about $2M/day) | **10Y yield: FRED daily close**, 1-2 business days old |
 | DXY computed from OANDA FX (~0.3 s) | VIX direction: **UVXY perpetual** | **Stablecoin supply: hourly**; total crypto cap from CoinGecko is 5-10 min old (moved live by Binance prices) |
 | TLT/HYG/IEF on IEX during US hours (~0.13 s) | Stablecoin share between CoinGecko polls: moved by a 5-coin basket | Headlines: depends on the publisher (FinancialJuice ~minutes; Finnhub 15-45 min) |
@@ -739,6 +843,12 @@ More caveats:
   them. The correlation weighting keeps co-moving pairs out, but it cannot prove causation.
 - **Fed dates** come from the Fed's own page. An unscheduled meeting appears only once the Fed
   publishes it.
+- **The notable-stock screen is a screen.** Its σ comes from 20 days of hourly bars (same clock),
+  and its volume is the 24/7 perpetual's, not the stock exchange's. It only chooses the stock; the
+  node's own z uses the full estimators, so the two can differ (the hover shows both). Outside US
+  hours a stock's perpetual trades thinly, and its overnight moves are perpetual price discovery
+  (the map's caveat says so). Only large caps with a Binance perpetual (78 of the 138 configured)
+  can be picked.
 
 ---
 

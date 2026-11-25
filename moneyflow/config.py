@@ -112,6 +112,19 @@ def validate(cfg: dict) -> None:
             v = s.get(coord)
             if v is not None and not (0 <= float(v) <= 1):
                 raise ConfigError(f"series {sid}: {coord} must be within 0..1")
+    for sid in ids:
+        if sid.startswith("stock") and sid[5:].isdigit():
+            raise ConfigError(f"series id {sid!r} is reserved for the notable-stock slots (stock1, stock2, ...)")
+    st = cfg.get("stocks", {}) or {}
+    if not (0 <= int(st.get("slots", 1)) <= 5):
+        raise ConfigError("stocks.slots must be 0..5")
+    if float(st.get("z_min", 2.0)) <= 0 or float(st.get("score_min", 2.5)) <= 0:
+        raise ConfigError("stocks.z_min and stocks.score_min must be positive")
+    if float(st.get("scan_interval_s", 300)) < 60:
+        raise ConfigError("stocks.scan_interval_s must be at least 60 (Binance's request budget is shared)")
+    for p in st.get("positions", []) or []:
+        if len(p) != 2 or not all(0 <= float(v) <= 1 for v in p):
+            raise ConfigError("stocks.positions: each slot needs [x, y] within 0..1")
     tf = cfg.get("general", {}).get("default_timeframe", "today")
     if tf not in ("1h", "today", "1w"):
         raise ConfigError(f"general.default_timeframe {tf!r} must be 1h, today or 1w")

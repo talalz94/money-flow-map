@@ -182,11 +182,35 @@ class BinanceFutures(_BinanceStream):
 
     def streams(self):
         out = []
-        for s, v in sorted(self.subs.items()):
-            out.append(f"{s.lower()}@markPrice@1s")
-            if v.get("volume", True):
-                out.append(f"{s.lower()}@kline_1m")
+        for s in sorted(self.subs):
+            out += self._streams_of(s)
         return out
+
+    def _streams_of(self, s: str) -> list[str]:
+        v = self.subs[s]
+        return [f"{s.lower()}@markPrice@1s"] + ([f"{s.lower()}@kline_1m"] if v.get("volume", True) else [])
+
+    async def subscribe(self, symbol: str, inst, field: str = "index", volume: bool = True) -> None:
+        """Add a symbol while connected (Binance's SUBSCRIBE on the open stream, measured to work on
+        /market/stream); a later reconnect includes it through `url()` anyway."""
+        s = symbol.upper()
+        new = s not in self.subs
+        self.add(s, inst, field, volume=volume)
+        ws = getattr(self, "ws", None)
+        if new and ws is not None and not ws.closed:
+            self._msg_id = getattr(self, "_msg_id", 0) + 1
+            await ws.send_str(jsonutil.dumps({"method": "SUBSCRIBE", "params": self._streams_of(s), "id": self._msg_id}))
+
+    async def unsubscribe(self, symbol: str) -> None:
+        s = symbol.upper()
+        if s not in self.subs:
+            return
+        params = self._streams_of(s)
+        del self.subs[s]
+        ws = getattr(self, "ws", None)
+        if ws is not None and not ws.closed:
+            self._msg_id = getattr(self, "_msg_id", 0) + 1
+            await ws.send_str(jsonutil.dumps({"method": "UNSUBSCRIBE", "params": params, "id": self._msg_id}))
 
     def on_text(self, data, recv):
         j = jsonutil.loads(data)

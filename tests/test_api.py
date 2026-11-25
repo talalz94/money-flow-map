@@ -128,14 +128,27 @@ def test_webhooks_deliver_events_and_skip_startup_noise(cfg, keys):
                 if n["id"] == "btc":
                     n["z"] = 3.5
             wh.check(snap3, NOW + 12)
+            # the notable-stock slot: an extreme stock appears, then the slot switches to another one
+            snap4 = json.loads(json.dumps(snap3))
+            t4 = snap4["timeframes"][snap4["default_timeframe"]]
+            spx = next(n for n in t4["nodes"] if n["id"] == "spx")
+            t4["nodes"].append(dict(spx, id="stock1", label="DELL (notable stock)", z=-3.3,
+                                    slot={"index": 1, "symbol": "DELL", "why": ""}))
+            wh.check(snap4, NOW + 18)
+            snap5 = json.loads(json.dumps(snap4))
+            s1 = next(n for n in snap5["timeframes"][snap5["default_timeframe"]]["nodes"] if n["id"] == "stock1")
+            s1.update(label="WMT (notable stock)", z=-3.1, slot={"index": 1, "symbol": "WMT", "why": ""})
+            wh.check(snap5, NOW + 24)
             await asyncio.sleep(0.5)
         await runner.cleanup()
 
     run(go())
     events = [g["event"] for g in got]
     assert "regime_change" in events and events.count("regime_change") == 1
-    # assets already extreme at start-up are a baseline, not news: only btc (made extreme later) fires
-    assert {g["id"] for g in got if g["event"] == "extreme_move"} == {"btc"}
+    # assets already extreme at start-up are a baseline, not news: only btc (made extreme later) fires,
+    # and the slot fires once per stock in it (the same slot id holding DELL, then WMT)
+    assert {g["id"] for g in got if g["event"] == "extreme_move"} == {"btc", "stock1"}
+    assert [g["symbol"] for g in got if g["event"] == "extreme_move" and g["id"] == "stock1"] == ["DELL", "WMT"]
     rc = next(g for g in got if g["event"] == "regime_change")
     assert rc["from"] == "RISK-OFF" and rc["to"] == "RISK-ON" and rc["schema"] == "moneyflow.webhook/1"
     assert any(g["event"] == "extreme_move" and g["id"] == "btc" for g in got)

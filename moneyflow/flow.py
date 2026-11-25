@@ -12,7 +12,8 @@ Edges ("money moving from A to B") are INFERRED, never observed:
   ρ_AB is the correlation of their step returns inside the window. Opposite co-movement (ρ → −1)
   is what a rotation looks like (one sold while the other is bought, step by step), so it keeps
   the full weight; assets that merely moved together (ρ → +1) get no edge. Unknown ρ counts 0.5.
-  The strongest edges are kept (at most `max_edges`, `per_node` per asset).
+  Every asset with a qualifying edge (weight ≥ `min_weight`) keeps its strongest one; then the
+  strongest of the rest are added, up to `max_edges` in all and `per_node` per asset.
 
 Risk composite: a weighted average of documented components, each in σ units and clipped to ±4,
 mapped to −100…+100 with 100·tanh(S / scale). Missing inputs drop out and the weights are
@@ -47,8 +48,10 @@ class Edge:
 
 
 def infer_edges(z: dict[str, float], corr_fn, theta: float = 0.5, max_edges: int = 16,
-                per_node: int = 5, min_weight: float = 0.3) -> list[Edge]:
-    """`z`: node id -> z-score (live nodes only). `corr_fn(a, b)` -> correlation or None."""
+                per_node: int = 5, min_weight: float = 0.3, why: dict | None = None) -> list[Edge]:
+    """`z`: node id -> z-score (live nodes only). `corr_fn(a, b)` -> correlation or None.
+    `why`, if given, receives for every node WITHOUT an edge the rule that left it out (see
+    `no_edge_text`): an asset with no arrow is a fact of the window, never a mystery."""
     outs = [i for i, v in z.items() if _ok(v) and v <= -theta]
     ins = [j for j, v in z.items() if _ok(v) and v >= theta]
     cands = []
@@ -62,10 +65,22 @@ def infer_edges(z: dict[str, float], corr_fn, theta: float = 0.5, max_edges: int
     cands.sort(key=lambda e: -e.weight)
     count: dict[str, int] = {}
     kept = []
+    # 1. every asset that has a qualifying edge keeps its strongest one, whatever the caps: otherwise
+    #    an asset sold into the same haven as five stronger sellers lost its only arrow (gold, often)
+    best: dict[str, Edge] = {}
+    for e in cands:
+        for n in (e.src, e.dst):
+            best.setdefault(n, e)
+    for e in sorted({id(e): e for e in best.values()}.values(), key=lambda e: -e.weight):
+        kept.append(e)
+        count[e.src] = count.get(e.src, 0) + 1
+        count[e.dst] = count.get(e.dst, 0) + 1
+    kept_ids = {id(e) for e in kept}
+    # 2. then the strongest of the rest, within the caps
     for e in cands:
         if len(kept) >= max_edges:
             break
-        if count.get(e.src, 0) >= per_node or count.get(e.dst, 0) >= per_node:
+        if id(e) in kept_ids or count.get(e.src, 0) >= per_node or count.get(e.dst, 0) >= per_node:
             continue
         kept.append(e)
         count[e.src] = count.get(e.src, 0) + 1
@@ -73,7 +88,53 @@ def infer_edges(z: dict[str, float], corr_fn, theta: float = 0.5, max_edges: int
     tot = sum(e.weight for e in kept)
     for e in kept:
         e.share = e.weight / tot if tot > 0 else 0.0
+    if why is not None:
+        linked = {n for e in kept for n in (e.src, e.dst)}
+        for n, v in z.items():
+            if n not in linked and _ok(v):
+                why[n] = _no_edge(n, v, z, outs, ins, corr_fn, theta, min_weight)
     return kept
+
+
+def _no_edge(n, v, z, outs, ins, corr_fn, theta, min_weight) -> dict:
+    if abs(v) < theta:
+        return {"code": "neutral", "z": v, "theta": theta}
+    side = "out" if v < 0 else "in"
+    others = ins if side == "out" else outs
+    if not others:
+        return {"code": "no_counterpart", "z": v, "side": side, "theta": theta}
+    # every pairing stayed under the minimum weight (step 1 keeps any that qualifies): report the
+    # best one and what held it down
+    best = None
+    for m in others:
+        a, b = (n, m) if side == "out" else (m, n)
+        rho = corr_fn(a, b)
+        base = math.sqrt(abs(z[a]) * z[b])
+        w = base * (0.5 if rho is None else (1.0 - rho) / 2.0)
+        if best is None or w > best[1]:
+            best = (m, w, rho, base * 0.5)
+    m, w, rho, w_neutral = best
+    code = "co_moved" if rho is not None and rho > 0 and w_neutral >= min_weight else "too_weak"
+    return {"code": code, "z": v, "partner": m, "weight": w, "corr": rho, "min_weight": min_weight}
+
+
+def no_edge_text(r: dict, names: dict[str, str]) -> str:
+    """Plain-language reason for a node that has no arrow (shown when hovering over it)."""
+    nm = lambda i: names.get(i, i)  # noqa: E731
+    c, z = r["code"], r.get("z")
+    if c == "neutral":
+        return (f"No arrow: it moved {z:+.1f}σ, inside ±{r['theta']:g}σ, too small to count as money "
+                f"moving in or out.")
+    if c == "no_counterpart":
+        return (f"No arrow: it was {'sold' if r['side'] == 'out' else 'bought'} ({z:+.1f}σ), but nothing on "
+                f"the map was {'bought' if r['side'] == 'out' else 'sold'} by {r['theta']:g}σ or more in this "
+                f"window to pair it with.")
+    if c == "co_moved":
+        return (f"No arrow: its best match, {nm(r['partner'])}, moved in step with it (ρ {r['corr']:+.2f}). "
+                f"Assets that move together are not a rotation, so the arrow would weigh only "
+                f"{r['weight']:.2f} (minimum {r['min_weight']:g}).")
+    return (f"No arrow: its strongest possible arrow ({'to' if z < 0 else 'from'} {nm(r['partner'])}) weighs "
+            f"{r['weight']:.2f}, under the {r['min_weight']:g} minimum.")
 
 
 # ── risk-on / risk-off ──────────────────────────────────────────────────────────────────────────

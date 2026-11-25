@@ -48,6 +48,30 @@ components = [
   { id = "tech_leadership",   kind = "spread", inputs = ["ndx", "spx"],   weight = 0.05, label = "Nasdaq 100 vs S&P 500" },
 ]
 
+[stocks]                           # the "notable stock" slot(s): the large-cap stock whose move is most
+enabled = true                     # unusual in the window, if any (it may be none). See README 3.8.
+slots = 1                          # how many stocks may be shown at once (0 = off, at most 5)
+z_min = 2.0                        # |z| a stock's move needs (screen: same-clock σ from hourly bars)...
+score_min = 2.5                    # ...and |z| x sqrt(relative volume, clipped 0.5-4) at least this
+scan_interval_s = 300              # bulk price snapshot of the universe (one request, weight 2)
+keep_s = 7200                      # keep a dropped pick's live feed this long (it may come back)
+positions = [[0.92, 0.29], [0.70, 0.55], [0.30, 0.55]]   # map positions of slots 1, 2, 3 (0..1)
+# Large caps (S&P 100 and Nasdaq-100 names, plus big ADRs). Only those with a Binance 24/7 TradFi
+# perpetual are screened, so the chosen stock is read around the clock (the API lists the rest).
+universe = [
+  "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "BRK.B", "JPM", "LLY", "V", "UNH",
+  "XOM", "MA", "COST", "HD", "PG", "JNJ", "WMT", "NFLX", "ABBV", "BAC", "CRM", "ORCL", "AMD", "KO",
+  "PEP", "MRK", "CVX", "ADBE", "TMO", "CSCO", "ACN", "MCD", "WFC", "ABT", "LIN", "DIS", "INTU", "IBM",
+  "QCOM", "TXN", "AMGN", "CAT", "GE", "VZ", "PFE", "CMCSA", "NOW", "ISRG", "AMAT", "UBER", "PM",
+  "SPGI", "GS", "MS", "BKNG", "RTX", "HON", "T", "LOW", "NEE", "BLK", "UNP", "COP", "AXP", "DE",
+  "LMT", "SBUX", "PLD", "MU", "LRCX", "ADI", "KLAC", "PANW", "SNPS", "CDNS", "MDLZ", "GILD", "ADP",
+  "REGN", "VRTX", "MELI", "PYPL", "ABNB", "MAR", "ORLY", "CTAS", "CRWD", "MRVL", "FTNT", "ASML",
+  "PDD", "AZN", "PLTR", "APP", "ARM", "COIN", "MSTR", "SHOP", "DASH", "TTD", "INTC", "C", "SCHW",
+  "BMY", "MO", "MMM", "DUK", "SO", "CL", "EMR", "FDX", "GD", "NKE", "TGT", "USB", "BA", "MDT", "TMUS",
+  "DDOG", "ZS", "TEAM", "SNOW", "NET", "MDB", "DELL", "GEV", "ETN", "CEG", "HOOD", "IBKR", "TSM",
+  "BABA", "NVO", "SONY", "ANT",
+]
+
 [webhooks]
 # Push events to other apps:  targets = [{ url = "http://127.0.0.1:9000/hook", events = ["regime_change"] }]
 # events: regime_change, strongest_flow_change, extreme_move (|z| >= extreme_z), snapshot (every min_interval_s)
@@ -248,20 +272,6 @@ field = "index"
 reference = [{ source = "alpaca", symbol = "SPY", hours = "us_regular" }]
 x = 0.92
 y = 0.55
-
-[[series]]
-id = "ant"
-label = "Anthropic (ANT)"
-short = "ANT"
-group = "equities"
-kind = "price"
-source = "binance_fut"
-symbol = "ANTUSDT"
-field = "index"
-reference = [{ source = "alpaca", symbol = "ANT", hours = "us_regular" }]
-note = "Listed on Nasdaq in Nov 2026; history is short, so its σ starts on a realized-variance estimate."
-x = 0.92
-y = 0.29
 
 [[series]]
 id = "btc"

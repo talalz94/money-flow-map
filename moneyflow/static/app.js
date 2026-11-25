@@ -141,7 +141,9 @@
     let x = n.x ?? 0.5, y = n.y ?? 0.5;
     if (L.narrow && n.id) {
       const td = tfData();
-      if (!S.narrowPos && td) S.narrowPos = narrowPositions(td.nodes);
+      // re-flow when the window's node set changes (a notable-stock slot comes and goes between windows)
+      const key = td ? td.nodes.map((x) => x.id).join(",") : "";
+      if (td && (!S.narrowPos || S.narrowKey !== key)) { S.narrowPos = narrowPositions(td.nodes); S.narrowKey = key; }
       const p = S.narrowPos && S.narrowPos[n.id];
       if (p) { x = p.x; y = p.y; }
     }
@@ -155,8 +157,13 @@
     const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, dx = b.x - a.x, dy = b.y - a.y;
     const len = Math.hypot(dx, dy) || 1, nx = -dy / len, ny = dx / len;
     const c = S.layout, cx = c.W / 2, cy = c.H / 2;
-    const side = ((mx - cx) * nx + (my - cy) * ny) > 0 ? 1 : -1;     // bow away from the centre
-    const off = Math.min(90, len * 0.16) * side * k;
+    let side = ((mx - cx) * nx + (my - cy) * ny) > 0 ? 1 : -1;       // bow away from the centre
+    let off = Math.min(90, len * 0.16);
+    if (Math.abs(dx) < c.R * 2) {        // one above the other (a column): a near-straight line would hide
+      side = -side;                      // under the spheres and labels between them, so bow inwards, clear
+      off = Math.max(off, c.R * (c.narrow ? 4.2 : 2.4));   // (phones: past the labels under each node)
+    }
+    off *= side * k;
     return { x: mx + nx * off, y: my + ny * off };
   }
   const qpt = (a, c, b, t) => ({ x: (1 - t) * (1 - t) * a.x + 2 * (1 - t) * t * c.x + t * t * b.x,
@@ -179,9 +186,9 @@
       const a = byId[e.from], b = byId[e.to]; if (!a || !b) continue;
       const pa = pos(a), pb = pos(b), c = curve(pa, pb, 1);
       const grad = g.createLinearGradient(pa.x, pa.y, pb.x, pb.y);
-      const al = 0.25 + 0.6 * Math.min(1, e.share * 4);
+      const al = 0.4 + 0.5 * Math.min(1, e.share * 4);              // even a minor flow stays readable
       grad.addColorStop(0, `rgba(255,77,109,${al})`); grad.addColorStop(1, `rgba(34,211,138,${al})`);
-      g.strokeStyle = grad; g.lineWidth = 1.2 + 9 * e.share; g.lineCap = "round";
+      g.strokeStyle = grad; g.lineWidth = 2 + 11 * e.share; g.lineCap = "round";
       g.beginPath(); g.moveTo(pa.x, pa.y); g.quadraticCurveTo(c.x, c.y, pb.x, pb.y); g.stroke();
     }
     // the Fed in the centre
@@ -196,6 +203,19 @@
     // nodes
     for (const n of nodes) drawNode(g, n, pos(n), n.id === S.hover);
     S.nodePos = nodes.map((n) => ({ id: n.id, ...pos(n) }));
+    // an empty notable-stock slot: a faint placeholder that explains itself on hover (wide layout)
+    const st = td.stocks;
+    if (st && st.slots > 0 && !L.narrow && !nodes.some((n) => n.slot) && st.positions && st.positions[0]) {
+      const p = pos({ x: st.positions[0][0], y: st.positions[0][1] });
+      g.save(); g.setLineDash([4, 5]); g.strokeStyle = S.hover === "stock-empty" ? "rgba(200,210,225,0.7)" : "rgba(139,151,168,0.45)";
+      g.lineWidth = 1.4; g.beginPath(); g.arc(p.x, p.y, L.R * 0.9, 0, Math.PI * 2); g.stroke(); g.restore();
+      g.textAlign = "center"; g.fillStyle = COL.muted || "#8b97a8";
+      g.font = `600 ${Math.round(L.R * 0.36)}px "Segoe UI", sans-serif`;
+      g.fillText("NOTABLE STOCK", p.x, p.y + L.R * 1.45);
+      g.font = `${Math.round(L.R * 0.34)}px "Segoe UI", sans-serif`;
+      g.fillText("none stands out now", p.x, p.y + L.R * 1.95);
+      S.nodePos.push({ id: "stock-empty", ...p });
+    }
   }
 
   function drawNode(g, n, p, hot) {
@@ -352,12 +372,38 @@
   canvas.addEventListener("pointerdown", (ev) => { if (ev.pointerType !== "mouse") pointerAt(ev); });
   canvas.addEventListener("mouseleave", () => { S.hover = null; $("tip").hidden = true; drawStatic(); blit(); });
 
+  function placeTip(tip, mx, my) {
+    if (mx == null) return;
+    const wrap = $("mapwrap").getBoundingClientRect();
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.left = Math.max(6, Math.min(wrap.width - tw - 6, mx + 18)) + "px";
+    tip.style.top = Math.max(6, Math.min(wrap.height - th - 6, my - th / 2)) + "px";
+  }
+  function slotTip(td, mx, my) {                                   // the empty notable-stock slot
+    const tip = $("tip"), st = td.stocks || {};
+    let h = `<h3><span>Notable stock</span><span class="badge b-no_data">NONE NOW</span></h3>`;
+    h += `<div class="note">${esc(st.note || "")}</div>`;
+    h += `<div class="row"><span>Rule</span><span>|z| ≥ ${st.rule ? st.rule.z_min : "—"} and score ≥ ${st.rule ? st.rule.score_min : "—"} ` +
+         `<span class="muted">(score = |z| × √volume ratio)</span></span></div>`;
+    for (const c of (st.candidates || []).slice(0, 3))
+      h += `<div class="row"><span>${esc(c.symbol)}</span><span><span class="${cls(c.z)}">${fmtPct(c.change_pct)} · ${fmtZ(c.z)}</span>` +
+           ` <span class="muted">vol ${c.rvol == null ? "—" : c.rvol.toFixed(1) + "×"} · score ${c.score.toFixed(1)}</span></span></div>`;
+    h += `<div class="row"><span>Screened</span><span>${st.screened || 0} of ${st.universe || 0} large caps` +
+         `${st.scanned_at ? " · " + esc(new Date(st.scanned_at).toLocaleTimeString()) : ""}</span></div>`;
+    tip.innerHTML = h; tip.hidden = false; placeTip(tip, mx, my);
+  }
   function showTip(id, mx, my) {
     const tip = $("tip"), d = S.data; if (!d) return;
-    const all = Object.fromEntries(Object.entries(d.timeframes).map(([k, v]) => [k, v.nodes.find((n) => n.id === id)]));
+    if (id === "stock-empty") { const td = tfData(); if (td) slotTip(td, mx, my); return; }
+    const cur = d.timeframes[S.tf].nodes.find((x) => x.id === id);
+    // a notable-stock slot can hold a different stock in each window: match those by symbol, not slot id
+    const same = (x) => cur && cur.slot ? x.slot && x.slot.symbol === cur.slot.symbol : x.id === id;
+    const all = Object.fromEntries(Object.entries(d.timeframes).map(([k, v]) => [k, v.nodes.find(same)]));
     const n = all[S.tf]; if (!n) { tip.hidden = true; return; }
     const v = n.volume, dv = n.derivatives, src = n.source, ex = n.extra || {};
     let h = `<h3><span>${esc(n.label)}</span>${statusBadge(n.status)}</h3>`;
+    if (n.slot) h += `<div class="row"><span>Notable stock · slot ${n.slot.index}</span><span>picked from ${n.slot.universe} large caps ` +
+                     `<span class="muted">(screen: ${fmtZ(n.slot.screen.z)}, volume ${n.slot.screen.rvol == null ? "—" : n.slot.screen.rvol.toFixed(1) + "×"})</span></span></div>`;
     h += `<div class="row"><span>Price</span><span>${fmtPx(n.price)} <span class="muted">${esc(src.symbol)}</span></span></div>`;
     h += `<div class="row"><span>Source</span><span>${esc(src.name)}${src.proxy ? ' <span class="badge b-proxy">PROXY</span>' : ""}</span></div>`;
     h += `<div class="row"><span>What it is</span><span>${esc(src.description || "")}</span></div>`;
@@ -365,6 +411,14 @@
     h += `<div class="tfrow">` + ["1h", "today", "1w"].map((t) => { const x = all[t];
       return `<div><b>${t === "today" ? "TODAY" : t.toUpperCase()}</b><span class="${cls(x && x.change_pct)}">${fmtPct(x && x.change_pct)}</span><br>` +
         `<span class="${cls(x && x.z)}">${fmtZ(x && x.z)}</span></div>`; }).join("") + `</div>`;
+    {                                                              // its arrows in this window, or why it has none
+      const td = d.timeframes[S.tf], names = Object.fromEntries(td.nodes.map((x) => [x.id, x.short || x.label]));
+      const es = td.edges.filter((e) => e.from === id || e.to === id);
+      if (es.length) h += `<div class="row"><span>Arrows</span><span>${es.map((e) => e.from === id
+        ? `→ ${esc(names[e.to] || e.to)} <span class="muted">${e.weight.toFixed(2)}</span>`
+        : `← ${esc(names[e.from] || e.from)} <span class="muted">${e.weight.toFixed(2)}</span>`).join(" · ")}</span></div>`;
+      else if (n.no_edge) h += `<div class="row"><span>Arrows</span><span>${esc(n.no_edge.text)}</span></div>`;
+    }
     if (n.history_from) h += `<div class="row"><span>History starts</span><span>${esc(new Date(n.history_from).toLocaleDateString(undefined, { day: "numeric", month: "short" }))} — too new for this window</span></div>`;
     h += sparkSvg(n.spark, nodeColor(n));
     h += `<div class="row"><span>Typical move (1σ) for this window</span><span>${n.sigma_pct == null ? "—" : n.sigma_pct.toFixed(2) + "%"}</span></div>`;
@@ -388,12 +442,7 @@
     if (ex.pairs) h += `<div class="row"><span>FX legs</span><span class="muted">${Object.entries(ex.pairs).map(([k, x]) => k + " " + (x == null ? "—" : x.toFixed(4))).join(" · ")}</span></div>`;
     if (n.note) h += `<div class="note">${esc(n.note)}</div>`;
     tip.innerHTML = h; tip.hidden = false;
-    if (mx != null) {
-      const wrap = $("mapwrap").getBoundingClientRect();
-      const tw = tip.offsetWidth, th = tip.offsetHeight;
-      tip.style.left = Math.max(6, Math.min(wrap.width - tw - 6, mx + 18)) + "px";
-      tip.style.top = Math.max(6, Math.min(wrap.height - th - 6, my - th / 2)) + "px";
-    }
+    placeTip(tip, mx, my);
   }
 
   function sparkSvg(xs, col) {

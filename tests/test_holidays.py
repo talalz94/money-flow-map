@@ -17,7 +17,7 @@ def test_thanksgiving_us_closed_fx_and_crypto_open(cfg, keys):
     assert aux["hyg"]["status"] == "closed" and aux["ief"]["status"] == "closed"
     assert aux["hyg"]["z"] is None                        # no session since yesterday's 17:00 roll
     assert nodes["bonds"]["source"]["proxy"] and "market closed" in nodes["bonds"]["source"]["description"]
-    for nid in ("ndx", "spx", "ant", "gold", "btc", "eth", "usd"):
+    for nid in ("ndx", "spx", "gold", "btc", "eth", "usd"):
         assert nodes[nid]["status"] == "live", nid        # 24/7 perpetuals, crypto, FX keep running
     credit = next(c for c in t["risk"]["components"] if c["id"] == "credit")
     assert credit["available"] is False and t["risk"]["coverage"] == 0.9

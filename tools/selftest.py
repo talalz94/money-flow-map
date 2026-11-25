@@ -131,6 +131,24 @@ def main() -> int:
             check(abs(sum(e["share"] for e in s["edges"]) - 1) < 0.01, f"{tf}: edge shares sum to 1")
             check(all(nodes[e["from"]]["z"] < 0 < nodes[e["to"]]["z"] for e in s["edges"]),
                   f"{tf}: every edge runs from an outflow to an inflow")
+        linked = {n for e in s["edges"] for n in (e["from"], e["to"])}
+        check(all((n.get("no_edge") is None) == (nid in linked) for nid, n in nodes.items()),
+              f"{tf}: every node without an arrow says why (and only those)",
+              "; ".join(f"{nid}: {n.get('no_edge')}" for nid, n in nodes.items() if (n.get("no_edge") is None) != (nid in linked)))
+        stk = s.get("stocks") or {}
+        if check(bool(stk), f"{tf}: notable-stock screen reported"):
+            rule = stk.get("rule") or {}
+            picks = stk.get("picks") or []
+            check(len(picks) <= stk.get("slots", 0), f"{tf}: no more stocks than slots", f"{len(picks)} > {stk.get('slots')}")
+            check(all(abs(p["z"]) >= rule.get("z_min", 0) and p["score"] >= rule.get("score_min", 0) for p in picks),
+                  f"{tf}: every picked stock clears the rule", json.dumps(picks)[:300])
+            shown = {n["slot"]["symbol"] for n in s["nodes"] if n.get("slot")}
+            check(all(p["symbol"] in shown for p in picks), f"{tf}: every picked stock is on the map",
+                  f"picked {[p['symbol'] for p in picks]}, shown {sorted(shown)}", warn_only=just_started)
+            if stk.get("scanned_at"):
+                check(stk.get("universe", 0) >= 20, f"{tf}: large-cap universe screened", f"universe={stk.get('universe')}")
+            print(f"      {tf}: notable stock: {', '.join(p['symbol'] + ' ' + format(p['z'], '+.1f') + 'σ' for p in picks) or 'none'}"
+                  f" ({stk.get('note', '')[:110]})")
         r = s["risk"]
         check(r["score"] is None or -100 <= r["score"] <= 100, f"{tf}: risk score within -100..100", str(r["score"]))
         check(0 <= r["coverage"] <= 1, f"{tf}: risk coverage within 0..1")
@@ -208,7 +226,9 @@ def main() -> int:
             if j and lnodes[nid]["price"]:
                 d = abs(float(j["price"]) / lnodes[nid]["price"] - 1) * 100
                 check(d < 0.3, f"{nid} price matches Binance REST", f"diff {d:.3f}%")
-        for sym, nid in (("QQQUSDT", "ndx"), ("SPYUSDT", "spx"), ("XAUUSDT", "gold"), ("CLUSDT", "oil")):
+        pairs = [("QQQUSDT", "ndx"), ("SPYUSDT", "spx"), ("XAUUSDT", "gold"), ("CLUSDT", "oil")]
+        pairs += [(n["slot"]["perpetual"], n["id"]) for n in live["nodes"] if n.get("slot") and n.get("price")]
+        for sym, nid in pairs:
             j = external(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}")
             if j and lnodes[nid]["price"]:
                 d = abs(float(j["indexPrice"]) / lnodes[nid]["price"] - 1) * 100

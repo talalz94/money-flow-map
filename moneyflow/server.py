@@ -131,11 +131,13 @@ class Webhooks:
         top = (cur["edges"][0]["from"], cur["edges"][0]["to"]) if cur["edges"] else None
         if top and self.prev.get("top") not in (None, top):
             events.append({"event": "strongest_flow_change", "from": top[0], "to": top[1], "edge": cur["edges"][0]})
-        ext = {n["id"] for n in cur["nodes"] if n.get("z") is not None and abs(n["z"]) >= self.extreme_z}
-        for nid in ext - self.prev.get("extreme", set()):
-            n = next(x for x in cur["nodes"] if x["id"] == nid)
-            events.append({"event": "extreme_move", "id": nid, "label": n["label"], "z": n["z"],
-                           "change_pct": n["change_pct"]})
+        # a notable-stock slot can change stock: track it by the stock, not by the slot's id
+        ident = lambda n: "stock:" + n["slot"]["symbol"] if n.get("slot") else n["id"]  # noqa: E731
+        ext = {ident(n) for n in cur["nodes"] if n.get("z") is not None and abs(n["z"]) >= self.extreme_z}
+        for key in ext - self.prev.get("extreme", set()):
+            n = next(x for x in cur["nodes"] if ident(x) == key)
+            events.append({"event": "extreme_move", "id": n["id"], "label": n["label"], "z": n["z"],
+                           "change_pct": n["change_pct"], **({"symbol": n["slot"]["symbol"]} if n.get("slot") else {})})
         if not self.prev:                       # first read after start-up: a baseline, not a change
             events = []
         events.append({"event": "snapshot"})
@@ -145,7 +147,7 @@ class Webhooks:
             for ev in events:
                 if ev["event"] not in wanted:
                     continue
-                key = (t["url"], ev["event"], ev.get("id"))
+                key = (t["url"], ev["event"], ev.get("symbol") or ev.get("id"))
                 if now - self.last_sent.get(key, 0) < self.min_interval:
                     continue
                 self.last_sent[key] = now
@@ -272,6 +274,9 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
         [step END time (epoch s), close, market open during the step (1/0)]."""
         nid = request.match_info["id"]
         s = engine.series.get(nid)
+        if s is None:                    # a notable-stock slot: the stock in it now (?tf=, default today)
+            tf = request.query.get("tf", "today")
+            s = next((sd for sd, _, _ in engine.slot_series(tf if tf in TFS else "today") if sd.id == nid), None)
         if s is None:
             return _json({"error": f"unknown id {nid!r}", "ids": sorted(engine.series)}, 404)
         grid = request.query.get("grid", "5m")

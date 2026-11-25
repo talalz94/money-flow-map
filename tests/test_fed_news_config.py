@@ -67,10 +67,17 @@ def test_farside_table_parser():
 def test_config_merge_by_id_and_validation(tmp_path):
     user = tmp_path / "moneyflow.toml"
     user.write_text('[server]\nport = 9001\n[[series]]\nid = "copper"\nenabled = true\n'
-                    '[[series]]\nid = "ant"\nenabled = false\n', encoding="utf-8")
+                    '[[series]]\nid = "silver"\nenabled = false\n[stocks]\nslots = 2\n', encoding="utf-8")
     c = cfgmod.load(paths=[user])
     ids = [s["id"] for s in cfgmod.enabled_series(c)]
-    assert c["server"]["port"] == 9001 and "copper" in ids and "ant" not in ids
+    assert c["server"]["port"] == 9001 and "copper" in ids and "silver" not in ids
+    assert c["stocks"]["slots"] == 2 and len(c["stocks"]["universe"]) > 100       # merged: defaults kept
+    for wrong in ('[[series]]\nid = "stock1"\nsource = "binance_fut"\nsymbol = "X"\n', '[stocks]\nslots = 9\n',
+                  '[stocks]\nscan_interval_s = 5\n', '[stocks]\npositions = [[1.5, 0.2]]\n'):
+        f = tmp_path / "wrong.toml"
+        f.write_text(wrong, encoding="utf-8")
+        with pytest.raises(cfgmod.ConfigError):
+            cfgmod.load(paths=[f])
     bad = tmp_path / "bad.toml"
     bad.write_text('[[risk.components]]\nid = "x"\nkind = "neg"\ninputs = ["nope"]\nweight = 1.0\n', encoding="utf-8")
     with pytest.raises(cfgmod.ConfigError):
