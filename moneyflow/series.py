@@ -334,7 +334,9 @@ class Instrument:
                 if k < k_until:
                     self.v5.put(k, q, tb)
         h = self.holes.get(grid)
-        if h is not None and by_k and k_first * step <= h and max(by_k) * step >= h:
+        # covered: the data starts at the gap, or at the oldest step the grid holds (anything older
+        # falls out of it anyway: a 1-day grid's first minute is never downloaded again)
+        if h is not None and by_k and max(by_k) * step >= h and (k_first * step <= h or k_first <= k_until - g.size + 2):
             self.holes[grid] = None          # the exchange's own data now covers the gap
         if self.price != self.price and last == last:            # no live price yet: use the last close
             self.price = last

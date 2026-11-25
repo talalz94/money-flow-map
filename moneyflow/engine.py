@@ -259,12 +259,16 @@ class Engine:
             self._cache.clear()
 
     def _node_reads(self, tf: str, now: float) -> dict:
-        """The map's own numbers for the stocks it already reads (current and recent picks, loaded):
-        {perpetual: (log return, σ, rvol, live price)}, for the screen to rank them on exactly those."""
+        """The map's own numbers for the stocks it shows now (the current picks, loaded, with no hole
+        left by a sleep or an outage: until the back-fill is done its grid lacks those steps):
+        {perpetual: (log return, σ, rvol, live price)}, for the screen to rank them on exactly those.
+        Only the current picks: every stock kept for 2 h cost the loop ~25 ms per screen."""
         out, w = {}, stats.window_for(tf, now)
+        shown = {p["symbol"] for r in self.stock_screen.values() for p in (r or {}).get("picks", [])}
         for sym, ent in self._stocks.items():
             inst = ent["inst"]
-            if not ent.get("ready") or not isnum(inst.price):
+            if (sym not in shown or not ent.get("ready") or not isnum(inst.price)
+                    or any(h is not None for h in inst.holes.values())):
                 continue
             try:
                 r = stats.window_return(inst, w, now)[0]
@@ -301,14 +305,27 @@ class Engine:
         self._tasks = [t for t in self._tasks if not t.done()] + [task]
         return task
 
+    STOCK_RETRY_FIRST = 30.0                 # a picked stock's history that failed: again after 30 s, to 15 min
+
     async def _start_stock(self, sym: str) -> None:
         """History (cache first, then the missing tail) and the live index price of a picked stock."""
         ent = self._stocks.get(sym)
         if ent is None:
             return
         inst, now = ent["inst"], self.clock.now()
+        history.load(self.cache_dir, inst, now)
+        delay = self.STOCK_RETRY_FIRST
+        while self._stocks.get(sym) is ent:         # dropped (or picked anew, by another task): stop
+            if await self._load_stock(sym, ent):
+                return
+            # e.g. no network: retry while it is picked (or kept), not "loading" for good
+            ent["retry_in_s"] = delay
+            await asyncio.sleep(delay)
+            delay = min(900.0, delay * 2)
+
+    async def _load_stock(self, sym: str, ent: dict) -> bool:
+        inst, now = ent["inst"], self.clock.now()
         try:
-            history.load(self.cache_dir, inst, now)
             last = history.last_good_ts(inst)
             for h in inst.holes.values():                 # a gap in the cache (or an old cache): from there
                 if h is not None:
@@ -321,10 +338,13 @@ class Engine:
             if bf is not None and sym in self._stocks:
                 await bf.subscribe(sym, inst, "index", volume=True)
             ent["ready"] = True
+            ent.pop("retry_in_s", None)
             self._cache.clear()
             log.info("notable stock %s: history loaded, live feed on", ent["ticker"])
+            return True
         except Exception as e:  # noqa: BLE001
-            log.warning("notable stock %s: %s", ent["ticker"], self.keys.redact(e))
+            log.warning("notable stock %s: %s (retrying)", ent["ticker"], self.keys.redact(e))
+            return False
 
     def _prune_stocks(self, now: float) -> None:
         """Drop the live feed of a stock no longer picked anywhere for `keep_s` (default 2 h)."""
@@ -402,11 +422,15 @@ class Engine:
         node's log return under 3/4 of the screen's, or turned around) and its z no longer clears the
         rule. The screen's σ (hourly bars) and the node's (5-minute data) differ by up to ~25% at some
         clock times, which alone must not call an unchanged move "eased" (it did, in 6-7 of 10 cases
-        at 10:45 New York). Once eased it stays so until the next screen: no flicker at the threshold."""
+        at 10:45 New York). Once eased it stays so (no flicker at the threshold) until the next screen,
+        or until the move is fully back: as big as the screen's, the same way, and |z| over the rule."""
         key = (tf, p["symbol"])
-        if at is not None and self._eased.get(key) == at:
-            return True
         rs, rn = math.log1p(p["change_pct"] / 100.0), r.get("log_return")
+        if at is not None and self._eased.get(key) == at:
+            if rn is not None and rn * rs > 0 and abs(rn) >= abs(rs) and abs(r["z"]) >= z_min:
+                del self._eased[key]                 # it is back: the usual text, and the narrative again
+                return False
+            return True
         shrank = rn is None or rn * rs <= 0 or abs(rn) < self.EASED_MOVE * abs(rs)
         eased = shrank and abs(r["z"]) < z_min
         if eased and at is not None:
@@ -426,6 +450,8 @@ class Engine:
             note = "The notable-stock slot is switched off ([stocks] slots = 0 or no universe)."
         elif meta.get("at") is None:
             note = "The large-cap screen has not run yet (it starts once the map's history is loaded)."
+        elif res.get("rolled"):
+            note = "A new session began at 17:00 New York: the large-cap screen is running again."
         elif not res.get("picks"):
             note = (f"No large-cap stock stands out: none of {res.get('screened', 0)} moved |z| ≥ {rule['z_min']:g} "
                     f"with a score ≥ {rule['score_min']:g}.")
@@ -522,10 +548,11 @@ class Engine:
         inst.seed("g1", [(t, c) for t, c, _, _ in k1], now)
 
     async def seed_history(self, incremental: bool = False, since: float | None = None,
-                           state: dict | None = None) -> None:
+                           state: dict | None = None, only: set[str] | None = None) -> None:
         """Fill the grids: disk cache first, then REST for whatever is missing: from the newest good
         step, or from the first step a live feed left empty (a sleep, a network outage: `holes`),
-        or from `since`. Instruments whose download failed are listed in state["failed"]."""
+        or from `since`. `only`: just these instruments (a back-fill). Instruments whose download
+        failed are listed in state["failed"]."""
         from .connectors import alpaca as alp, hyperliquid as hl, pollers
         now = self.clock.now()
         days = int(self.cfg.get("general", {}).get("history_days", 35))
@@ -542,7 +569,8 @@ class Engine:
         startup = state is None
         st = self.seed_state if startup else state
         st.update(state="running", done=0, errors=[], failed=[], started=clock.iso(now))
-        insts = [i for i in self.instruments.values() if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")]
+        insts = [i for i in self.instruments.values() if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
+                 and (only is None or i.key in only)]
         st["total"] = len(insts) + 2
         if not incremental:
             for i in insts:
@@ -574,6 +602,8 @@ class Engine:
         tasks = [one(i) for i in insts if i.source != "alpaca"]
 
         async def alpaca_all():
+            if not alp_insts:
+                return
             conn = self.connectors.get("alpaca")
             if conn is None or not alp_insts or not conn.available()[0]:
                 # No Alpaca (no key, or switched off): take the same ETFs' history from Yahoo's chart
@@ -646,7 +676,7 @@ class Engine:
                     st["errors"].append(f"yahoo {h.get('symbol')}: {e}"[:200])
             st["done"] += 1
 
-        await asyncio.gather(*tasks, alpaca_all(), yahoo_dxy())
+        await asyncio.gather(*tasks, alpaca_all(), *([yahoo_dxy()] if only is None else []))
         oi = self.connectors.get("binance_oi")
         if oi is not None and not incremental:
             try:
@@ -694,6 +724,14 @@ class Engine:
             # 17:00 New York: TODAY starts a new window. Nothing computed for the old one may be served
             # after it (σ was, for up to a minute: z-scores ~6x too small, seen live on 24 Nov).
             self._cache.clear()
+            # ...nor the old session's TODAY pick (its move is gone: it read as "eased"): screen again
+            today = self.stock_screen.get("today")
+            if today and today.get("picks"):
+                self.stock_screen["today"] = dict(today, picks=[], top=[], rolled=True)
+            self._eased = {k: v for k, v in self._eased.items() if k[0] != "today"}
+            sc = self.connectors.get("stocks")
+            if sc is not None:
+                sc.kick()
         self._roll_seen = roll
         for inst in self.instruments.values():
             inst.feed_alive(self._feed_seen(inst.source))   # a quiet market on a live feed is covered
@@ -1308,7 +1346,9 @@ class Engine:
                 st = {"reason": reason, "attempt": attempt, "since": clock.iso(since), "missing": sorted(todo)}
                 self.backfill_state = st
                 try:
-                    await self.seed_history(incremental=True, since=since, state=st)
+                    # only what has holes, each from its own first hole: one stock's 35-day-old gap
+                    # once re-downloaded 35 days of every instrument (Binance's half budget, twice)
+                    await self.seed_history(incremental=True, state=st, only=set(todo))
                 except Exception as e:  # noqa: BLE001 - whatever it was, try again later
                     st.setdefault("errors", []).append(self.keys.redact(e)[:200])
                     st["failed"] = sorted(todo)

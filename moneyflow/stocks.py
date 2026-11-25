@@ -302,19 +302,33 @@ class StockBook:
         self.ring: dict[str, deque] = {}
         self.ticker: dict[str, str] = {}
 
+    RING_CAP = 400                          # points per stock, a safety bound (an hour holds ~30)
+
+    def _trim(self, ring: deque, now: float) -> None:
+        """Keep what a 1H start can need: the points of the last hour, plus a scan's tolerance. By TIME,
+        not by count: after a 15-40 minute gap the seeded 5-minute closes and the scans since then
+        share the ring, and keeping only the newest 16 dropped the ones near now - 1 h (the 1H start
+        then stayed on the line between two hourly closes, re-seeded and truncated at every scan)."""
+        oldest = now - H - 2 * self.scan_interval * 1.5
+        while ring and (ring[0][0] < oldest or len(ring) > self.RING_CAP):
+            ring.popleft()
+
     def on_prices(self, prices: dict[str, float], ts: float) -> None:
-        keep = int(H / self.scan_interval) + 4
         for sym, p in prices.items():
             if sym in self.hourly and _ok(p) and p > 0:
                 self.last[sym] = (p, ts)
-                self.ring.setdefault(sym, deque(maxlen=keep)).append((ts, p))
+                ring = self.ring.setdefault(sym, deque())
+                ring.append((ts, p))
+                self._trim(ring, ts)
 
-    def seed_ring(self, sym: str, points) -> None:
+    def seed_ring(self, sym: str, points, now: float | None = None) -> None:
         """Merge earlier prices [(ts, price)] into a stock's ring, in time order (after a start or a wake)."""
-        keep = max(int(H / self.scan_interval) + 4, 16)
         pts = sorted({(float(t), float(p)) for t, p in list(points) + list(self.ring.get(sym, ()))
                       if _ok(p) and p > 0})
-        self.ring[sym] = deque(pts, maxlen=keep)
+        ring = deque(pts)
+        if pts:
+            self._trim(ring, max(now or 0.0, pts[-1][0]))
+        self.ring[sym] = ring
 
 
 class StockScanner(PollConnector):
@@ -330,6 +344,8 @@ class StockScanner(PollConnector):
         self.universe_cfg = [str(t).upper() for t in cfg.get("universe", [])]
         self.universe_at = 0.0
         self.missing: list[str] = []          # configured tickers without a perpetual
+        self._seed_retry_at = 0.0             # after a failed 5-minute seed, wait before asking again
+        self._seed_backoff = self.interval
 
     def available(self):
         if not self.cfg.get("enabled", True) or int(self.cfg.get("slots", 1)) <= 0:
@@ -383,7 +399,7 @@ class StockScanner(PollConnector):
         from .connectors import binance as bn
         tol = self.book.scan_interval * 1.5
         need = [s for s in self.book.hourly if not _ok(ring_price(self.book.ring.get(s), now - H, tol))]
-        if not need:
+        if not need or now < self._seed_retry_at:
             return
         sem = asyncio.Semaphore(4)
 
@@ -393,12 +409,18 @@ class StockScanner(PollConnector):
                                          {"pair": sym, "interval": "5m", "startTime": int((now - H - 600) * 1000),
                                           "limit": 20}, bn.FUT_GATE)
             self.book.seed_ring(sym, [(r[0] / 1000.0 + 300.0, float(r[4])) for r in rows
-                                      if r[0] / 1000.0 + 300.0 <= now])
+                                      if r[0] / 1000.0 + 300.0 <= now], now)
 
         res = await asyncio.gather(*(one(s) for s in need), return_exceptions=True)
         bad = [r for r in res if isinstance(r, Exception)]
-        if bad:                                    # those keep the hourly fallback until the ring fills
+        if bad:
+            # those keep the hourly fallback until the ring fills from the scans (within the hour);
+            # do not ask again at every scan while the network is down: 5, 10, ... 30 minutes
             self.error(bad[0], f"5-minute start prices for {len(bad)} of {len(need)} stocks")
+            self._seed_retry_at = now + self._seed_backoff
+            self._seed_backoff = min(1800.0, self._seed_backoff * 2)
+        else:
+            self._seed_backoff = self.interval
 
     async def _prices(self, now: float) -> None:
         """Every stock's index price in one request (weight 10, ~25 KB compressed): the price of the

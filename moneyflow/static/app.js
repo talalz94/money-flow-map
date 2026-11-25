@@ -484,7 +484,7 @@
       `<div class="w">${e.weight.toFixed(2)}${e.corr == null ? "" : "<br>ρ " + e.corr.toFixed(2)}</div></div>`).join("")
       : `<div class="muted">No asset pair moved clearly in opposite directions in this window.</div>`;
     $("statusStrip").innerHTML = d.sources.map((s) => {
-      const k = ["connected", "ok"].includes(s.state) ? "ok" : s.state === "disabled" ? "" : ["error", "reconnecting"].includes(s.state) ? "err" : "warn";
+      const k = ["connected", "ok"].includes(s.state) ? "ok" : s.state === "disabled" ? "" : ["error", "reconnecting", "restarting"].includes(s.state) ? "err" : "warn";
       const lat = s.latency_ms_median != null ? ` ${Math.round(s.latency_ms_median)}ms` : "";
       const rate = s.msgs_per_s != null && s.kind === "stream" ? ` ${s.msgs_per_s}/s` : "";
       return `<span class="pill ${k}" title="${esc(s.title)}: ${esc(s.state)} ${esc(s.detail || "")} ${esc(s.last_error || "")}"><i></i>${esc(s.id)}${lat}${rate}</span>`;

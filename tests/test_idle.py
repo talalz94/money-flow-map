@@ -173,5 +173,6 @@ def test_auto_stop_still_works_while_a_backfill_keeps_retrying(tmp_path, keys, m
     took = time.monotonic() - t0
     assert 1.2 <= took < 6, took                  # stopped on time, the back-fill did not hold it up
     assert len(calls) >= 3                        # ...while it kept retrying
-    assert engines[0]._backfill_task.done() and engines[0].backfill_state.get("state") == "retrying"
+    bf = engines[0].backfill_state                # stopped mid-retry: cancelled, after several attempts
+    assert engines[0]._backfill_task.done() and bf.get("state") in ("retrying", "running") and bf.get("attempt", 0) >= 2
     assert _port_free(port)

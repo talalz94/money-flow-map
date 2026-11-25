@@ -294,8 +294,9 @@ def test_every_stream_connector_keeps_reconnecting_through_its_real_run_loop(key
 def test_no_connector_attribute_shadows_a_base_method(keys):
     """The Finnhub bug's class of error, for every connector: an instance attribute set in __init__ must
     not hide a method of the class (the loop then calls a number)."""
+    from moneyflow import stocks  # noqa: F401 - every connector class must exist before the walk
+    from moneyflow.connectors import alpaca, binance, coinbase, finnhub, hyperliquid, pollers  # noqa: F401
     from moneyflow.connectors.base import Connector
-    from moneyflow.connectors import pollers  # noqa: F401
 
     def walk(c):
         for s in c.__subclasses__():
@@ -551,8 +552,8 @@ def _exchange(truth, fail):
         if fail():
             raise OSError(11001, "getaddrinfo failed")
         step = 300 if interval == "5m" else 60
-        t = (start_ms // 1000 // step) * step
-        rows = []
+        t = -(-start_ms // 1000 // step) * step if start_ms % (step * 1000) else start_ms // 1000
+        rows = []                                            # (like Binance: bars opening at or after startTime)
         while t + step <= end_ms / 1000:
             rows.append((t, truth(t + step), 1.0, 0.5))
             t += step
@@ -589,6 +590,7 @@ def test_wake_with_dns_down_then_back_fills_the_gap_and_leaves_nothing_carried_a
     asyncio.run(eng._backfill("wake"))
     assert eng.backfill_state["state"] == "done" and eng.backfill_state["attempts"] == 3
     assert btc.holes == {"g1": None, "g5": None}
+    assert set(calls) == {"BTCUSDT"}                         # only what had holes was downloaded again
     for k in asleep:                                         # the exchange's prices, live
         assert btc.g5.get(k) == truth((k + 1) * G5_STEP) and btc.g5.is_live(k)
     assert stats.price_at(btc, wake - 1800, wake) == truth(wake - 1800)
@@ -665,7 +667,7 @@ def test_an_old_cache_with_a_flat_live_night_is_downloaded_again(cfg, keys, monk
     from moneyflow import history
     from moneyflow.connectors import binance as bn
     from moneyflow.series import G5_STEP
-    now = 1795528800.0
+    now = 1795528800.0 + 37.5                                # not on a minute: as a real start
     truth = lambda t: 100.0 + (t - now) / 86400.0           # noqa: E731
     old, _ = _gap_engine(cfg, keys, now, tmp_path)
     btc = old.instruments["binance_spot:BTCUSDT"]
@@ -675,6 +677,8 @@ def test_an_old_cache_with_a_flat_live_night_is_downloaded_again(cfg, keys, monk
     rows = [(t, rows[int(t // G5_STEP) - k_now + 2000 - 1][1] if int(t // G5_STEP) in flat else c)
             for t, c in rows]
     btc.seed("g5", rows, now)
+    k1 = int(now // 60)                                      # and a day of 1-minute closes (its first minute
+    btc.seed("g1", [(k * 60, truth((k + 1) * 60)) for k in range(k1 - 1440, k1)], now)   # is never downloaded)
     assert all(btc.g5.is_live(k) for k in flat)
     history.save(tmp_path, btc)
     f = next(tmp_path.glob("binance_spot_BTCUSDT.json"))

@@ -260,8 +260,11 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
   - one bulk request returns every index price (all 817 perpetuals, weight 10, about 25 KB compressed);
   - each stock's hourly index closes and its perpetual's hourly volume are fetched once (31 days,
     weight 5 each) and topped up hourly (weight 1 each);
-  - after a start or a wake, each stock's last 70 minutes of 5-minute index closes (weight 1 each,
-    once), so a 1H move starts from a real price, not from a line between two hourly closes.
+  - the scans' prices are kept for the last hour and a bit, by time. Whenever they do not reach
+    back to a 1H window's start (after a start, a wake, or a gap in the scans), each such stock's
+    last 70 minutes of 5-minute index closes are downloaded (weight 1 each), so a 1H move starts
+    from a real price, not from a line between two hourly closes. If that download fails it is
+    tried again after 5, 10, ... 30 minutes; within the hour the scans cover it anyway.
   - For each window and stock:
 
     ```
@@ -282,8 +285,9 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
   on 5-minute data, and its reason text (map, hover, panel, "what the flow says") quotes the node's
   own numbers. The screen's numbers, which chose it, stay in the API (`slot.screen`). A stock no
   longer picked keeps its live feed for 2 hours (`keep_s`) in case it comes back, then it is dropped.
-- **From the next screen on, a stock the map reads is ranked on the map's own numbers** (its move,
-  σ and volume ratio from 5-minute data; `screen.from` = `map`). Hourly bars cannot place where in
+- **From the next screen on, a stock the map shows is ranked on the map's own numbers** (its move,
+  σ and volume ratio from 5-minute data; `screen.from` = `map`): the current picks, once their
+  history has no gap left by a sleep or an outage. Hourly bars cannot place where in
   an hour the variance came (the 09:30 open sits inside the 09:00-10:00 bar), so for the other
   stocks the screen's σ differs from what a node would read: within ±10% as a median at every
   clock time tested, but 0.74 to 1.21 times on single days (section 10). For the pick itself, from
@@ -303,9 +307,15 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
   has shrunk below 3/4 of the move the screen picked (or turned around) **and** its |z| is under the
   rule, the slot says so instead of calling it the most unusual move, for example "NKE −0.30% in the
   last hour (−0.9σ) on 2.7× its usual volume. At the screen 2 min ago it was the most unusual move
-  among 75 large caps (−0.77%, −2.4σ); the move has eased since." That holds until the next screen
-  (no flicker at the threshold), and "What the flow says" leaves the stock out (API: `slot.eased`). A
-  move that did not shrink is never "eased", even if the node's σ puts its z a little under the rule.
+  among 75 large caps (−0.77%, −2.4σ); the move has eased since." That holds (no flicker at the
+  threshold) until the next screen, or until the move is fully back: as big as the screen's, the
+  same way, with |z| over the rule. Meanwhile "What the flow says" leaves the stock out (API:
+  `slot.eased`). A move that did not shrink is never "eased", even if the node's σ puts its z a
+  little under the rule.
+- **At 17:00 New York** TODAY starts again: the old session's TODAY pick is cleared (its move is
+  gone) and the screen runs again at once.
+- **A pick whose history fails to download** (no network) is retried after 30 s, doubling to
+  15 min, for as long as it is picked, instead of showing "loading" for good.
 - **Seen live on 25 Nov 2026 (pre-market, with the first σ estimator):**
   - TODAY: **DELL**, −9.2% since 17:00 New York on 4.1× its usual volume (screen −2.9σ, map −3.3σ),
     after a 12.4% fall in Tuesday's session (Alpaca), an arrow into bonds, the dollar and stablecoins;
@@ -1066,7 +1076,8 @@ new code:
 - **Smaller fixes:**
   - 1H starts from 5-minute index closes after a start or a wake, not a line between hourly closes;
   - 1W uses √(sessions in the window), 4 in Thanksgiving week (z was 11% too small);
-  - the screen's 1W start is to the minute, not the hour;
+  - the screen's 1W start is interpolated between the hourly closes around it, not the hour's
+    close (the node's start is to the minute);
   - "what the flow says" counts and ranks like the slot's text (75 screened, not 78; a runner-up in
     slot 1 is "number 2");
   - in the API every screen number sits under `screen` (with `from`: `map` or `hourly bars`), and
@@ -1077,9 +1088,11 @@ new code:
 - **`tools/verify_against_exchange.py`** recomputes the new formulas on its own (and takes `--url`).
   Against a test copy at 16:00 UTC, σ for BTC, ETH, the Nasdaq 100, the S&P 500, gold and oil, in
   all three windows, matched to the fourth decimal, and so did every z and % change.
-- **Mutation check:** the four changes the tests missed before are now caught (1W ignoring the
+- **Mutation check:** the four changes the review listed as missed are now caught (1W ignoring the
   calendar, NYSE holidays ignored, the cap not wired into TODAY and 1W, 1H samples not grouped by
-  day), as are 12 for this round's changes.
+  day), as are 12 for this round's changes. Seven others that the review found later (the
+  screen's calendar, DST, the 1H live filter, the volume baselines) were caught only by the tests
+  of the seventh round.
 - **Not fixed** (section 11): the screen's 1H volume ratio is the last whole hour's; the one-off
   cap can miss an event that straddles the 17:00 roll.
 
@@ -1096,6 +1109,58 @@ Live, the before and after are in section 9. The tests cover the wake with DNS f
 outage while awake, the auto-stop while back-fills keep failing, and an old cache. A mutation check
 of this fix (10 changes, from carried steps flagged live again to a back-fill that never retries) is
 caught by them all.
+
+
+**Seventh round (25 Nov 2026): a review of the fifth round.**
+- **The 1H start after a short gap** (a regression of the fifth round). After a 15-40 minute sleep
+  or outage, the 5-minute start prices and the scans since shared a ring of 16 points (about 40
+  minutes), so the prices near the hour's start were dropped. The 1H start then stayed on the line
+  between two hourly closes for the rest of the session, and every scan downloaded 5-minute prices
+  for all 78 stocks again. The ring now keeps the last hour by time, and a failed download backs
+  off (5 to 30 minutes). On the review's reproduction (a 15, 20 or 30-minute gap at 09:32 New
+  York):
+
+  | | Before | Now |
+  |---|---|---|
+  | Later scans whose 1H start fell back to the line | 21 | 0 |
+  | Scans that downloaded 5-minute prices | 22 | 2: the start, and once an hour later, when the hour's start fell in the gap |
+
+- **Smaller fixes:**
+  - a pick whose history fails to download is retried (30 s, doubling to 15 min) instead of
+    staying "loading";
+  - only the stocks the map shows are ranked on its numbers, and only once their history has no
+    gap from a sleep (the first screen after a wake ranked them on pre-sleep prices). With five
+    more stocks kept on the map, the screen's re-reads take 15 ms instead of 84 ms;
+  - "eased" lets go when the move is fully back;
+  - at 17:00 New York the old session's TODAY pick is cleared and the screen runs again at once;
+  - a crashed connector's "restarting" shows red, like "reconnecting";
+  - the screen's 1W start is now described as what it is (interpolated);
+  - the API schema describes `eased` by its rule.
+- **Tests.** `tests/test_calendar_rules.py` checks every place a calendar or a clock rule enters
+  σ and the volume baselines, on the nodes and on the screen, against values computed
+  independently: NYSE trading days, the midpoint rule, DST, the 1H live filter, the TODAY stop at
+  the roll, and √(sessions). Other new tests cover:
+  - the ring after a gap and with a failing download;
+  - `poll()` seeding the ring;
+  - each condition of the "eased" rule;
+  - the roll, the retry and which stocks are re-read.
+
+  The guard against attributes that hide methods now imports every connector first; run alone, it
+  fails on the old Finnhub file.
+- **Found while testing this round, in the sixth round's back-fill.** A start from an old-format
+  cache showed two flaws:
+  - the back-fill re-downloaded every instrument from the earliest hole of any of them: one
+    stock's 35-day-old gap meant 35 days of everything, and Binance's half-budget pause twice;
+  - a gap at the very first step of the 1-day grid could never count as filled, which set off one
+    needless back-fill.
+
+  Now it downloads only the instruments with holes, each from its own first hole, and a gap older
+  than the grid holds counts as filled once the data starts at the grid's beginning. On a fresh
+  old-format cache: history ready in 27 s, no back-fill needed, and `verify_against_exchange` found
+  all 10,078 steps of six series equal to Binance's (the 25 Nov night repaired).
+- **Mutation check: 40 of 40 changes are caught.** They include the seven the review found
+  surviving, the review's list for the fifth round, the conditions of "eased", this round's seven
+  and the two back-fill flaws above.
 
 ---
 

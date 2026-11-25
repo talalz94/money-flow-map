@@ -401,3 +401,185 @@ def test_a_new_pick_is_shown_only_once_its_data_is_in(cfg, keys):
     eng._cache.clear()
     td = eng.snapshot(NOW + 1)["timeframes"]["today"]
     assert any(n.get("slot") for n in td["nodes"]) and td["stocks"]["loading"] == []
+
+
+
+# ── the 1H start after a gap, the seed's back-off, and poll() really seeding ──────────────────────
+def _scan_path(t):
+    return 100.0 * math.exp(0.004 * math.sin(t / 1700.0) + 0.002 * math.sin(t / 290.0))
+
+
+def _scanner(monkeypatch, fail_first=0):
+    import types
+    from moneyflow.connectors import binance as bn
+    calls = {"n": 0}
+
+    async def fake(session, base, path, params, gate, timeout=30):
+        assert path == "/fapi/v1/indexPriceKlines" and params["interval"] == "5m"
+        calls["n"] += 1
+        if calls["n"] <= fail_first:
+            raise OSError(11001, "getaddrinfo failed")
+        t0 = params["startTime"] / 1000.0
+        first = math.ceil(t0 / 300.0) * 300.0
+        return [[int((first + 300 * i) * 1000), "0", "0", "0", f"{_scan_path(first + 300 * (i + 1)):.6f}", "0"]
+                for i in range(params["limit"])]
+
+    from moneyflow.keys import KeyStore
+    monkeypatch.setattr(bn, "rest_get", fake)
+    ctx = types.SimpleNamespace(engine=None, clock=clock.Clock(fixed=NOW), keys=KeyStore(), session=None)
+    sc = stocks.StockScanner(ctx, {"universe": ["NVDA"], "scan_interval_s": 300})
+    sc.book.hourly["NVDAUSDT"], sc.book.ticker["NVDAUSDT"] = Hourly(), "NVDA"
+    sc.book.hourly["NVDAUSDT"].merge([(NOW - 40 * H + k * H, 100.0, 1.0) for k in range(30)])
+    return sc, calls
+
+
+def _polls(sc, start, n, skip=(), interval=300.0):
+    """Polls every 5 minutes (seed, then this scan's price); skip = indices of polls lost to a gap."""
+    out = []
+    for i in range(n):
+        t = start + i * interval
+        if i in skip:
+            continue
+        asyncio.run(sc._seed_ring(t))
+        p0 = stocks.ring_price(sc.book.ring.get("NVDAUSDT"), t - H, sc.book.scan_interval * 1.5)
+        out.append((i, p0))
+        sc.book.on_prices({"NVDAUSDT": _scan_path(t)}, t)
+    return out
+
+
+def test_the_hour_start_survives_a_short_gap_and_is_not_reseeded_every_scan(monkeypatch):
+    """A 20-minute sleep or outage: the seeded 5-minute closes and the scans since share the ring.
+    Bounded by count (16), it dropped the ones near now - 1 h, so the 1H start stayed on the line
+    between two hourly closes for the rest of the session and every scan re-seeded 78 stocks."""
+    sc, calls = _scanner(monkeypatch)
+    start = ny_ts(2026, 11, 25, 9, 2) + 10
+    res = _polls(sc, start, 40, skip=range(6, 10))             # no scan 09:32-09:47
+    assert all(p0 == p0 for _, p0 in res)                      # every 1H start from a real price
+    assert calls["n"] <= 2                                      # the start, and at most once after the gap
+    assert len(sc.book.ring["NVDAUSDT"]) <= 40                  # an hour and a bit, not everything
+
+
+def test_a_failing_seed_backs_off_and_the_scans_fill_the_hour(monkeypatch):
+    """The 5-minute seed failing (no network) is retried after 5, 10, 20... minutes, not at every scan;
+    within an hour the scans themselves cover it."""
+    sc, calls = _scanner(monkeypatch, fail_first=10 ** 6)
+    start = ny_ts(2026, 11, 25, 9, 2) + 10
+    res = _polls(sc, start, 16)
+    assert calls["n"] <= 4                                      # not 12
+    assert all(p0 == p0 for i, p0 in res if i >= 12)           # an hour of scans covers it
+
+
+def test_poll_seeds_the_ring_before_the_first_screen(monkeypatch):
+    """poll() itself seeds the 5-minute start prices (a screen right after a start has its 1H start)."""
+    import types
+    from moneyflow.connectors import binance as bn
+    screens = []
+
+    async def fake(session, base, path, params, gate, timeout=30):
+        if path == "/fapi/v1/exchangeInfo":
+            return {"symbols": [{"symbol": "NVDAUSDT", "status": "TRADING", "contractType": "TRADIFI_PERPETUAL",
+                                 "underlyingType": "EQUITY"}]}
+        if path in ("/fapi/v1/indexPriceKlines", "/fapi/v1/klines"):
+            step = 300 if params["interval"] == "5m" else H
+            t0 = params.get("startTime", (NOW - 30 * D) * 1000) / 1000.0
+            first = math.ceil(t0 / step) * step
+            return [[int((first + step * i) * 1000), "0", "0", "0", "100.0", "0", 0, "1000.0"]
+                    for i in range(min(params["limit"], int((NOW - first) // step)))]
+        if path == "/fapi/v1/premiumIndex":
+            return [{"symbol": "NVDAUSDT", "indexPrice": "100.5"}]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bn, "rest_get", fake)
+    eng = types.SimpleNamespace(seed_state={"state": "done"}, on_stock_screen=lambda book, now, missing=(): screens.append(now))
+    ctx = types.SimpleNamespace(engine=eng, clock=clock.Clock(fixed=NOW), keys=None, session=None)
+    sc = stocks.StockScanner(ctx, {"universe": ["NVDA"]})
+    asyncio.run(sc.poll())
+    ring = sc.book.ring["NVDAUSDT"]
+    assert screens == [NOW] and len(ring) > 10 and stocks.ring_price(ring, NOW - H, 450) == 100.0
+
+
+# ── the "eased" rule: each of its conditions ──────────────────────────────────────────────────────
+@pytest.mark.parametrize("tf", ["1h", "today"])
+def test_eased_needs_both_a_smaller_move_and_z_under_the_rule_and_lets_go_when_the_move_is_back(cfg, keys, monkeypatch, tf):
+    from moneyflow import stats
+    eng = engine_with_pick(cfg, keys)
+    inst, real = eng._stocks["NVDAUSDT"]["inst"], stats.window_return
+    pick = eng.stock_screen[tf]["picks"][0]
+    rs = math.log1p(pick["change_pct"] / 100)
+    sig = stats.sigma_for(tf, inst, NOW)[0]
+    move = {"r": rs}
+
+    def window_return(i, w, now):
+        if i is not inst:
+            return real(i, w, now)
+        return move["r"], math.expm1(move["r"]) * 100, i.price / math.exp(move["r"])
+    monkeypatch.setattr(stats, "window_return", window_return)
+
+    def eased(r, z_min, new_screen=True):
+        move["r"] = r
+        eng.stock_cfg = dict(eng.stock_cfg, z_min=z_min)
+        if new_screen:
+            eng.stock_meta["at"] += 300                          # judged afresh
+        eng._cache.clear()
+        eng._snap_cache = None
+        return next(n for n in eng.build_tf(tf, NOW)["nodes"] if n["id"] == "stock1")["slot"]["eased"]
+
+    z = lambda r: abs(r / sig)                                    # noqa: E731
+    assert eased(0.7 * rs, z(0.7 * rs) - 0.1) is False            # shrank, but |z| still clears the rule
+    assert eased(0.8 * rs, z(0.8 * rs) + 0.1) is False            # |z| under the rule, but 0.8 of the move
+    assert eased(0.7 * rs, z(0.7 * rs) + 0.1) is True             # both: eased
+    assert eased(-rs, z(rs) + 0.1) is True                        # turned around: eased, whatever its size
+    assert eased(0.7 * rs, z(0.7 * rs) + 0.1) is True             # (latched)
+    assert eased(0.9 * rs, z(0.9 * rs) - 0.1, new_screen=False) is True    # 0.9 back: still eased
+    assert eased(1.05 * rs, z(1.05 * rs) - 0.1, new_screen=False) is False  # fully back and over the rule
+
+
+# ── the 17:00 roll, a pick whose history fails, which stocks are ranked on the map ────────────────
+def test_the_roll_clears_todays_pick_and_screens_again(cfg, keys):
+    """At 17:00 New York TODAY restarts: the old session's pick is not shown as "eased" until the next
+    screen; it goes, the note says why, and the screen runs again at once."""
+    import types
+    eng = engine_with_pick(cfg, keys)
+    kicked = []
+    eng.connectors["stocks"] = types.SimpleNamespace(kick=lambda: kicked.append(1))
+    eng.tick(NOW)
+    after = ny_ts(2026, 11, 24, 17, 0) + 30
+    eng.tick(after)
+    assert eng.stock_screen["today"]["picks"] == [] and kicked == [1]
+    assert eng.stock_screen["1h"]["picks"] and eng.stock_screen["1w"]["picks"]      # the other windows stay
+    st = eng.build_tf("today", after)["stocks"]
+    assert "new session" in st["note"] and st["picks"] == []
+
+
+def test_a_pick_whose_history_fails_is_retried_not_left_loading(cfg, keys):
+    eng = filled_engine_at(cfg, keys, NOW)
+    eng.STOCK_RETRY_FIRST = 0.01
+    eng.connectors = {}
+    inst = eng.instrument("binance_fut", "NVDAUSDT", "24/7", True, "NVDA", "index")
+    ent = eng._stocks["NVDAUSDT"] = {"inst": inst, "ticker": "NVDA", "picked_at": NOW, "owned": True, "ready": False}
+    tries = []
+
+    async def history(i, since5, since1, now):
+        tries.append(1)
+        if len(tries) < 3:
+            raise OSError(11001, "getaddrinfo failed")
+    eng._binance_history = history
+    asyncio.run(asyncio.wait_for(eng._start_stock("NVDAUSDT"), timeout=5))
+    assert len(tries) == 3 and ent["ready"] and "retry_in_s" not in ent
+
+
+def test_only_the_shown_picks_with_complete_history_are_ranked_on_the_map(cfg, keys):
+    eng = engine_with_pick(cfg, keys)
+    assert set(eng._node_reads("today", NOW)) == {"NVDAUSDT"}
+    other = eng.instrument("binance_fut", "AAPLUSDT", "24/7", True, "AAPL", "index")
+    k_now = int(NOW // G5_STEP)                                       # a full history: readable on the map
+    closes = [(k * G5_STEP, 200 * math.exp(0.002 * math.sin(k / 7.0))) for k in range(k_now - 35 * 288, k_now)]
+    other.seed("g5", closes, NOW, [(t, 1e6, 5e5) for t, _ in closes])
+    other.price = closes[-1][1] * 1.01
+    eng._stocks["AAPLUSDT"] = {"inst": other, "ticker": "AAPL", "picked_at": NOW, "owned": True, "ready": True}
+    eng.stock_screen["today"]["picks"].append(dict(eng.stock_screen["today"]["picks"][0], symbol="AAPLUSDT"))
+    assert set(eng._node_reads("today", NOW)) == {"NVDAUSDT", "AAPLUSDT"}    # readable when shown...
+    eng.stock_screen["today"]["picks"].pop()
+    assert set(eng._node_reads("today", NOW)) == {"NVDAUSDT"}        # kept for 2 h, not shown: not re-read
+    eng._stocks["NVDAUSDT"]["inst"].holes["g5"] = NOW - 3600        # a sleep's gap, not back-filled yet
+    assert eng._node_reads("today", NOW) == {}
