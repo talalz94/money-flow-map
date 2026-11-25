@@ -136,19 +136,36 @@ The live price updates every tick. A step's `live` flag records whether that ins
 was open. History is seeded at start-up from REST and cached on disk.
 
 ### 3.2 The z-score (σ)
-`z = log return over the window / σ`, where σ is the asset's **own typical move for that same kind of window**:
+`z = log return over the window / σ`, where σ is the asset's **own typical move for that same kind
+of window, on the days its market trades**:
 
 | Window | σ estimated from |
 |---|---|
-| 1H | RMS of rolling 60-minute log returns over the last 10 days. Only windows where its market was open count. |
-| TODAY | **Same-clock σ**: RMS, over the previous 30 days, of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. Fallback (fewer than 8 such days, e.g. a recent listing): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
-| 1W | RMS of daily (roll-to-roll) log returns over calendar days, × √7. |
+| 1H | **Same clock hour**: RMS of the 60-minute moves ending within 30 minutes of this clock time on each of the previous 20 trading days (10 days for crypto). The pre-market hour is judged against past pre-market hours, the opening hour against past opening hours. Only hours when the market was open count. Fallback (fewer than 30 such moves, e.g. a recent listing): every 60-minute move of the last 10 days. |
+| TODAY | **Same-clock σ**: RMS, over the previous 20 trading days (30 days for crypto), of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. Fallback (fewer than 8 such days, e.g. a recent listing): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
+| 1W | RMS of the daily (roll-to-roll) moves on the trading days of the last 30 days, × √5 (five trading days a week; × √7 for crypto, which trades every day). |
 
+- **Trading days only.** Each series has a `calendar`:
+  - `all`: crypto and the stablecoin share, every day;
+  - `weekdays`: the dollar and FX, gold, silver, oil and copper (Monday to Friday sessions);
+  - `us_equity`: NYSE trading days, for the indices, bonds, the VIX proxy and the notable stock.
+
+  A trading day is the session that ends at 17:00 New York, so Sunday evening's open counts as
+  Monday. The Binance perpetuals trade around the clock, but on weekends and holidays the index
+  under them hardly moves. Counting those quiet hours as "typical" made σ too small, so every
+  weekday move looked bigger than it was. The S&P 500's TODAY σ was 0.45% with weekends counted;
+  on trading days only it is 0.53%, in line with the cash index's own weekday range (0.51-0.62%).
+- **One one-off day does not set the yardstick.** If a single day's moves are more than twice the
+  size of any other day's (an earnings gap, a crash day), that day counts as the next-largest one.
+  SHOP's −18.3% earnings gap had more than doubled its TODAY σ (3.47% instead of 1.44%), so a −2.5σ
+  morning read −1.1σ. Several big days are all kept: that is the asset's real volatility.
+- **The notable-stock screen uses the same functions**, on hourly bars (section 3.8), so the stock
+  it picks reads the same on the map.
 - **RMS, not standard deviation:** the mean of short-horizon returns is about 0, and estimating it adds noise.
 - **No information is not a zero move:** a market that was **shut for the whole window** gets a missing z. HYG at 3 a.m. has no "1H" move.
 
 ### 3.3 Volume confirmation (where volume exists)
-- **Relative volume:** volume in the window ÷ the median volume of the same window on the previous 20 days. For 1W it is the previous 4 weeks.
+- **Relative volume:** volume in the window ÷ the median volume of the same window on the previous 20 trading days. For 1W it is the previous 4 weeks.
 - **Net taker flow (USD):** taker-buy quote volume − taker-sell quote volume, from Binance 1-minute klines. It shows how much aggressive buying versus selling hit the book.
 - **IEX volume** (Alpaca) is a *sample*, about 2-3% of US volume, so only relative volume is used from it.
 
@@ -237,26 +254,46 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
   in `[stocks] universe`) that have a Binance 24/7 TradFi perpetual: **78 of them** on 25 Nov 2026.
   The API lists the other 60 (`stocks.not_listed`: MA, PG, PEP, CVX, ...). The perpetual is what
   makes the chosen stock readable around the clock, like the Nasdaq-100 and S&P 500 nodes, with no key.
-- **The screen** runs every 5 minutes and is cheap:
-  - one bulk request returns every last price (all 817 perpetuals in 50 KB, weight 2);
-  - each stock's hourly bars are fetched once (20 days, weight 2) and topped up hourly (weight 1).
+- **The screen** runs every 5 minutes and is cheap. Its prices are **Binance's index of each stock**,
+  the same price the stock's node reads, not the perpetual's last trade. A thin perpetual's last
+  trade can sit well off the index: MDB's sat 0.6% above it at the 17:00 roll on 25 Nov.
+  - one bulk request returns every index price (all 817 perpetuals, weight 10, about 25 KB compressed);
+  - each stock's hourly index closes and its perpetual's hourly volume are fetched once (31 days,
+    weight 5 each) and topped up hourly (weight 1 each).
   - For each window and stock:
 
     ```
     r     = ln(price now / price at the window start)
-    σ     = same clock: RMS of the same window's move on each of the previous 20 days
-            (1H: the same clock hour; TODAY: the same time since 17:00 New York; 1W: daily × √7)
+    σ     = the map's own estimator (section 3.2) on hourly bars, over the previous 20 NYSE trading
+            days: 1H the same clock hour; TODAY the same time since 17:00 New York; 1W the daily
+            moves of the last 30 days × √5. A single one-off day (an earnings gap) is capped.
+            Between whole hours, σ is interpolated (in variance) from the hours either side.
     z     = r / σ
-    rvol  = the window's quote volume / the median of the same on previous days
+    rvol  = the window's quote volume / the median of the same on previous trading days
     score = |z| · √clip(rvol, 0.5, 4)      (unusual volume strengthens a move, thin volume weakens it)
     ```
   - **Rule:** a stock qualifies with **|z| ≥ 2 and score ≥ 2.5**; the highest scores fill the slots.
     The API shows the five best candidates in every case, picked or not (`stocks.candidates`).
 - **The chosen stock becomes a full node.** Its 35-day history and its live 1-second index price
-  are loaded within seconds of the pick. Its z on the map comes from the same estimators as every
-  other node; the screen's numbers only choose it, and the hover shows both. A stock no longer
-  picked keeps its live feed for 2 hours (`keep_s`) in case it comes back, then it is dropped.
-- **Seen live on 25 Nov 2026 (pre-market):**
+  are loaded within seconds of the pick. Its z on the map uses the same estimator as the screen,
+  on 5-minute data, and its reason text (map, hover, panel, "what the flow says") quotes the node's
+  own numbers. The screen's numbers, which chose it, stay in the API (`slot.screen`). A stock no
+  longer picked keeps its live feed for 2 hours (`keep_s`) in case it comes back, then it is dropped.
+- **Map and screen agree** (25 Nov 2026, 14:12 UTC, 09:12 New York, a copy without keys):
+
+  | Window, stock | Move: map / screen | z: map / screen |
+  |---|---|---|
+  | 1H, GOOGL | −1.80% / −1.81% | −2.63σ / −2.39σ |
+  | TODAY, PANW | −5.27% / −5.26% | −2.43σ / −2.17σ |
+  | 1W, PDD | +10.66% / +10.68% | +2.43σ / +2.43σ |
+
+  Before the σ round (section 10), SHOP read −1.06σ on the map against −2.95σ on the screen.
+- **A 1H move can fade between two screens** (they run every 5 minutes). When the node's own |z|
+  drops below the rule, the slot says so instead of calling it the most unusual move, for example
+  "NKE −0.30% in the last hour (−0.9σ) on 2.7× its usual volume. At the screen 2 min ago it was the
+  most unusual move among 75 large caps (−0.77%, −2.4σ); the move has eased since." "What the flow
+  says" leaves it out, and the next screen picks again (API: `slot.eased`).
+- **Seen live on 25 Nov 2026 (pre-market, with the first σ estimator):**
   - TODAY: **DELL**, −9.2% since 17:00 New York on 4.1× its usual volume (screen −2.9σ, map −3.3σ),
     after a 12.4% fall in Tuesday's session (Alpaca), an arrow into bonds, the dollar and stablecoins;
   - 1H: **WMT** (−3.0σ for that pre-market hour, 6.7× volume);
@@ -381,7 +418,7 @@ Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON
   - Public market data needs no key.
   - REST weight limits: 6,000/min (spot) and 2,400/min (futures). The service watches the used-weight header and pauses at 50%.
   - Up to 1,024 streams per websocket; Binance closes each connection every 24 h, and the service reconnects.
-  - The notable-stock screen adds about 110 weight an hour (one bulk price call every 5 min at weight 2, plus one small hourly-bar request per stock an hour), and 160 once at start-up. A picked stock joins the open stream with `SUBSCRIBE`, without reconnecting (measured).
+  - The notable-stock screen adds about 280 weight an hour (one bulk index-price call every 5 min at weight 10, plus two small hourly-bar requests per stock an hour), and about 780 once at start-up (two 31-day requests per stock at weight 5), after the map's own history has loaded. A picked stock joins the open stream with `SUBSCRIBE`, without reconnecting (measured).
   - Market data only. API Terms of Use: <https://www.binance.com/en/terms>
 - **Alpaca Basic (free)**
   - Real-time IEX feed; **one** connection per stream type; 200 REST calls/min.
@@ -433,6 +470,8 @@ served:
 - Override it in `moneyflow.toml`, or in `moneyflow.local.toml` (git-ignored) for this PC.
 - `[[series]]` entries merge by `id`. To add an asset (for example the disabled `copper`, `iwm`
   or `openai` series), set `enabled = true`, or add a new entry with a `source` and `symbol`.
+- Each series' `calendar` (`all`, `weekdays` or `us_equity`) sets the days its σ is measured on
+  (section 3.2). The default follows its trading hours.
 - Connectors are switched in `[connectors.*]`.
 - Auto-stop is set in `[server] idle_shutdown_minutes` (default 5; 0 = keep running), or per start
   with `--stay-running` / `--idle-minutes N` (`start.ps1 -StayRunning`).
@@ -502,7 +541,8 @@ ws.onmessage = (m) => { const s = JSON.parse(m.data).data; console.log(s.risk.la
 {"schema": "moneyflow.snapshot/1", "generated_at": "2026-11-24T14:13:34.340Z", "timeframe": "today",
  "window": {"start": "...", "end": "...", "label": "since 17:00 New York Mon 23 Nov"},
  "nodes": [{"id": "ndx", "label": "Nasdaq 100", "price": 638.67, "change_pct": -2.10, "z": -2.01,
-            "sigma_pct": 1.06, "direction": "outflow", "status": "live", "age_s": 0.15, "latency_ms": 121,
+            "sigma_pct": 1.06, "sigma_method": "same-clock", "sigma_days": "NYSE trading days",
+            "direction": "outflow", "status": "live", "age_s": 0.15, "latency_ms": 121,
             "source": {"id": "binance_fut", "name": "Binance USD-M perpetual", "symbol": "QQQUSDT", "proxy": true},
             "volume": {"rvol": 1.92, "net_taker": -15307890, "taker_buy_ratio": 0.48},
             "reference": [{"symbol": "QQQ", "source": "alpaca", "price": 635.76, "status": "closed"}],
@@ -511,7 +551,7 @@ ws.onmessage = (m) => { const s = JSON.parse(m.data).data; console.log(s.risk.la
             "no_edge": {"code": "neutral", "text": "No arrow: it moved -0.4σ, inside ±0.5σ, too small to count as money moving in or out."}},
            {"id": "stock1", "label": "DELL (notable stock)", "short": "DELL", "z": -3.29, "change_pct": -9.22, "...": "...",
             "slot": {"index": 1, "symbol": "DELL", "perpetual": "DELLUSDT", "universe": 78,
-                     "why": "DELL -9.20% today (-2.9σ) on 4.1× its usual volume: the most unusual move among 77 large caps (screen score 5.8).",
+                     "why": "DELL -9.22% today (-3.3σ) on 4.1× its usual volume: the most unusual move among 77 large caps.",
                      "screen": {"z": -2.92, "rvol": 4.06, "score": 5.85}}}],
  "edges": [{"from": "spx", "to": "stables", "weight": 1.53, "share": 0.18, "corr": -0.65}],
  "stocks": {"slots": 1, "universe": 78, "screened": 77, "rule": {"z_min": 2.0, "score_min": 2.5},
@@ -596,7 +636,7 @@ machine (its *Processes* tab, 8 logical cores).
 | Headless, first config, first hour after the open (10 min; also streamed IEF/HYG bid/ask, since dropped) | 3.9% / 3.1% / 9.3% | 0.49% | 75-79 MB | 60-63 MB |
 | **With the notable-stock slot** (25 Nov, pre-market, 10 min; 2 picked stocks live, 1 dashboard open) | **2.65%** / — / 6.2% | **0.33%** | 81-87 MB | — |
 
-The large-cap screen costs no measurable CPU (one 50 KB request every 5 minutes, about 0.3 s each, and a small hourly top-up) and about 5 MB of memory.
+The large-cap screen costs no measurable CPU (one bulk request every 5 minutes, about 25 KB compressed, and a small hourly top-up) and about 5 MB of memory.
 
 - **25-minute soak** (after the verification fixes, with the dashboard tab connected): 50 samples, 30 s apart.
   - Memory flat: 75.6 MB at the start, 74.2 MB at the end, 78.6 MB at most.
@@ -698,7 +738,7 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - New York trading-day roll across DST, NYSE holidays and early closes, FX and VIX hours;
   - the ring buffers;
   - the stitched bonds series: the 1- and 5-minute series agreeing, gaps in the proxy, and bonds without an Alpaca key in US hours;
-  - σ estimators on exact synthetic series;
+  - σ estimators on exact synthetic series: trading days only (a quiet weekend does not shrink an index's σ), the same clock hour (a quiet pre-open hour is not judged by the opening hour), one one-off day capped while real volatility stays, and the stock screen and the node giving the same σ;
   - edge weights (including series built from each other), which edges are kept, the plain-language reason for every asset without an arrow, and the risk composite;
   - **every node, gold and the stock slot included, as the strongest outflow and the strongest inflow, in all three windows**, through the real engine (`tests/test_every_node.py`: 66 forced cases);
   - auto-stop: the idle timer (a tab connects, disconnects, a refresh within the delay, two viewers, API polling, a webhook delivery, the opt-out, never opened), and the real `serve()` stopping by itself and freeing its port, or staying up while an app streams (`tests/test_idle.py`);
@@ -862,6 +902,68 @@ watched through the process list and open ports only, because a request would it
 | A hidden tab left open (port 8765, default 5 min) | The test browser kept a hidden dashboard tab open, so the service rightly stayed up. That tab was closed at 12:43:16. At 12:48:20: "no dashboard tab or app connected for 5 minutes: stopping"; exited at 12:48:24, code 0. The browser's idle keep-alive connections did not count. |
 | Afterwards | No Python process left on the PC, no port listening. No scheduled task (of 196), Startup-folder item, Run/RunOnce registry entry or Windows service refers to the app. |
 
+**Fourth round (25 Nov 2026): σ calibration, "the map and the stock screen disagree".** The map
+showed SHOP at −1.1σ for TODAY while the stock screen ranked it at −2.9σ. There were two causes:
+- **Two estimators.** The screen used 20 days of same-clock moves. The node used 30 calendar days
+  (TODAY) and every 60-minute move of 10 days (1H). Both counted SHOP's −18.3% earnings day,
+  which more than doubled the node's σ.
+- **Weekends counted as trading.** The Binance perpetuals trade 24/7, so σ for the S&P 500, the
+  Nasdaq 100, gold and the stocks included weekend and holiday hours, when the market under them
+  hardly moves. That made σ too small.
+
+One estimator now serves both (section 3.2): trading days only, the same clock hour for 1H, a cap
+on a single one-off day. The slot's reason text quotes the node's numbers. The table shows the
+same frozen data (25 Nov 13:04 UTC, 08:04 New York, before the US open) through the old and the
+new code:
+
+| z, before → after | 1H | TODAY | 1W |
+|---|---|---|---|
+| S&P 500 | −0.10 → −0.16 | −4.04 → −3.40 (σ 0.45% → 0.53%) | −1.07 → −1.04 |
+| Nasdaq 100 | +0.17 → +0.26 | −3.17 → −2.66 (σ 0.90% → 1.07%) | −1.12 → −1.11 |
+| Gold | +1.62 → +2.04 | −1.01 → −0.85 | −1.38 → −1.43 |
+| SHOP on the map | −0.29 → −0.39 | **−1.06 → −2.53** (σ 3.47% → 1.44%) | −1.19 → −1.18 |
+| SHOP on the screen | −1.08 → −0.60 | −2.95 → −2.47 | −1.38 → −1.16 |
+| Bitcoin (every day counts) | +0.19 → +0.34 | −1.72 → −1.72 | −1.36 → −1.33 |
+
+- **Live**, on a copy without keys: the map and the screen agree in all three windows (section 3.8,
+  14:12 UTC). The reason text, the hover and the panel all quote the node's numbers, and the hover
+  names the days σ is measured on ("same-clock on NYSE trading days (20)"; API: `sigma_days`).
+- **Three more causes turned up while checking live**, and each is fixed:
+  - **Last trade against index.** The screen priced stocks by the perpetual's last trade; the
+    node uses Binance's index of the stock. MDB's perpetual traded about $1,000 in the hour to the
+    17:00 roll. Its last trade sat 0.6% above the index then and 0.4% below at 09:00 New York, so the
+    screen saw −5.3% where the map saw −4.4%. The screen now reads index prices too (one bulk
+    request at weight 10 instead of 2).
+  - **The screen's σ lagged by up to an hour.** Hourly bars give σ at whole hours only, so at 08:59
+    New York the screen still used 08:00's σ. That left out a market-wide jump on Monday 23 Nov
+    between 08:55 and 09:00: S&P futures +1.3% and gold +1.1% on Yahoo (ES=F, GC=F), Bitcoin +4%. The
+    node counted it from 09:00, and PANW read −2.5σ on the screen against −2.0σ on the map. Between
+    whole hours the screen now interpolates σ from the hours either side.
+  - **A 1H move can fade in the minutes between two screens.** NKE read −2.35σ at the 13:52:40
+    screen and −0.88σ on the map 2½ minutes later. The σ agreed (0.33% and 0.34%) but the move did
+    not (−0.77% against −0.30%), because of the minutes and, then, the last-trade price. The slot
+    now says when a move has eased since the screen picked it (section 3.8).
+- **σ can step at a clock time.** A same-clock yardstick counts every past day's moves up to this
+  clock time, so that Monday jump raised TODAY's σ for the S&P 500 from 0.64% at 08:43 New York to
+  0.76% at 09:00. It is real volatility, not a fault.
+- **The gold-arrow replay, again.** The engine ran over the same frozen history, once with the old
+  code and once with the new:
+
+  | Gold has an arrow | 1H (24 h) | TODAY (24 h) | TODAY (7 d) | 1W (7 d) |
+  |---|---|---|---|---|
+  | Before | 47% | 69% | 50% | 100% |
+  | After | 59% | 64% | 45% | 100% |
+
+  TODAY lost a few arrows, and that is intended. Without quiet weekends diluting it, gold's σ is
+  larger, so more of its small moves now read as neutral (inside ±0.5σ). Every arrow-less moment
+  still has a stated reason: in TODAY over 24 h, 32 were neutral and 3 had no counterpart. None
+  was crowded out. `tests/test_every_node.py` (66 forced cases) still passes.
+- **A first version was too aggressive.** It capped every outlier at 3× a median scale. That made
+  the map and the screen disagree on ZS's week: daily σ 3.5% on the map, 2.5% on the screen. A stock
+  with a run of big days is volatile, not unlucky. Now only a single one-off day is capped, and ZS
+  reads 4.5% on the map and 4.35% on the screen. For crypto the 1H lookback stays at 10 days, so its
+  yardstick follows the current regime.
+
 ---
 
 ## 11. Limits: what is real-time and what is not
@@ -886,12 +988,17 @@ More caveats:
   them. The correlation weighting keeps co-moving pairs out, but it cannot prove causation.
 - **Fed dates** come from the Fed's own page. An unscheduled meeting appears only once the Fed
   publishes it.
-- **The notable-stock screen is a screen.** Its σ comes from 20 days of hourly bars (same clock),
-  and its volume is the 24/7 perpetual's, not the stock exchange's. It only chooses the stock; the
-  node's own z uses the full estimators, so the two can differ (the hover shows both). Outside US
-  hours a stock's perpetual trades thinly, and its overnight moves are perpetual price discovery
-  (the map's caveat says so). Only large caps with a Binance perpetual (78 of the 138 configured)
-  can be picked.
+- **The notable-stock screen is a screen.** It uses the map's estimator on hourly index bars,
+  interpolated between whole hours, and its volume is the 24/7 perpetual's, not the stock
+  exchange's. So its σ can differ from the node's (5-minute data) by about 10%, most of all just
+  before the 09:30 open: PANW at 09:12 New York read 2.53% on the screen and 2.26% on the map. In
+  1H a move can also fade in the minutes between two screens, and the slot then says so. The reason
+  text always quotes the node's numbers. Outside US hours a stock's perpetual trades thinly, and its
+  overnight moves are perpetual price discovery (the map's caveat says so). Only large caps with a
+  Binance perpetual (78 of the 138 configured) can be picked.
+- **Trading-day σ assumes the default calendars.** An asset added with `enabled = true` gets one
+  from its `hours` (US hours → NYSE days, FX hours → weekdays, otherwise every day); set
+  `calendar` yourself if that is wrong for it.
 
 ---
 

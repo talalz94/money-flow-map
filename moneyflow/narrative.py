@@ -145,12 +145,11 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
             "down" if v < 0 else "up")
     for k, v in live.items():                      # the notable-stock slot, if a stock stands out
         sl = v.get("slot")
-        if not sl or sl.get("index") != 1 or not nodes[k].get("node", True):
-            continue
-        rv = (sl.get("screen") or {}).get("rvol")
+        if not sl or sl.get("index") != 1 or sl.get("eased") or not nodes[k].get("node", True):
+            continue                               # (eased: its move has faded since the screen picked it)
+        rv = (v.get("volume") or {}).get("rvol")      # the node's own volume ratio, as on the map
         vol = f" on {rv:.1f}× its usual volume" if rv is not None and rv >= 1.05 else ""
-        # the % and the volume, not a σ: the screen ranks on a 20-day hourly yardstick, the map's z on
-        # the 30-day one (an earnings day can sit in one and not the other); the hover shows both
+        # the map's own numbers (the screen used the same estimator on hourly bars to pick it)
         add("notable_stock", f"Notable stock: {sl['symbol']} {fmt_pct(v['change_pct'])} {phrase}{vol}, the most "
                              f"unusual move among {sl.get('universe') or 'the'} large caps.",
             "down" if v["change_pct"] < 0 else "up")

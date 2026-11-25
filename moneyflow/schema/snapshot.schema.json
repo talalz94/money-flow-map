@@ -48,6 +48,7 @@
         "z": {"$ref": "#/$defs/num", "description": "window log return / the asset's typical move (σ) for that window"},
         "sigma_pct": {"$ref": "#/$defs/num", "description": "one typical move for this window, in percent"},
         "sigma_method": {"type": "string"}, "sigma_samples": {"type": "integer"},
+        "sigma_days": {"type": ["string", "null"], "description": "the days σ is measured on: all days, weekdays or NYSE trading days (null for a fallback estimate)"},
         "direction": {"enum": ["inflow", "outflow", "neutral", null]},
         "status": {"enum": ["live", "delayed", "closed", "stale", "warming_up", "no_data"]},
         "age_s": {"$ref": "#/$defs/num", "description": "now minus the timestamp of the newest data"},
@@ -73,6 +74,7 @@
         "slot": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["index", "symbol", "why"], "properties": {
           "index": {"type": "integer"}, "symbol": {"type": "string"}, "perpetual": {"type": "string"},
           "why": {"type": "string"}, "universe": {"type": "integer"}, "ready": {"type": "boolean"},
+          "eased": {"type": "boolean", "description": "its move on the map no longer clears the rule (it faded since the last screen)"},
           "screen": {"type": "object", "description": "the screen's own estimates (z, change_pct, sigma_pct, rvol, score)"}}}],
           "description": "set on a notable-stock node (id stock1, stock2, ...): which stock fills the slot and why"},
         "extra": {"type": "object"}, "note": {"type": "string"}

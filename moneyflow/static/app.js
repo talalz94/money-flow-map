@@ -431,7 +431,7 @@
     if (n.history_from) h += `<div class="row"><span>History starts</span><span>${esc(new Date(n.history_from).toLocaleDateString(undefined, { day: "numeric", month: "short" }))} — too new for this window</span></div>`;
     h += sparkSvg(n.spark, nodeColor(n));
     h += `<div class="row"><span>Typical move (1σ) for this window</span><span>${n.sigma_pct == null ? "—" : n.sigma_pct.toFixed(2) + "%"}</span></div>`;
-    h += `<div class="row"><span>σ estimated from</span><span>${esc(n.sigma_method || "—")} (${n.sigma_samples ?? 0})</span></div>`;
+    h += `<div class="row"><span>σ estimated from</span><span>${esc(n.sigma_method || "—")}${n.sigma_days ? " on " + esc(n.sigma_days) : ""} (${n.sigma_samples ?? 0})</span></div>`;
     if (v) {
       h += `<div class="row"><span>Volume vs usual</span><span>${v.rvol == null ? "—" : v.rvol.toFixed(2) + "×"} <span class="muted">(${v.baseline_days} days)</span></span></div>`;
       if (v.net_taker != null) h += `<div class="row"><span>Net taker flow</span><span class="${cls(v.net_taker)}">${fmtUsd(v.net_taker)} <span class="muted">(${(v.taker_buy_ratio * 100).toFixed(1)}% buys)</span></span></div>`;

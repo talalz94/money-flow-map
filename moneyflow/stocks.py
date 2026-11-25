@@ -8,19 +8,23 @@ Universe: the configured large caps (S&P 100 / Nasdaq-100 names) that have a Bin
 perpetual. The chosen stock is then read around the clock like the Nasdaq-100 and S&P 500 nodes
 (the perpetual's index price, every second), and no key is needed.
 
-Screen, cheap and periodic (`scan_interval_s`, default 5 min):
-  * one bulk request for every last price (weight 2, all ~800 perpetuals in ~50 KB);
-  * each stock's hourly bars, fetched once (20 days, weight 2) and then topped up hourly (weight 1).
+Screen, cheap and periodic (`scan_interval_s`, default 5 min). Prices are Binance's INDEX of each
+stock, the price its node on the map reads, never a thin perpetual's last trade:
+  * one bulk request for every index price (weight 10, all ~800 perpetuals, ~25 KB compressed);
+  * each stock's hourly index closes and the perpetual's hourly quote volume, fetched once (31 days,
+    weight 5 each) and then topped up hourly (weight 1 each).
 For each window:
     r     = ln(price now / price at the window start)
-    σ     = same clock: RMS of the same window's move on each of the previous 20 days
-            (1H: the same clock hour; TODAY: the same time since 17:00 New York; 1W: daily × √7)
+    σ     = the map's own estimator (stats.py), here on hourly bars, on the previous 20 NYSE trading
+            days: 1H the same clock hour; TODAY the same time since 17:00 New York; 1W the daily
+            moves of the last 30 days × √5. A single one-off day (an earnings gap) is capped.
     z     = r / σ
-    rvol  = the window's quote volume on the perpetual / the median of the same on previous days
+    rvol  = the window's quote volume on the perpetual / the median of the same on previous trading days
     score = |z| · √clip(rvol, 0.5, 4)     (unusual volume strengthens a move, thin volume weakens it)
 A stock qualifies with |z| ≥ z_min and score ≥ score_min; the highest scores fill the slots. The
-chosen stock then becomes a full node (35-day 5-minute history and the live index price), so its z
-on the map comes from the same estimators as every other node. The screen's numbers only choose it.
+chosen stock then becomes a full node (35-day 5-minute history and the live index price) read with
+the same estimator, and its reason text quotes the node's own numbers, so the screen, the hover and
+the panel agree. The screen's numbers (which chose it) stay in the API under `slot.screen`.
 """
 from __future__ import annotations
 
@@ -31,14 +35,14 @@ import time
 from array import array
 from collections import deque
 
-from . import clock
+from . import clock, stats
 from .connectors.base import PollConnector
 
 H = 3600.0
 D = 86400.0
 NaN = float("nan")
-MAX_BARS = 24 * 21              # 21 days of hourly bars per stock
-DAYS = 20                       # same-clock samples for σ and the volume baseline
+MAX_BARS = 24 * 31              # 31 days of hourly bars per stock: 20 trading days of same-clock samples
+CALENDAR = "us_equity"          # σ and volume baselines on NYSE trading days only (stats.py)
 
 
 def _ok(x) -> bool:
@@ -51,7 +55,7 @@ def perp_symbol(ticker: str) -> str:
 
 
 class Hourly:
-    """Complete hourly bars of one perpetual: closes and quote volumes, oldest first."""
+    """Complete hourly bars of one stock: index closes and the perpetual's quote volumes, oldest first."""
     __slots__ = ("h0", "close", "qvol")
 
     def __init__(self):
@@ -113,11 +117,6 @@ class Hourly:
         return s
 
 
-def _rms(xs) -> float:
-    xs = [x for x in xs if _ok(x)]
-    return math.sqrt(sum(x * x for x in xs) / len(xs)) if len(xs) >= 5 else NaN
-
-
 def _ratio(v: float, base: list[float]) -> float | None:
     base = [b for b in base if _ok(b) and b > 0]
     if not _ok(v) or len(base) < 5:
@@ -138,34 +137,58 @@ def ring_price(ring, t: float, tol: float) -> float:
     return best[1] if best else NaN
 
 
-def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: float = 450.0) -> dict | None:
-    """One stock in one window: {z, change_pct, sigma_pct, rvol, score} (None without enough data)."""
+def _sigma_now(sig_at, e: float, now: float) -> float:
+    """σ at `now` from hourly bars: σ at the hour boundaries either side of now (past days' bars exist
+    for both), interpolated in variance. Without this the screen's yardstick lagged the node's by up
+    to an hour: at 08:59 New York it still excluded a past day's jump at 08:55 that the node, on
+    5-minute data, counted a minute later (PANW: −2.5σ on the screen, −2.0σ on the map)."""
+    a, f = sig_at(e), (now - e) / H
+    if f <= 0 or not _ok(a) or clock.day_roll(e + H) != clock.day_roll(now):   # never across the 17:00 roll
+        return a
+    b = sig_at(e + H)
+    return math.sqrt((1 - f) * a * a + f * b * b) if _ok(b) else a
+
+
+def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: float = 450.0,
+               calendar: str = CALENDAR) -> dict | None:
+    """One stock in one window: {z, change_pct, sigma_pct, rvol, score} (None without enough data).
+    σ comes from the SAME estimator as the map's nodes (stats.py: same clock, trading days only,
+    robust RMS), here on hourly bars, so the stock picked and its node on the map tell the same story."""
     if not _ok(price) or price <= 0 or h.h0 is None:
         return None
     e = math.floor(now / H) * H                     # the last hour boundary: history is hour-aligned
+    days = stats.SAME_CLOCK_DAYS.get(calendar, 20)
     if tf == "1h":
         p0 = ring_price(ring, now - H, tol)
         if not _ok(p0):                             # first hour after a start: interpolate the hourly closes
             a, b = h.price_at(now - H), h.price_at(now - H + H)
             frac = ((now - H) % H) / H
             p0 = a + (b - a) * frac if _ok(a) and _ok(b) else a
-        sig = _rms([_lr(h.price_at(e - d * D), h.price_at(e - d * D - H)) for d in range(1, DAYS + 1)])
-        rvol = _ratio(h.volume(e - H, e), [h.volume(e - H - d * D, e - d * D) for d in range(1, DAYS + 1)])
+
+        def sig_at(t: float) -> float:
+            rs = stats.same_clock_hour_returns(h.price_at, t, calendar, stats.SAME_CLOCK_DAYS_1H.get(calendar, 20),
+                                               offsets=(0,))
+            return stats.robust_rms(rs) if sum(len(d) for d in rs) >= 10 else NaN  # rs: grouped by day
+        sig = _sigma_now(sig_at, e, now)
+        rvol = _ratio(h.volume(e - H, e), [h.volume(t - H, t) for t in stats.comparable_ends(e, calendar, days)])
     elif tf == "today":
         roll = clock.day_roll(now)
         p0 = h.price_at(roll)
-        el = max(math.floor((now - roll) / H) * H, H)       # 1-hour floor, as for every node
-        rolls = [clock.roll_n_days_before(roll, d) for d in range(1, DAYS + 1)]
-        sig = _rms([_lr(h.price_at(r + el), h.price_at(r)) for r in rolls])
+
+        def sig_at(t: float) -> float:
+            rs = stats.same_clock_today_returns(h.price_at, t, calendar, days)
+            return stats.robust_rms(rs) if len(rs) >= 8 else NaN
+        sig = _sigma_now(sig_at, e, now)
         done = e - roll
+        rolls = [r for r in (clock.roll_n_days_before(roll, n) for n in range(1, stats.MAX_BACK_DAYS + 1))
+                 if clock.trading_day(calendar, r + 1)][:days]
         rvol = _ratio(h.volume(roll, e), [h.volume(r, r + done) for r in rolls]) if done >= H else None
     elif tf == "1w":
         p0 = h.price_at(now - 7 * D)
-        # previous days only: today's own move is what is being measured
-        daily = _rms([_lr(h.price_at(e - d * D), h.price_at(e - (d + 1) * D)) for d in range(1, DAYS)])
-        sig = daily * math.sqrt(7.0) if _ok(daily) else NaN
-        week, prior = h.volume(e - 7 * D, e), h.volume(e - DAYS * D, e - 7 * D)
-        rvol = week / (prior * 7.0 / (DAYS - 7)) if _ok(week) and _ok(prior) and prior > 0 else None
+        rs = stats.roll_daily_returns(h.price_at, e, calendar, max_days=stats.DAILY_DAYS)
+        sig = stats.robust_rms(rs) * math.sqrt(stats.days_per_week(calendar)) if len(rs) >= 10 else NaN
+        week, prior = h.volume(e - 7 * D, e), h.volume(e - 28 * D, e - 7 * D)
+        rvol = week / (prior / 3.0) if _ok(week) and _ok(prior) and prior > 0 else None
     else:
         raise ValueError(tf)
     r = _lr(price, p0)
@@ -200,14 +223,31 @@ def screen(book: "StockBook", tf: str, now: float, z_min: float, score_min: floa
 TF_PHRASE = {"1h": "in the last hour", "today": "today", "1w": "this week"}
 
 
+def _vol_phrase(rvol) -> str:
+    return ("" if rvol is None else
+            f" on {rvol:.1f}× its usual volume" if rvol >= 1.05 else
+            f" on only {rvol:.1f}× its usual volume")
+
+
+def eased_text(node: dict, pick: dict, tf: str, n: int, ago_s: float | None) -> str:
+    """The picked stock's move on the map no longer clears the rule: a 1H move can fade in the minutes
+    between two screens. Say so, with the screen's numbers that picked it, rather than calling it the
+    most unusual move."""
+    when = "At the last screen" if ago_s is None else f"At the screen {max(1, round(ago_s / 60))} min ago"
+    rank = (f"the most unusual move among {n} large caps" if node.get("rank", 1) == 1
+            else f"number {node['rank']} of {n} large caps")
+    return (f"{node['ticker']} {node['change_pct']:+.2f}% {TF_PHRASE[tf]} ({node['z']:+.1f}σ)"
+            f"{_vol_phrase(node['rvol'])}. {when} it was {rank} ({pick['change_pct']:+.2f}%, "
+            f"{pick['z']:+.1f}σ); the move has eased since.")
+
+
 def why_text(s: dict, tf: str, n: int) -> str:
-    vol = ("" if s["rvol"] is None else
-           f" on {s['rvol']:.1f}× its usual volume" if s["rvol"] >= 1.05 else
-           f" on only {s['rvol']:.1f}× its usual volume")
+    vol = _vol_phrase(s["rvol"])
+    score = f" (screen score {s['score']:.1f})" if s.get("score") is not None else ""
     return (f"{s['ticker']} {s['change_pct']:+.2f}% {TF_PHRASE[tf]} ({s['z']:+.1f}σ){vol}: the most unusual "
-            f"move among {n} large caps (screen score {s['score']:.1f}).") if s.get("rank", 1) == 1 else (
+            f"move among {n} large caps{score}.") if s.get("rank", 1) == 1 else (
             f"{s['ticker']} {s['change_pct']:+.2f}% {TF_PHRASE[tf]} ({s['z']:+.1f}σ){vol}: number {s['rank']} "
-            f"of {n} large caps (screen score {s['score']:.1f}).")
+            f"of {n} large caps{score}.")
 
 
 class StockBook:
@@ -266,7 +306,8 @@ class StockScanner(PollConnector):
         self.universe_at = time.time()
 
     async def _hourly(self, now: float) -> None:
-        """Top up every stock's hourly bars (one small request each per hour; 20 days the first time)."""
+        """Top up every stock's hourly bars: Binance's index closes (the price the map's node reads) and
+        the perpetual's quote volume, one small request of each per hour (31 days the first time)."""
         from .connectors import binance as bn
         e = math.floor(now / H) * H
         sem = asyncio.Semaphore(4)
@@ -275,24 +316,40 @@ class StockScanner(PollConnector):
             if h.end is not None and h.end >= e:
                 return
             async with sem:
-                p = {"symbol": sym, "interval": "1h", "limit": 499}
+                p = {"interval": "1h", "limit": MAX_BARS}
                 if h.end is not None:
-                    p.update(startTime=int(h.end * 1000), limit=min(499, int((e - h.end) / H) + 2))
-                rows = await bn.rest_get(self.session, bn.FUT_REST, "/fapi/v1/klines", p, bn.FUT_GATE)
-                h.merge([(r[0] / 1000.0, float(r[4]), float(r[7])) for r in rows if r[0] / 1000.0 + H <= now])
+                    p.update(startTime=int(h.end * 1000), limit=min(MAX_BARS, int((e - h.end) / H) + 2))
+                idx = await bn.rest_get(self.session, bn.FUT_REST, "/fapi/v1/indexPriceKlines", dict(p, pair=sym),
+                                        bn.FUT_GATE)
+                vol = await bn.rest_get(self.session, bn.FUT_REST, "/fapi/v1/klines", dict(p, symbol=sym), bn.FUT_GATE)
+                q = {r[0]: float(r[7]) for r in vol}
+                h.merge([(r[0] / 1000.0, float(r[4]), q.get(r[0], NaN)) for r in idx if r[0] / 1000.0 + H <= now])
 
         await asyncio.gather(*(one(s, h) for s, h in list(self.book.hourly.items())))
 
-    async def poll(self) -> None:
+    async def _prices(self, now: float) -> None:
+        """Every stock's index price in one request (weight 10, ~25 KB compressed): the price of the
+        underlying stock, as the node shows it, not the perpetual's last trade. A thin perpetual's last
+        trade can sit well off it (MDB, 25 Nov: 0.6% above its index at the 17:00 roll, 0.4% below at
+        09:00), which made the screen's move a whole point bigger than the map's."""
         from .connectors import binance as bn
+        rows = await bn.rest_get(self.session, bn.FUT_REST, "/fapi/v1/premiumIndex", {}, bn.FUT_GATE)
+        prices = {}
+        for r in rows:
+            try:
+                if r.get("symbol") in self.book.hourly and float(r.get("indexPrice") or 0) > 0:
+                    prices[r["symbol"]] = float(r["indexPrice"])
+            except (TypeError, ValueError):
+                continue
+        self.book.on_prices(prices, now)
+
+    async def poll(self) -> None:
         if self.engine.seed_state.get("state") != "done":
             return                              # the map's own history first (and Binance's budget)
         now = self.now()
         await self._universe()
         await self._hourly(now)
-        rows = await bn.rest_get(self.session, bn.FUT_REST, "/fapi/v1/ticker/price", {}, bn.FUT_GATE)
-        self.book.on_prices({r["symbol"]: float(r["price"]) for r in rows if r.get("symbol") in self.book.hourly},
-                            now)
+        await self._prices(now)
         self.health.mark_msg(now)
         self.engine.on_stock_screen(self.book, now, missing=self.missing)
 

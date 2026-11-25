@@ -150,6 +150,8 @@ class Engine:
                 self.derived.append(inst)
             else:  # validated in config
                 continue
+            if s.get("calendar"):          # the days its σ is measured on (clock.CALENDARS)
+                inst.calendar = s["calendar"]
             refs = []
             for r in s.get("reference", []) or []:
                 ri = self.instrument(r["source"], r["symbol"], r.get("hours"), self._has_volume(r["source"]),
@@ -255,6 +257,8 @@ class Engine:
             key = f"binance_fut:{sym}"
             owned = key not in self.instruments            # a configured node may already read it
             inst = self.instrument("binance_fut", sym, "24/7", True, ticker, "index")
+            if owned:
+                inst.calendar = "us_equity"     # a US stock: σ from NYSE trading days, like the screen
             ent = self._stocks[sym] = {"inst": inst, "ticker": ticker, "picked_at": now, "owned": owned,
                                        "ready": not owned}
             if owned:
@@ -335,18 +339,33 @@ class Engine:
 
     def _slot_reads(self, tf: str, w, now: float) -> list[tuple[dict, Instrument]]:
         """The window's picked stock(s) as map nodes (read like every other node)."""
+        from . import stocks
         out = []
+        screened = (self.stock_screen.get(tf) or {}).get("screened", 0)
+        z_min, at = float(self.stock_cfg.get("z_min", 2.0)), self.stock_meta.get("at")
         for i, (sdef, p, ent) in enumerate(self.slot_series(tf)):
             r = self.read(sdef, w, now)
-            r["slot"] = {"index": i + 1, "symbol": p["ticker"], "perpetual": p["symbol"], "why": p["why"],
+            why, eased = p["why"], False
+            if r["z"] is not None and r["change_pct"] is not None:
+                # the node's own numbers, so the map, the hover and the panel say the same thing (the
+                # screen's numbers, from the same estimator on hourly bars, stay under slot.screen).
+                # The screen runs every few minutes and a 1H move can fade in between: then say so.
+                node = {"ticker": p["ticker"], "z": r["z"], "change_pct": r["change_pct"],
+                        "rvol": (r.get("volume") or {}).get("rvol"), "rank": p.get("rank", i + 1)}
+                eased = abs(r["z"]) < z_min
+                why = (stocks.eased_text(node, p, tf, screened, None if at is None else now - at) if eased
+                       else stocks.why_text(node, tf, screened))
+            r["note"] = why
+            r["slot"] = {"index": i + 1, "symbol": p["ticker"], "perpetual": p["symbol"], "why": why, "eased": eased,
                          "universe": self.stock_meta.get("universe", 0), "ready": ent["ready"],
                          "screen": {k: None if p.get(k) is None else round(p[k], 3)
                                     for k in ("z", "change_pct", "sigma_pct", "rvol", "score")}}
             out.append((r, ent["inst"]))
         return out
 
-    def _stocks_info(self, tf: str) -> dict:
+    def _stocks_info(self, tf: str, node_why: dict | None = None) -> dict:
         sc, res, meta = self.stock_cfg, self.stock_screen.get(tf) or {}, self.stock_meta
+        node_why = node_why or {}
         slots = self.stock_slots()
         rule = {"z_min": float(sc.get("z_min", 2.0)), "score_min": float(sc.get("score_min", 2.5))}
         rnd = lambda p: {"symbol": p["ticker"], **{k: None if p.get(k) is None else round(p[k], 3)  # noqa: E731
@@ -359,12 +378,13 @@ class Engine:
             note = (f"No large-cap stock stands out: none of {res.get('screened', 0)} moved |z| ≥ {rule['z_min']:g} "
                     f"with a score ≥ {rule['score_min']:g}.")
         else:
-            note = res["picks"][0]["why"]
+            note = node_why.get(res["picks"][0]["ticker"], res["picks"][0]["why"])
         loading = [p["ticker"] for p in res.get("picks", [])
                    if not (self._stocks.get(p["symbol"]) or {}).get("ready")]
         return {"slots": slots, "universe": meta.get("universe", 0), "screened": res.get("screened", 0),
                 "scanned_at": clock.iso(meta["at"]) if meta.get("at") else None, "rule": rule,
-                "picks": [dict(rnd(p), slot=i + 1, why=p["why"]) for i, p in enumerate(res.get("picks", []))],
+                "picks": [dict(rnd(p), slot=i + 1, why=node_why.get(p["ticker"], p["why"]))
+                          for i, p in enumerate(res.get("picks", []))],
                 "candidates": [rnd(p) for p in res.get("top", [])], "not_listed": meta.get("missing", []),
                 "positions": (sc.get("positions") or [[0.92, 0.29]])[:max(1, slots)], "note": note,
                 "loading": loading}
@@ -719,6 +739,9 @@ class Engine:
             "z": round(z, 3) if z is not None else None,
             "sigma_pct": round((math.exp(sig) - 1) * 100, 4) if isnum(sig) else None,
             "sigma_method": method, "sigma_samples": n,
+            # the days σ was measured on (a fallback for a recent listing uses whatever history exists)
+            "sigma_days": clock.CALENDAR_LABELS.get(getattr(inst, "calendar", "all"))
+            if str(method).startswith(("same-clock", "daily RMS")) else None,
             "direction": None if z is None else ("inflow" if z >= self.flow_cfg.get("theta", 0.5)
                                                 else "outflow" if z <= -self.flow_cfg.get("theta", 0.5) else "neutral"),
             "status": status, "age_s": None if age is None else round(age, 2),
@@ -864,7 +887,8 @@ class Engine:
         return {"timeframe": tf, "label": stats.TF_LABELS[tf],
                 "window": {"start": clock.iso(w.start), "end": clock.iso(w.end), "label": w.label},
                 "nodes": nodes, "aux": aux, "edges": edges_d, "risk": risk, "narrative": bullets,
-                "tiles": self._tiles(tf, w, reads, now), "stocks": self._stocks_info(tf)}
+                "tiles": self._tiles(tf, w, reads, now),
+                "stocks": self._stocks_info(tf, {r["slot"]["symbol"]: r["slot"]["why"] for r, _ in slots})}
 
     @staticmethod
     def _no_edge_info(n: dict, r: dict | None, names: dict, has_edge: bool) -> dict | None:

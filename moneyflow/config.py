@@ -108,6 +108,9 @@ def validate(cfg: dict) -> None:
         h = s.get("hours")
         if h is not None and h not in HOURS:
             raise ConfigError(f"series {sid}: unknown hours {h!r}")
+        c = s.get("calendar")
+        if c is not None and c not in ("all", "weekdays", "us_equity"):
+            raise ConfigError(f"series {sid}: unknown calendar {c!r} (use all, weekdays or us_equity)")
         for coord in ("x", "y"):
             v = s.get(coord)
             if v is not None and not (0 <= float(v) <= 1):

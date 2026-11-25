@@ -242,6 +242,42 @@ def is_us_trading_day(d: dt.date) -> bool:
     return d.weekday() < 5 and d not in nyse_holidays(d.year)
 
 
+# ── trading calendars for volatility samples ────────────────────────────────────────────────────
+# Liveness is one thing (a Binance perpetual on the S&P 500 trades all weekend), comparable history
+# another: the S&P's typical move must be measured on days the S&P trades, or the quiet weekend
+# samples drag σ down and every weekday move looks bigger than it is.
+#   all        every day (crypto)
+#   weekdays   Monday to Friday sessions (FX, CME futures: gold, silver, oil, copper)
+#   us_equity  NYSE trading days (US stocks and ETFs, and perpetuals on them)
+CALENDARS = ("all", "weekdays", "us_equity")
+CALENDAR_LABELS = {"all": "all days", "weekdays": "weekdays", "us_equity": "NYSE trading days"}
+
+
+def session_date(ts: float) -> dt.date:
+    """The trading day a moment belongs to: days roll at 17:00 New York, so Sunday 20:00 is Monday."""
+    return (dt.datetime.fromtimestamp(ts, NY) + dt.timedelta(hours=24 - ROLL_HOUR_NY)).date()
+
+
+def trading_day(calendar: str, ts: float) -> bool:
+    if calendar == "all":
+        return True
+    d = session_date(ts)
+    if calendar == "weekdays":
+        return d.weekday() < 5
+    if calendar == "us_equity":
+        return is_us_trading_day(d)
+    raise ValueError(f"unknown calendar {calendar!r}")
+
+
+def default_calendar(hours: str) -> str:
+    return {"fx": "weekdays", "vix": "weekdays", "us_regular": "us_equity", "us_extended": "us_equity"}.get(hours, "all")
+
+
+def same_clock_before(ts: float, n: int) -> float:
+    """The same New York wall-clock time `n` calendar days earlier (DST-safe)."""
+    return (dt.datetime.fromtimestamp(ts, NY) - dt.timedelta(days=n)).timestamp()
+
+
 def us_equity_session(ts: float) -> str:
     """'regular' | 'pre' | 'post' | 'closed' for US-listed stocks/ETFs at epoch `ts`."""
     d = dt.datetime.fromtimestamp(ts, NY)

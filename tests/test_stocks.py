@@ -23,21 +23,23 @@ SCHEMA = json.loads((Path(__file__).resolve().parents[1] / "moneyflow" / "schema
 
 
 def logp(t: float, today_moves: float) -> float:
-    """Log price: on each past day +-M from 17:00 to 10:00 New York, back to 0 by the next 17:00;
-    today `today_moves` x M since the roll (linear up to NOW)."""
+    """Log price, exact by construction. Each day (17:00 to 17:00 New York) sits at a level of ±M/2,
+    alternating, so every roll-to-roll move is ±M; within a past day it moves a further ±M from 17:00
+    to 10:00 and back by the next 17:00, so every same-clock move to 10:00 is ±M; today it moves
+    `today_moves` x M from the roll (linear up to NOW)."""
     r = clock.day_roll(t)
     if r >= ROLL:
-        return today_moves * M * min(1.0, (t - ROLL) / (NOW - ROLL))
+        return -M / 2 + today_moves * M * min(1.0, (t - ROLL) / (NOW - ROLL))
     d = round((ROLL - r) / D)
     sign = 1 if d % 2 else -1
-    return sign * M * ((t - r) / EL if t - r <= EL else 1 - (t - r - EL) / (D - EL))
+    return sign * M / 2 + sign * M * ((t - r) / EL if t - r <= EL else 1 - (t - r - EL) / (D - EL))
 
 
 def bars(today_moves: float, vol_today: float = 1000.0) -> tuple[Hourly, float]:
     h = Hourly()
     e = math.floor(NOW / H) * H
     rows = [(t, 100 * math.exp(logp(t + H, today_moves)), vol_today if t >= ROLL else 1000.0)
-            for t in (e - 21 * D + k * H for k in range(int(21 * D / H)))]
+            for t in (e - 31 * D + k * H for k in range(int(31 * D / H)))]
     h.merge(rows)
     return h, 100 * math.exp(logp(NOW, today_moves))
 
@@ -62,17 +64,45 @@ def test_hourly_bars_price_and_volume():
 def test_today_screen_is_exact_on_known_data():
     h, px = bars(-3.0, vol_today=3000.0)
     s = screen_one(h, px, NOW, "today")
-    assert s["z"] == pytest.approx(-3.0, rel=1e-6)                     # -3% against a typical ±1%
+    # at 10:30 the same-clock move on past days is M at 10:00 and 6/7 M at 11:00 (the hourly bars'
+    # two sides), interpolated in variance half-way; the node, on 5-minute data, has 13/14 M (0.3% apart)
+    sig = M * math.sqrt(0.5 + 0.5 * (6 / 7) ** 2)
+    assert s["z"] == pytest.approx(-0.03 / sig, rel=1e-6)              # -3% against a typical ±0.93%
     assert s["change_pct"] == pytest.approx((math.exp(-0.03) - 1) * 100)
     assert s["rvol"] == pytest.approx(3.0)                              # 3x the same hours' usual volume
-    assert s["score"] == pytest.approx(3.0 * math.sqrt(3.0))
+    assert s["score"] == pytest.approx(0.03 / sig * math.sqrt(3.0))
 
 
-def test_week_screen_scales_the_daily_move():
+def test_week_screen_scales_the_trading_day_move():
+    """1W: roll-to-roll moves on NYSE trading days (±M each), × √5 sessions a week."""
     h, px = bars(-3.0)
     s = screen_one(h, px, NOW, "1w")
-    # same-clock daily moves alternate +-1% -> +-2% day to day: σ_1w = 2% x sqrt(7); a week ago was +1%
-    assert s["z"] == pytest.approx(math.log(px / (100 * math.exp(M))) / (2 * M * math.sqrt(7)), rel=1e-6)
+    week_ago = 100 * math.exp(logp(math.floor((NOW - 7 * D) / H) * H, -3.0))   # close of the bar then
+    assert s["z"] == pytest.approx(math.log(px / week_ago) / (M * math.sqrt(5)), rel=1e-6)
+
+
+def test_screen_and_node_share_one_estimator():
+    """The same prices give the same σ whether read from hourly bars (the screen) or from the map's
+    5-minute grid (the node): one estimator, trading days only, robust to an outlier."""
+    from moneyflow import stats
+    from moneyflow.series import Instrument
+    h, px = bars(-3.0)
+    at = math.floor(NOW / H) * H                    # on an hour: the bars' resolution, so both see the same samples
+    inst = Instrument("binance_fut:XUSDT", "binance_fut", "XUSDT", "24/7")
+    inst.calendar = "us_equity"
+    k_now = int(at // G5_STEP)
+    inst.seed("g5", [(k * G5_STEP, 100 * math.exp(logp((k + 1) * G5_STEP, -3.0))) for k in range(k_now - 34 * 288, k_now)], at)
+    inst.price = px
+    for tf in ("today", "1w"):
+        node_sigma = stats.sigma_for(tf, inst, at)[0]
+        screen_sigma = math.log(1 + screen_one(h, px, at, tf)["sigma_pct"] / 100)
+        assert node_sigma == pytest.approx(screen_sigma, rel=1e-6), tf
+    # between two whole hours the screen interpolates its hourly σ, so it keeps time with the node
+    # (here the same-clock move shrinks after 10:00: M at 10:00, 0.93 M at 10:30, 0.86 M at 11:00)
+    node_sigma = stats.sigma_for("today", inst, NOW)[0]
+    screen_sigma = math.log(1 + screen_one(h, px, NOW, "today")["sigma_pct"] / 100)
+    at_10 = math.log(1 + screen_one(h, px, at, "today")["sigma_pct"] / 100)
+    assert node_sigma == pytest.approx(screen_sigma, rel=0.01) and node_sigma < 0.95 * at_10
 
 
 def test_hour_screen_uses_the_scan_ring_when_it_covers_the_hour():
@@ -100,7 +130,7 @@ def test_only_unusual_moves_on_real_volume_fill_the_slot():
     r = screen(book, "today", NOW, z_min=2.0, score_min=2.5, slots=1)
     assert [p["ticker"] for p in r["picks"]] == ["NVDA"] and r["screened"] == 3
     assert [t["ticker"] for t in r["top"]] == ["NVDA", "TSLA", "AAPL"]          # transparency: the runners-up
-    assert r["picks"][0]["why"].startswith("NVDA -2.96% today (-3.0σ) on 3.0× its usual volume: the most unusual")
+    assert r["picks"][0]["why"].startswith("NVDA -2.96% today (-3.2σ) on 3.0× its usual volume: the most unusual")
     assert screen(book, "today", NOW, z_min=3.5, score_min=2.5, slots=1)["picks"] == []   # may be none
     two = screen(book, "today", NOW, z_min=1.0, score_min=1.0, slots=2)["picks"]
     assert [p["ticker"] for p in two] == ["NVDA", "TSLA"] and "number 2 of 3" in two[1]["why"]
@@ -130,6 +160,44 @@ def test_universe_keeps_only_listed_equity_perpetuals(monkeypatch):
     asyncio.run(sc._universe())
     assert sorted(sc.book.hourly) == ["BRKBUSDT", "NVDAUSDT"] and sc.book.ticker["BRKBUSDT"] == "BRK.B"
     assert sc.missing == ["PG", "MA"]
+
+
+def test_the_screen_prices_stocks_by_their_index_like_the_map(monkeypatch):
+    """The screen reads Binance's index price (what the stock's node shows), never the perpetual's last
+    trade: a thin perpetual's last trade sat 0.6% off its index at the 17:00 roll (MDB, 25 Nov) and made
+    the screen's move a point bigger than the map's. Volume stays the perpetual's own."""
+    import types
+    from moneyflow.connectors import binance as bn
+    e = math.floor(NOW / H) * H
+    calls = []
+
+    async def fake(session, base, path, params, gate, timeout=30):
+        calls.append(path)
+        opens = [int((e - k * H) * 1000) for k in (3, 2, 1)]               # three complete bars, ending at e
+        if path == "/fapi/v1/indexPriceKlines":
+            assert params["pair"] in ("NVDAUSDT", "AAPLUSDT") and "symbol" not in params
+            return [[t, "0", "0", "0", str(100.0 + i), "0"] for i, t in enumerate(opens)]
+        if path == "/fapi/v1/klines":
+            assert params["symbol"] in ("NVDAUSDT", "AAPLUSDT")
+            return [[t, "0", "0", "0", "999.0", "0", 0, str(5000.0 + i)] for i, t in enumerate(opens)]
+        if path == "/fapi/v1/premiumIndex":
+            return [{"symbol": "NVDAUSDT", "markPrice": "151.0", "indexPrice": "150.0"},
+                    {"symbol": "AAPLUSDT", "markPrice": "1.0", "indexPrice": ""},       # no index: skipped
+                    {"symbol": "XAUUSDT", "markPrice": "4000", "indexPrice": "4001"}]   # not a stock
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bn, "rest_get", fake)
+    ctx = types.SimpleNamespace(engine=None, clock=clock.Clock(fixed=NOW), keys=None, session=None)
+    sc = stocks.StockScanner(ctx, {"universe": ["NVDA", "AAPL"]})
+    for sym in ("NVDAUSDT", "AAPLUSDT"):
+        sc.book.hourly[sym], sc.book.ticker[sym] = Hourly(), sym.removesuffix("USDT")
+    asyncio.run(sc._hourly(NOW))
+    h = sc.book.hourly["NVDAUSDT"]
+    assert h.price_at(e) == 102.0 and h.price_at(e - H) == 101.0           # index closes, not the last trade (999)
+    assert h.volume(e - 3 * H, e) == 15003.0                               # the perpetual's quote volume
+    asyncio.run(sc._prices(NOW))
+    assert sc.book.last == {"NVDAUSDT": (150.0, NOW)}                      # the index, not the mark (151)
+    assert "/fapi/v1/ticker/price" not in calls
 
 
 def engine_with_pick(cfg, keys, now=NOW, move=0.9):
@@ -164,6 +232,52 @@ def test_the_picked_stock_is_a_full_node_on_the_map(cfg, keys):
     assert any(b["id"] == "notable_stock" and "NVDA" in b["text"] for b in today["narrative"])
     assert "NVDA" in eng.watch_symbols()
     assert [s.id for s, _, _ in eng.slot_series("today")] == ["stock1"]
+
+
+def test_each_node_says_which_days_its_sigma_is_measured_on(cfg, keys):
+    eng = engine_with_pick(cfg, keys)
+    expect = {"spx": "NYSE trading days", "ndx": "NYSE trading days", "stock1": "NYSE trading days",
+              "gold": "weekdays", "btc": "all days"}
+    for tf in ("1h", "today", "1w"):
+        nodes = {n["id"]: n for n in eng.build_tf(tf, NOW)["nodes"]}
+        for nid, days in expect.items():
+            n = nodes[nid]
+            assert n["sigma_method"].startswith(("same-clock", "daily RMS")), (tf, nid, n["sigma_method"])
+            assert n["sigma_days"] == days, (tf, nid)
+
+
+@pytest.mark.parametrize("tf", ["1h", "today", "1w"])
+def test_a_pick_whose_move_has_eased_says_so(cfg, keys, monkeypatch, tf):
+    """The screen runs every few minutes and a 1H move can fade in between (seen live: NKE −2.4σ at the
+    screen, −0.9σ on the map 2½ minutes later). The slot then says so, with the numbers that picked it,
+    instead of calling a −0.5σ move the most unusual one; "what the flow says" leaves it out."""
+    from moneyflow import stats
+    eng = engine_with_pick(cfg, keys)
+    eng.stock_cfg = dict(eng.stock_cfg, z_min=2.0)                  # the real rule (the fixture lowers it to pick)
+    inst, real = eng._stocks["NVDAUSDT"]["inst"], stats.window_return
+
+    def window_return(i, w, now):
+        if i is not inst:
+            return real(i, w, now)
+        r = -0.5 * stats.sigma_for(w.tf, i, now)[0]
+        return r, (math.exp(r) - 1) * 100, i.price / math.exp(r)
+
+    monkeypatch.setattr(stats, "window_return", window_return)
+    eng._cache.clear()
+    snap = eng.snapshot(NOW)
+    jsonschema.validate(one_tf(snap, tf), SCHEMA)
+    td = snap["timeframes"][tf]
+    node = next(n for n in td["nodes"] if n["id"] == "stock1")
+    pick = td["stocks"]["picks"][0]
+    why = node["slot"]["why"]
+    assert node["z"] == pytest.approx(-0.5, abs=1e-6) and node["slot"]["eased"] is True
+    assert "(-0.5σ)" in why and f"{pick['z']:+.1f}σ)" in why and why.endswith("the move has eased since.")
+    assert "At the screen" in why and pick["why"] == why and td["stocks"]["note"] == why
+    assert not any(b["id"] == "notable_stock" for b in td["narrative"])
+    monkeypatch.setattr(stats, "window_return", real)               # the move is back: the usual text
+    eng._cache.clear()
+    node = next(n for n in eng.build_tf(tf, NOW)["nodes"] if n["id"] == "stock1")
+    assert node["slot"]["eased"] is False and "the most unusual move among" in node["slot"]["why"]
 
 
 def test_an_empty_slot_says_why(cfg, keys):

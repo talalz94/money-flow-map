@@ -128,6 +128,7 @@ class Instrument:
         self.key, self.source, self.symbol = key, source, symbol
         self.label = label or symbol
         self.hours = hours                  # market-hours profile, see clock.market_open
+        self.calendar = clock.default_calendar(hours)   # days comparable for σ, see clock.CALENDARS
         self.delayed_s = delayed_s          # known publication delay of the source (e.g. 900 s)
         self.g1 = Grid(G1_STEP, G1_SIZE)
         self.g5 = Grid(G5_STEP, G5_SIZE)

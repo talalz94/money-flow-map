@@ -78,6 +78,8 @@ def at(eng: Engine, t: float, now: float) -> None:
             v = d.g1.asof(t) if now - t < 23 * 3600 else NaN
             d.price = v if v == v else d.g5.asof(t)
             d.ts, d.recv_ts = t - 1, t - 0.9
+            for i in d.inputs:              # its FX legs have no free history: the replayed DXY is ICE's
+                i._live_seen, i.ts, i.recv_ts = True, t - 1, t - 0.9
         else:
             d.rebuild(t)
             if isinstance(d, Stitched):
@@ -94,9 +96,10 @@ def main() -> int:
     ap.add_argument("--focus", nargs="+", default=["gold"], help="assets whose missing arrows are explained")
     ap.add_argument("--data", default=str(ROOT / "data"))
     ap.add_argument("--no-network", action="store_true")
+    ap.add_argument("--end", type=float, help="replay up to this epoch time (default: 2 minutes ago)")
     a = ap.parse_args()
     eng, now = build_engine(Path(a.data), not a.no_network)
-    end, step = now - 120, a.step_min * 60
+    end, step = (a.end if a.end else now - 120), a.step_min * 60
     times = [end - k * step for k in range(int(a.hours * 60 / a.step_min), -1, -1)]
     with_arrow = {tf: collections.Counter() for tf in a.tf}
     reasons = {tf: collections.Counter() for tf in a.tf}

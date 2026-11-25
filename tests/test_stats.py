@@ -25,10 +25,68 @@ def drifting(now, days=35, hours="24/7", volume=False):
 NOW = ny_ts(2026, 11, 24, 10, 0)            # on a 5-minute boundary, 17 h after the roll
 
 
-def test_sigma_1h_is_rms_of_rolling_hour_returns():
+def test_sigma_1h_is_rms_of_same_clock_hour_returns():
     inst = drifting(NOW)
-    s, n = stats.sigma_1h(inst, NOW)
-    assert s == pytest.approx(12 * A, rel=1e-9) and n > 2000
+    s, n, method = stats.sigma_1h(inst, NOW)
+    # crypto calendar: the same clock hour (±30 min in 15-min steps) on each of the previous 10 days
+    assert s == pytest.approx(12 * A, rel=1e-9) and n == 10 * 5 and method == "same-clock hour"
+
+
+def _shaped(now, calendar, hourly_move, days=34):
+    """An instrument whose log price moves by hourly_move(t) in each 5-minute step (per hour)."""
+    inst = Instrument("t:S", "t", "S", "24/7")
+    inst.calendar = calendar
+    k_now = int(now // G5_STEP)
+    lp, closes = 0.0, []
+    for k in range(k_now - days * 288, k_now):
+        lp += hourly_move((k + 1) * G5_STEP) / 12
+        closes.append((k * G5_STEP, 100.0 * math.exp(lp)))
+    inst.seed("g5", closes, now)
+    inst.price = closes[-1][1]
+    return inst
+
+
+def test_quiet_weekends_do_not_dilute_an_exchange_traded_assets_sigma():
+    """A perpetual on the S&P trades all weekend but barely moves: its σ must come from the days the
+    S&P trades, or every weekday move looks bigger than it is (seen: SPX TODAY σ 0.45% vs 0.5-0.6%)."""
+    def move(t):              # a steady 0.1% an hour on NYSE trading days, nothing at weekends
+        return 0.001 if clock.trading_day("us_equity", t) else 0.0
+    eq = _shaped(NOW, "us_equity", move)
+    s1, n1, _ = stats.sigma_1h(eq, NOW)
+    assert s1 == pytest.approx(0.001, rel=0.05)             # every sample a 0.1% hour, no weekend zeros
+    every_day = _shaped(NOW, "all", move)                   # the same prices read as a 24/7 asset
+    s_all, _, _ = stats.sigma_1h(every_day, NOW)
+    assert s_all < 0.9 * s1                                 # weekends pulled the old yardstick down
+    st, nt, _ = stats.sigma_today(eq, NOW)
+    assert nt == 20 and st > stats.sigma_today(every_day, NOW)[0]
+
+
+def test_one_off_day_does_not_dominate_sigma_but_real_volatility_stays():
+    """A −18% earnings gap among ±1% days once tripled a stock's σ (−2.9σ moves showed as −1.1σ).
+    The one day more than twice the size of any other now counts as the next-largest day; a stock
+    with several big days keeps them (that is its volatility, seen live with ZS)."""
+    gap = [0.01 if i % 2 else -0.01 for i in range(19)] + [-0.18]
+    assert stats._rms(gap) == pytest.approx(math.sqrt((19 * 1e-4 + 0.0324) / 20))      # 4.1%: the gap rules
+    assert stats.robust_rms(gap) == pytest.approx(0.01)                                # the gap counts as a 1% day
+    volatile = [0.01 if i % 2 else -0.01 for i in range(16)] + [0.08, -0.10, 0.11, -0.08]
+    assert stats.robust_rms(volatile) == pytest.approx(stats._rms(volatile))          # 11% is not 2x 10%: kept
+    assert stats.robust_rms([0.01, -0.01] * 10) == pytest.approx(0.01)                 # ordinary days: untouched
+    # per day for overlapping samples: one event seen by five 1-hour windows is still one day
+    days = [[0.002] * 5 for _ in range(19)] + [[0.03, 0.025, 0.02, 0.03, 0.028]]
+    assert stats.robust_rms(days) == pytest.approx(0.002)
+
+
+def test_same_clock_hour_tells_a_quiet_pre_open_from_the_opening_hour():
+    """Pre-open hours are judged against pre-open hours, the opening hour against opening hours."""
+    def move(t):
+        import datetime as _dt
+        h = _dt.datetime.fromtimestamp(t, clock.NY).hour
+        size = 0.004 if 9 <= h < 11 else 0.0005             # busy around the open, quiet otherwise
+        return size if int(t // 3600) % 2 else -size
+    inst = _shaped(NOW, "us_equity", move)
+    pre, _, _ = stats.sigma_1h(inst, ny_ts(2026, 11, 24, 7, 0))
+    opening, _, _ = stats.sigma_1h(inst, ny_ts(2026, 11, 24, 10, 0))
+    assert opening > 4 * pre
 
 
 def test_sigma_today_same_clock_and_z_of_one():
