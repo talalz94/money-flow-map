@@ -3,9 +3,11 @@
     -NoDashboard   API only (headless), no web page
     -NoBrowser     do not open the dashboard in the browser
     -Port 8765     another port
-  Double-click start.bat for the same. Stop with Ctrl+C in this window.
+    -StayRunning   keep running when nobody uses it (by default it stops by itself 5 minutes after
+                   the last dashboard tab or app disconnects, or if it is never opened)
+  Double-click start.bat for the same. Stop with Ctrl+C in this window, or close the dashboard.
 #>
-param([switch]$NoDashboard, [switch]$NoBrowser, [int]$Port = 0)
+param([switch]$NoDashboard, [switch]$NoBrowser, [int]$Port = 0, [switch]$StayRunning)
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
@@ -52,4 +54,5 @@ $args2 = @("-m", "moneyflow", "run")
 if ($NoDashboard) { $args2 += "--no-dashboard" }
 elseif (-not $NoBrowser) { $args2 += "--open" }
 if ($Port -gt 0) { $args2 += @("--port", "$Port") }
+if ($StayRunning) { $args2 += "--stay-running" }
 & $exe @pre @args2

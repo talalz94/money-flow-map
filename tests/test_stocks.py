@@ -183,3 +183,20 @@ def test_a_stock_no_longer_picked_is_dropped_after_keep_s(cfg, keys):
     assert "NVDAUSDT" in eng._stocks                                  # kept a while (it may come back)
     eng.on_stock_screen(quiet, NOW + 7300)
     assert "NVDAUSDT" not in eng._stocks and key not in eng.instruments
+
+
+def test_a_new_pick_is_shown_only_once_its_data_is_in(cfg, keys):
+    """Just picked: the slot shows the stock once its history and live feed are in (never "no data");
+    meanwhile the API lists it as loading. Seen live when the TODAY pick switched from DELL to SHOP."""
+    eng = engine_with_pick(cfg, keys)
+    eng._stocks["NVDAUSDT"]["ready"] = False
+    eng._cache.clear()
+    snap = eng.snapshot(NOW)
+    td = snap["timeframes"]["today"]
+    assert not any(n.get("slot") for n in td["nodes"]) and td["stocks"]["loading"] == ["NVDA"]
+    assert td["stocks"]["picks"][0]["symbol"] == "NVDA"
+    jsonschema.validate(one_tf(snap, "today"), SCHEMA)
+    eng._stocks["NVDAUSDT"]["ready"] = True
+    eng._cache.clear()
+    td = eng.snapshot(NOW + 1)["timeframes"]["today"]
+    assert any(n.get("slot") for n in td["nodes"]) and td["stocks"]["loading"] == []

@@ -51,7 +51,7 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
     from aiohttp import web
 
     from .engine import Engine
-    from .server import make_app
+    from .server import IDLE_KEY, make_app
     log = logging.getLogger("moneyflow")
     engine = Engine(cfg, keys)
     app = make_app(engine, cfg, dashboard)
@@ -67,9 +67,14 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
                          f"Open http://127.0.0.1:{port}/ or start with --port.")
     await engine.start()
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/"
+    idle = app[IDLE_KEY]
     log.info("moneyflow %s: API %sapi%s", __version__, url, f", dashboard {url}" if dashboard else " (dashboard off)")
+    auto = (f"stops by itself {idle.grace / 60:g} min after the last dashboard tab or app disconnects "
+            f"(or if never opened)" if idle.grace else "keeps running until stopped (auto-stop off)")
+    log.info("auto-stop: %s", auto)
     print(f"\n  Money Flow Map is running.\n  API:        {url}api\n"
-          f"  Dashboard:  {url if dashboard else '(off: started with --no-dashboard)'}\n  Stop:       Ctrl+C\n", flush=True)
+          f"  Dashboard:  {url if dashboard else '(off: started with --no-dashboard)'}\n"
+          f"  Stop:       Ctrl+C, or it {auto}\n", flush=True)
     if open_browser and dashboard:
         webbrowser.open(url)
     stop = asyncio.Event()
@@ -79,18 +84,39 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         loop.call_soon_threadsafe(stop.set)
 
     import signal
+    previous = {}
     for name in ("SIGBREAK", "SIGTERM"):          # Ctrl+Break / closing the console window; kill
         if hasattr(signal, name):
             try:
-                signal.signal(getattr(signal, name), _graceful)
+                previous[name] = signal.signal(getattr(signal, name), _graceful)
             except (ValueError, OSError):
                 pass
+
+    async def watch_idle():
+        """Not in use (no dashboard tab or app) for the grace period: stop, as if Ctrl+C was pressed."""
+        step = max(0.2, min(5.0, idle.grace / 6))
+        while not stop.is_set():
+            await asyncio.sleep(step)
+            if idle.should_stop():
+                why = idle.reason()
+                log.info("auto-stop: %s", why)
+                print(f"\n  Money Flow Map: {why}\n", flush=True)
+                stop.set()
+
+    watcher = asyncio.create_task(watch_idle(), name="idle") if idle.grace else None
     try:
         await stop.wait()
     finally:
+        if watcher is not None:
+            watcher.cancel()
         log.info("stopping (saving the history cache)...")
         await engine.stop()
         await runner.cleanup()
+        for name, handler in previous.items():
+            try:
+                signal.signal(getattr(signal, name), handler)
+            except (ValueError, OSError, TypeError):
+                pass
         log.info("stopped")
 
 
@@ -167,6 +193,10 @@ def main(argv=None) -> int:
     r.add_argument("--port", type=int)
     r.add_argument("--host")
     r.add_argument("--log-level")
+    r.add_argument("--stay-running", action="store_true",
+                   help="do not stop when unused (by default it stops [server] idle_shutdown_minutes, 5, "
+                        "after the last dashboard tab or app disconnects)")
+    r.add_argument("--idle-minutes", type=float, help="stop after this many unused minutes (0 = never)")
     rd = sub.add_parser("read", help="print the current read from the running service")
     rd.add_argument("--tf", default="today", choices=["1h", "today", "1w"])
     rd.add_argument("--json", action="store_true")
@@ -195,6 +225,10 @@ def main(argv=None) -> int:
             srv["host"] = args.host
         if getattr(args, "no_dashboard", False):
             srv["dashboard"] = False
+        if getattr(args, "idle_minutes", None) is not None:
+            srv["idle_shutdown_minutes"] = args.idle_minutes
+        if getattr(args, "stay_running", False):
+            srv["idle_shutdown_minutes"] = 0
         if srv:
             overrides["server"] = srv
     try:

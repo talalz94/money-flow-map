@@ -149,9 +149,11 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
             continue
         rv = (sl.get("screen") or {}).get("rvol")
         vol = f" on {rv:.1f}× its usual volume" if rv is not None and rv >= 1.05 else ""
-        add("notable_stock", f"Notable stock: {sl['symbol']} is {fmt_z(v['z'])} {phrase} "
-                             f"({fmt_pct(v['change_pct'])}){vol}, the most unusual move among "
-                             f"{sl.get('universe') or 'the'} large caps.", "down" if v["z"] < 0 else "up")
+        # the % and the volume, not a σ: the screen ranks on a 20-day hourly yardstick, the map's z on
+        # the 30-day one (an earnings day can sit in one and not the other); the hover shows both
+        add("notable_stock", f"Notable stock: {sl['symbol']} {fmt_pct(v['change_pct'])} {phrase}{vol}, the most "
+                             f"unusual move among {sl.get('universe') or 'the'} large caps.",
+            "down" if v["change_pct"] < 0 else "up")
     if _ok(oil) and abs(oil) >= Z2:
         add("oil_move", f"Crude oil is {fmt_z(oil)} {phrase}: "
                         f"{'an inflation / supply risk' if oil > 0 else 'a demand-scare or supply-glut signal'}.", "info")

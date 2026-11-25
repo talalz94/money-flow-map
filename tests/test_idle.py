@@ -1,0 +1,145 @@
+"""Auto-stop when unused: the idle timer's rules, and the real `serve()` stopping by itself (or not)."""
+import asyncio
+import socket
+import time
+
+import aiohttp
+import pytest
+
+from moneyflow import cli, config as cfgmod
+from moneyflow.engine import Engine
+from moneyflow.idle import IdleGuard
+
+G = 300.0                                         # the default grace: 5 minutes
+
+
+def test_started_but_never_opened_stops_after_the_grace():
+    g = IdleGuard(G, now=0.0)
+    assert not g.should_stop(G - 1) and g.should_stop(G)
+    assert g.info(10.0)["stops_in_s"] == pytest.approx(G - 10) and "not opened" in g.reason(G)
+
+
+def test_an_open_dashboard_or_stream_keeps_it_running():
+    g = IdleGuard(G, now=0.0)
+    g.stream_opened(5.0)
+    assert not g.should_stop(10 * G) and g.info(10 * G)["stops_in_s"] is None
+    g.stream_closed(10 * G)                       # the tab is closed: the grace starts now
+    assert not g.should_stop(11 * G - 1) and g.should_stop(11 * G)
+    assert "no dashboard tab or app connected" in g.reason(11 * G)
+
+
+def test_a_page_refresh_reconnects_within_the_grace():
+    g = IdleGuard(G, now=0.0)
+    g.stream_opened(1.0)
+    g.stream_closed(100.0)                        # refresh: the WebSocket closes ...
+    g.stream_opened(101.5)                        # ... and the new page reconnects 1.5 s later
+    assert not g.should_stop(100.0 + 2 * G)
+    g.stream_closed(1000.0)
+    assert not g.should_stop(1000.0 + G - 1) and g.should_stop(1000.0 + G)
+
+
+def test_two_viewers_one_leaves():
+    g = IdleGuard(G, now=0.0)
+    g.stream_opened(1.0)                          # a dashboard tab
+    g.stream_opened(2.0)                          # and an app's SSE stream
+    g.stream_closed(3.0)
+    assert not g.should_stop(3.0 + 5 * G) and g.streams == 1
+
+
+def test_api_activity_keeps_it_alive_and_then_the_grace_runs():
+    g = IdleGuard(G, now=0.0)
+    for t in range(0, 3000, 200):                 # an app polling the REST API every 200 s
+        g.touch(float(t), "request /api/risk")
+        assert not g.should_stop(t + 199.0)
+    assert g.should_stop(2800.0 + G) and not g.should_stop(2800.0 + G - 1)
+    g2 = IdleGuard(G, now=0.0)
+    g2.touch(250.0, "webhook delivered")          # a webhook delivery counts too
+    assert not g2.should_stop(400.0) and g2.should_stop(550.0)
+
+
+def test_opt_out_never_stops():
+    g = IdleGuard(0, now=0.0)
+    assert not g.should_stop(1e9) and g.info(1e9)["stops_in_s"] is None
+
+
+def test_config_and_flags(tmp_path, monkeypatch):
+    assert cfgmod.load(paths=[])["server"]["idle_shutdown_minutes"] == 5          # auto-stop is the default
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[server]\nidle_shutdown_minutes = -1\n", encoding="utf-8")
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.load(paths=[bad])
+    seen = {}
+
+    async def fake_serve(cfg, keys, dashboard, open_browser):
+        seen["idle"] = cfg["server"]["idle_shutdown_minutes"]
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    for argv, want in ((["run"], 5), (["run", "--stay-running"], 0), (["run", "--idle-minutes", "2"], 2)):
+        cli.main(argv)
+        assert seen["idle"] == want, argv
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _serve_cfg(tmp_path, port: int, minutes: float) -> dict:
+    return cfgmod.load(paths=[], overrides={"general": {"data_dir": str(tmp_path / "data")},
+                                            "server": {"port": port, "idle_shutdown_minutes": minutes}})
+
+
+@pytest.fixture
+def no_feeds(monkeypatch):
+    """serve() without the network: the engine's feeds and history are not started."""
+    async def noop(self):
+        return None
+    monkeypatch.setattr(Engine, "start", noop)
+    monkeypatch.setattr(Engine, "stop", noop)
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def test_serve_stops_by_itself_when_never_opened_and_frees_the_port(tmp_path, keys, no_feeds):
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0.02)        # a 1.2 s grace
+    t0 = time.monotonic()
+    asyncio.run(asyncio.wait_for(cli.serve(cfg, keys, dashboard=False, open_browser=False), timeout=20))
+    took = time.monotonic() - t0
+    assert 1.2 <= took < 6, took                  # returned on its own, shortly after the grace
+    assert _port_free(port)
+
+
+def test_serve_stays_up_while_an_app_streams_then_stops(tmp_path, keys, no_feeds):
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0.02)
+    events = {}
+
+    async def go():
+        task = asyncio.create_task(cli.serve(cfg, keys, dashboard=False, open_browser=False))
+        await asyncio.sleep(0.5)
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(f"http://127.0.0.1:{port}/ws?tf=today") as ws:
+                await ws.receive(timeout=10)                       # the first snapshot
+                async with s.get(f"http://127.0.0.1:{port}/api/health") as r:
+                    events["health"] = (await r.json())["idle"]
+                await asyncio.sleep(4.0)                           # > 3x the grace, streaming
+                events["alive_while_streaming"] = not task.done()
+            t_closed = time.monotonic()
+        await asyncio.wait_for(task, timeout=15)                   # stops once the app has left
+        events["stopped_after_s"] = time.monotonic() - t_closed
+
+    asyncio.run(go())
+    assert events["alive_while_streaming"]
+    assert events["health"]["streams"] == 1 and events["health"]["stops_in_s"] is None
+    assert 1.0 <= events["stopped_after_s"] < 6
+    assert _port_free(port)

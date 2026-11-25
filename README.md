@@ -40,8 +40,24 @@ Or double-click **`start.bat`**. This finds Python 3.11+, installs `aiohttp` onl
 missing, starts the service and opens the dashboard at <http://127.0.0.1:8765/>. Stop it with
 Ctrl+C or by closing the window.
 
+**It does not keep running in the background.** It stops by itself **5 minutes after the last
+dashboard tab (or app) disconnects**, and also 5 minutes after a start if nobody opens it. A page
+refresh is fine; the 5 minutes are there for that. Stopping is clean: the feeds stop, the history
+cache is saved, the port is freed and the process exits. The log says why ("no dashboard tab or app
+connected for 5 minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
+entry, service or watchdog. Start it again with `start.bat` when you want it.
+
+- An app using the API keeps it alive: an open WebSocket/SSE stream, or any request (or webhook
+  delivery) within the 5 minutes.
+- To keep it always on: `.\start.ps1 -StayRunning`, `python -m moneyflow run --stay-running`, or
+  `idle_shutdown_minutes = 0` under `[server]` in `moneyflow.local.toml`. Another delay:
+  `idle_shutdown_minutes = 15` or `--idle-minutes 15`.
+- A webhook-only setup (nothing reads the API) should use the always-on option. Webhooks fire only
+  on events, so the service could otherwise stop between them.
+
 ```powershell
 .\start.ps1 -NoDashboard        # API only (headless)
+.\start.ps1 -StayRunning        # do not stop when unused
 python -m moneyflow run --no-dashboard --port 8800
 python -m moneyflow read --tf 1h # print the current read in the terminal
 python -m moneyflow keys         # which API keys were found (values are never shown)
@@ -86,6 +102,7 @@ Windows. Everything is in `requirements.txt`.
 | **Strongest flows** | The top inferred edges with weight and correlation ρ. |
 | **News wire** | Headlines from several feeds, newest first. Each shows its source and how long ago it was published. |
 | **Status strip** | Every connector with its state, median latency and message rate. |
+| **Footer** | Connection state, and "This program stops by itself 5 min after the last viewer leaves" (section 1). If the page loses the service for good it says the service may have stopped and to start it again with `start.bat`. |
 
 Every asset reports one of these statuses:
 
@@ -415,6 +432,8 @@ served:
 - `[[series]]` entries merge by `id`. To add an asset (for example the disabled `copper`, `iwm`
   or `openai` series), set `enabled = true`, or add a new entry with a `source` and `symbol`.
 - Connectors are switched in `[connectors.*]`.
+- Auto-stop is set in `[server] idle_shutdown_minutes` (default 5; 0 = keep running), or per start
+  with `--stay-running` / `--idle-minutes N` (`start.ps1 -StayRunning`).
 - The notable-stock slot is set in `[stocks]`: `slots` (0 switches it off, up to 5), `z_min` and
   `score_min` (the rule), `scan_interval_s`, `keep_s`, `positions` (where each slot sits on the
   map) and `universe` (your own list of tickers replaces the default one).
@@ -445,7 +464,7 @@ The service listens on `http://127.0.0.1:8765` (localhost only). Everything is r
 | `GET /api/edges?tf=` · `/api/risk?tf=` · `/api/narrative?tf=` · `/api/tiles?tf=` | Parts of the read |
 | `GET /api/history/{id}?grid=5m&hours=24` | Stored closes of one series (5m: 35 days, 1m: 1 day), each `[step end time, close, market open 1/0]`, for drawing your own charts. `stock1` gives the stock now in that slot (`&tf=` picks the window, default `today`) |
 | `GET /api/news?limit=30` · `/api/fed` · `/api/events` | Headlines, next FOMC decision, scheduled releases |
-| `GET /api/sources` · `/api/health` | Connector states and latency; process CPU/RAM, clock offset |
+| `GET /api/sources` · `/api/health` | Connector states and latency; process CPU/RAM, clock offset; `idle`: open streams, seconds idle and seconds until auto-stop |
 | `GET /api/schema` | The JSON Schema (`moneyflow/schema/snapshot.schema.json`) |
 | `WS /ws?tf=today` | A `{"type":"snapshot","tf":..,"data":{..}}` message every second. Send `{"tf":"1h"}` to switch. |
 | `GET /sse?tf=today` | The same messages as Server-Sent Events (`event: snapshot`) |
@@ -624,6 +643,8 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - A watchdog notices the wall clock jumping (more than 25 s in a 5 s tick).
   - It then clears the DNS cache, re-syncs the clock by NTP and **kicks every connector** into an immediate reconnect.
   - After gaps over 2 minutes it **downloads the missing history** for every instrument.
+  - With no dashboard open, it stops by itself within 5 minutes of the PC waking (auto-stop,
+    section 1). An open dashboard reconnects within that time and keeps it running.
 - **Pollers** back off on errors (10 s doubling to 15 min) and recover by themselves.
 - **Rate limits:** a `429 Too Many Requests` answer makes that source wait at least 5 minutes (or its `Retry-After`) before asking again.
 - **Restarts reuse fresh data:** the slow sources are cached in `data/cache/`, so frequent restarts stay far from the sources' limits:
@@ -678,6 +699,7 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - σ estimators on exact synthetic series;
   - edge weights (including series built from each other), which edges are kept, the plain-language reason for every asset without an arrow, and the risk composite;
   - **every node, gold and the stock slot included, as the strongest outflow and the strongest inflow, in all three windows**, through the real engine (`tests/test_every_node.py`: 66 forced cases);
+  - auto-stop: the idle timer (a tab connects, disconnects, a refresh within the delay, two viewers, API polling, a webhook delivery, the opt-out, never opened), and the real `serve()` stopping by itself and freeing its port, or staying up while an app streams (`tests/test_idle.py`);
   - the notable-stock screen on exact synthetic hourly bars (σ, volume ratio, score, the rule, "may be none"), the universe filter, and the slot as a full node (snapshot, schema, narrative, history id);
   - narrative rules (including the reference screenshot's read);
   - Fed calendar parsing;
@@ -818,6 +840,17 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - the stock screen's weekly σ included the current day, which is the move being measured;
   - the hover mixed up two stocks when the slot held different ones in different windows;
   - the phone layout kept stale positions when the slot appeared on switching windows.
+
+**Auto-stop, tested live on 25 Nov 2026.** A 1-minute delay was used unless noted. The service was
+watched through the process list and open ports only, because a request would itself count as use.
+
+| Scenario | What happened |
+|---|---|
+| Started, never opened (default 5 min; a copy without keys) | Started 12:03:46 UTC. At 12:08:49: "not opened for 5 minutes: stopping"; cache saved; exited at 12:08:50, code 0. |
+| Dashboard opened, kept open, then closed | Opened 12:09:45 and still running 100 s later. Tab closed 12:11:41. At 12:12:43: "no dashboard tab or app connected for 1 minute: stopping"; exited at 12:12:45, code 0; port free 65 s after the close. |
+| An app streaming the API for 150 s | 148 snapshots received; the service stayed up throughout, long past the delay. The app left at 12:15:47; the service stopped at 12:16:52 and exited at 12:16:54, code 0. |
+| `--stay-running` (given together with `--idle-minutes 1`) | Still running 100 s after start with nobody connected ("auto-stop off"). |
+| Afterwards | No Python process left on the PC, no port listening. No scheduled task (of 196), Startup-folder item, Run/RunOnce registry entry or Windows service refers to the app. |
 
 ---
 

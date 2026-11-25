@@ -23,6 +23,7 @@ import aiohttp
 from aiohttp import web
 
 from . import SCHEMA_ID, __version__, jsonutil, stats
+from .idle import IdleGuard
 
 log = logging.getLogger("moneyflow.server")
 STATIC = Path(__file__).resolve().parent / "static"
@@ -30,6 +31,7 @@ SCHEMA_FILE = Path(__file__).resolve().parent / "schema" / "snapshot.schema.json
 TFS = stats.TIMEFRAMES
 ENGINE_KEY = web.AppKey("engine", object)
 HUB_KEY = web.AppKey("hub", object)
+IDLE_KEY = web.AppKey("idle", IdleGuard)
 
 
 def one_tf(snap: dict, tf: str) -> dict:
@@ -112,6 +114,7 @@ class Webhooks:
         self.last_check = 0.0
         self.sent = 0
         self.failed = 0
+        self.idle: IdleGuard | None = None
 
     def due(self, now: float) -> bool:
         # nothing is sent until the history is in: a read without it would only produce a spurious
@@ -166,6 +169,8 @@ class Webhooks:
                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status < 300:
                         self.sent += 1
+                        if self.idle is not None:
+                            self.idle.touch(what="webhook delivered")
                         return
             except Exception:  # noqa: BLE001
                 pass
@@ -189,6 +194,8 @@ def _json(data, status: int = 200) -> web.Response:
 
 def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
     scfg = cfg.get("server", {})
+    # auto-stop when unused (see idle.py); the CLI runs the watcher that acts on it
+    idle = IdleGuard(float(scfg.get("idle_shutdown_minutes", 5)) * 60)
     token = scfg.get("token") or ""
     allowed = {"localhost", "127.0.0.1", "[::1]", "::1"} | {h.lower() for h in scfg.get("allowed_hosts", [])}
     if scfg.get("host") not in (None, "127.0.0.1", "localhost", "::1"):
@@ -206,6 +213,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
             got = request.headers.get("X-Moneyflow-Token") or request.query.get("token")
             if got != token:
                 return _json({"error": "token required"}, 401)
+        idle.touch(what=f"request {path}")
         if request.method == "OPTIONS":
             resp = web.Response(status=204)
         else:
@@ -222,6 +230,8 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
     app[ENGINE_KEY] = engine
     hub = Hub(engine, float(scfg.get("push_interval_s", 1.0)), cfg.get("webhooks", {}))
     app[HUB_KEY] = hub
+    hub.webhooks.idle = idle
+    app[IDLE_KEY] = idle
 
     async def index_api(request):
         return _json({"name": "moneyflow", "version": __version__, "schema": SCHEMA_ID, "timeframes": list(TFS),
@@ -319,7 +329,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
         srcs = engine.sources(now)
         return _json({"status": "ok", "version": __version__, "process": engine.process_info(),
                       "clock": engine.clock.info(), "history": engine.seed_state, "resumes": engine.resumes,
-                      "clients": hub.n_clients, "webhooks": {"targets": len(hub.webhooks.targets),
+                      "clients": hub.n_clients, "idle": idle.info(), "webhooks": {"targets": len(hub.webhooks.targets),
                                                              "sent": hub.webhooks.sent, "failed": hub.webhooks.failed},
                       "connectors": {s["id"]: s["state"] for s in srcs}})
 
@@ -331,6 +341,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
         await ws.prepare(request)
         tf = request.query.get("tf", "all")
         hub.ws_clients[ws] = tf if tf in TFS or tf == "all" else "all"
+        idle.stream_opened()
         try:
             s = engine.snapshot()
             data = s if hub.ws_clients[ws] == "all" else one_tf(s, hub.ws_clients[ws])
@@ -352,6 +363,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
         finally:
             hub.ws_clients.pop(ws, None)
             hub.last_sent.pop(ws, None)
+            idle.stream_closed()
         return ws
 
     async def sse_handler(request):
@@ -364,6 +376,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
         await resp.prepare(request)
         q: asyncio.Queue = asyncio.Queue()
         hub.sse_clients[q] = tf
+        idle.stream_opened()
         try:
             s = engine.snapshot()
             first = jsonutil.dumps({"type": "snapshot", "tf": tf, "data": s if tf == "all" else one_tf(s, tf)})
@@ -378,6 +391,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
             pass
         finally:
             hub.sse_clients.pop(q, None)
+            idle.stream_closed()
         return resp
 
     app.router.add_get("/api", index_api)

@@ -54,7 +54,10 @@
     ws.onmessage = (ev) => { try { const t = performance.now(); const m = JSON.parse(ev.data); perf.parseMs += performance.now() - t; perf.msgs++;
       if (m.type === "snapshot") onData(m.data); } catch (e) { console.error(e); } };
     ws.onclose = () => {
-      if (!/token/.test($("footConn").textContent)) setConn(false, "stream lost, retrying");
+      if (!/token/.test($("footConn").textContent))
+        setConn(false, wsDelay < 8000 ? "stream lost, retrying"
+          : "not connected: the service may have stopped" + (S.idleS ? ` (it stops by itself ${Math.round(S.idleS / 60)} min after the last viewer leaves)` : "")
+            + ". Start it again with start.bat.");
       startPolling(); setTimeout(connect, wsDelay); wsDelay = Math.min(30000, wsDelay * 2);
     };
     ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
@@ -73,6 +76,12 @@
     S.data = d;
     S.receivedAt = Date.now() / 1000;
     S.serverOffset = d.generated_ts - S.receivedAt;
+    const idle = d.meta && d.meta.idle_shutdown_s;              // the service stops by itself when unused
+    if (idle !== S.idleS) {
+      S.idleS = idle;
+      $("footIdle").textContent = idle ? `This program stops by itself ${Math.round(idle / 60)} min after the last viewer leaves.`
+                                       : "This program keeps running until stopped (auto-stop off).";
+    }
     if (S.hidden) { S.dirty = true; return; }              // hidden tab: keep the data, draw nothing
     render();
   }
@@ -213,7 +222,7 @@
       g.font = `600 ${Math.round(L.R * 0.36)}px "Segoe UI", sans-serif`;
       g.fillText("NOTABLE STOCK", p.x, p.y + L.R * 1.45);
       g.font = `${Math.round(L.R * 0.34)}px "Segoe UI", sans-serif`;
-      g.fillText("none stands out now", p.x, p.y + L.R * 1.95);
+      g.fillText(st.loading && st.loading.length ? `loading ${st.loading[0]}…` : "none stands out now", p.x, p.y + L.R * 1.95);
       S.nodePos.push({ id: "stock-empty", ...p });
     }
   }

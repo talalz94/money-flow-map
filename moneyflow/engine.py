@@ -309,13 +309,15 @@ class Engine:
                     bf.subs.pop(sym, None)
 
     def slot_series(self, tf: str) -> list[tuple[SeriesDef, dict, dict]]:
-        """The window's picked stock(s) as series: [(SeriesDef with id stock1.., pick, entry)]."""
+        """The window's picked stock(s) as series: [(SeriesDef with id stock1.., pick, entry)]. A stock just
+        picked is shown once its history and live feed are in (a few seconds), never as "no data"."""
         out = []
         pos = self.stock_cfg.get("positions") or [[0.92, 0.29]]
-        for i, p in enumerate((self.stock_screen.get(tf) or {}).get("picks", [])):
+        for p in (self.stock_screen.get(tf) or {}).get("picks", []):
             ent = self._stocks.get(p["symbol"])
-            if ent is None:
+            if ent is None or not ent["ready"]:
                 continue
+            i = len(out)
             x, y = pos[min(i, len(pos) - 1)]
             sdef = SeriesDef(f"stock{i + 1}", f"{p['ticker']} (notable stock)", p["ticker"], "equities", True, "price",
                              ent["inst"], {"x": x, "y": y, "source": "binance_fut", "symbol": p["symbol"],
@@ -358,11 +360,14 @@ class Engine:
                     f"with a score ≥ {rule['score_min']:g}.")
         else:
             note = res["picks"][0]["why"]
+        loading = [p["ticker"] for p in res.get("picks", [])
+                   if not (self._stocks.get(p["symbol"]) or {}).get("ready")]
         return {"slots": slots, "universe": meta.get("universe", 0), "screened": res.get("screened", 0),
                 "scanned_at": clock.iso(meta["at"]) if meta.get("at") else None, "rule": rule,
                 "picks": [dict(rnd(p), slot=i + 1, why=p["why"]) for i, p in enumerate(res.get("picks", []))],
                 "candidates": [rnd(p) for p in res.get("top", [])], "not_listed": meta.get("missing", []),
-                "positions": (sc.get("positions") or [[0.92, 0.29]])[:max(1, slots)], "note": note}
+                "positions": (sc.get("positions") or [[0.92, 0.29]])[:max(1, slots)], "note": note,
+                "loading": loading}
 
     # ── callbacks from connectors ───────────────────────────────────────────────────────────
     def on_news(self, items: list[dict]) -> None:
@@ -1010,6 +1015,7 @@ class Engine:
             "market": clock.market_status(now),
             "sources": self.sources(now),
             "meta": {"heuristic": True, "disclaimer": DISCLAIMER, "clock": self.clock.info(),
+                     "idle_shutdown_s": float(self.cfg.get("server", {}).get("idle_shutdown_minutes", 5)) * 60,
                      "local_timezone": self.local_tz, "history": dict(self.seed_state),
                      "process": self.process_info(), "resumes": self.resumes,
                      "keys": self.keys.describe(), "config_files": self.cfg.get("_files", [])},

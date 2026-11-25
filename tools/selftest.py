@@ -75,6 +75,10 @@ def main() -> int:
     proc = health.get("process") or {}
     if proc.get("rss_mb") is not None:
         check(proc["rss_mb"] < 300, "memory below 300 MB", f"rss={proc['rss_mb']} MB")
+    idle = health.get("idle") or {}
+    if check("idle_shutdown_s" in idle, "auto-stop state reported", json.dumps(idle)):
+        print("      note: " + (f"auto-stop on: it stops {idle['idle_shutdown_s'] / 60:g} min after the last dashboard tab or app "
+                               f"leaves (this self-test counts as use)" if idle["idle_shutdown_s"] else "auto-stop off (always on)"))
     clk = health.get("clock") or {}
     check(clk.get("ntp_server") is not None, "clock synchronised by NTP", "no NTP sync (ages may be off by the PC clock error)", warn_only=True)
 
@@ -143,8 +147,10 @@ def main() -> int:
             check(all(abs(p["z"]) >= rule.get("z_min", 0) and p["score"] >= rule.get("score_min", 0) for p in picks),
                   f"{tf}: every picked stock clears the rule", json.dumps(picks)[:300])
             shown = {n["slot"]["symbol"] for n in s["nodes"] if n.get("slot")}
-            check(all(p["symbol"] in shown for p in picks), f"{tf}: every picked stock is on the map",
+            loading = set(stk.get("loading") or [])            # just picked: history and live feed loading
+            check(all(p["symbol"] in shown | loading for p in picks), f"{tf}: every picked stock is on the map (or loading)",
                   f"picked {[p['symbol'] for p in picks]}, shown {sorted(shown)}", warn_only=just_started)
+            check(not (shown & loading), f"{tf}: a stock is shown only once its data is in", str(sorted(shown & loading)))
             if stk.get("scanned_at"):
                 check(stk.get("universe", 0) >= 20, f"{tf}: large-cap universe screened", f"universe={stk.get('universe')}")
             print(f"      {tf}: notable stock: {', '.join(p['symbol'] + ' ' + format(p['z'], '+.1f') + 'σ' for p in picks) or 'none'}"

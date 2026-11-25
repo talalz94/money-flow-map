@@ -135,6 +135,9 @@ def validate(cfg: dict) -> None:
         for i in c.get("inputs", []):
             if i not in ids:
                 raise ConfigError(f"risk component {c.get('id')}: unknown input series {i!r}")
+    idle = cfg.get("server", {}).get("idle_shutdown_minutes", 5)
+    if not isinstance(idle, (int, float)) or idle < 0:
+        raise ConfigError("server.idle_shutdown_minutes must be 0 (keep running) or a positive number of minutes")
     port = cfg.get("server", {}).get("port", 8765)
     if not (0 < int(port) < 65536):
         raise ConfigError("server.port out of range")

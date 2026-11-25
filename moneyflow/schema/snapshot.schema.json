@@ -85,7 +85,8 @@
       "picks": {"type": "array", "items": {"type": "object", "required": ["slot", "symbol", "why"]}},
       "candidates": {"type": "array", "items": {"type": "object"}, "description": "the five highest screen scores, picked or not"},
       "not_listed": {"type": "array", "items": {"type": "string"}, "description": "configured tickers without a perpetual"},
-      "positions": {"type": "array"}, "note": {"type": "string"}}},
+      "positions": {"type": "array"}, "note": {"type": "string"},
+      "loading": {"type": "array", "items": {"type": "string"}, "description": "picked stocks whose history and live feed are still loading (shown once in)"}}},
     "edge": {"type": "object", "required": ["from", "to", "weight", "share", "from_z", "to_z"], "properties": {
       "from": {"type": "string"}, "to": {"type": "string"},
       "weight": {"type": "number", "description": "sqrt(|z_from| * z_to) * (1 - corr) / 2"},

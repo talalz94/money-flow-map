@@ -19,6 +19,9 @@ push_interval_s = 1.0             # WebSocket / SSE update cadence
 token = ""                        # optional shared secret for /api, /ws, /sse (header X-Moneyflow-Token or ?token=)
 cors_origin = "*"                 # GET-only CORS for other local apps ("" disables)
 allowed_hosts = []                # extra Host headers accepted besides localhost (DNS-rebinding guard)
+idle_shutdown_minutes = 5         # stop by itself this long after the last dashboard tab or app leaves
+                                  # (or if never opened): no WebSocket/SSE stream and no request or
+                                  # webhook delivery meanwhile. 0 = keep running (also: --stay-running)
 
 [keys]
 # .env files to read API keys from (relative to the project folder). Values are read at runtime
