@@ -528,3 +528,193 @@ def test_engine_resume_resyncs_and_kicks_every_connector(cfg, keys):
             await eng.on_resume(gap=60)
         return kicked
     assert sorted(asyncio.run(go())) == ["a", "b", "c"]
+
+
+# ── a sleep or a network outage: empty steps, never the old price as live; back-filled with retries ──
+def _gap_engine(cfg, keys, t0, tmp_path):
+    clk = clock.Clock(fixed=t0)
+    eng = Engine(cfg, keys, clk)
+    eng.cache_dir = tmp_path
+    eng.connectors = {}
+    eng.cfg = dict(cfg, connectors=dict(cfg["connectors"], yahoo={"enabled": False}))
+    eng.seed_state["state"] = "done"
+    eng.BACKFILL_SETTLE, eng.BACKFILL_FIRST, eng.BACKFILL_MAX = 0.0, 0.01, 0.02
+    return eng, clk
+
+
+def _exchange(truth, fail):
+    """Binance's klines of `truth(t)` (the close at the step's end); `fail()` says when DNS is down."""
+    calls = []
+
+    async def klines(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        calls.append(symbol)
+        if fail():
+            raise OSError(11001, "getaddrinfo failed")
+        step = 300 if interval == "5m" else 60
+        t = (start_ms // 1000 // step) * step
+        rows = []
+        while t + step <= end_ms / 1000:
+            rows.append((t, truth(t + step), 1.0, 0.5))
+            t += step
+        return rows
+    return klines, calls
+
+
+def test_wake_with_dns_down_then_back_fills_the_gap_and_leaves_nothing_carried_as_live(cfg, keys, monkeypatch, tmp_path):
+    """25 Nov: the PC woke, DNS was down, every refill request failed and the one-shot refill never
+    tried again, so the night stayed in the history as the pre-sleep price, flagged live (Bitcoin flat
+    for 26 steps, σ too low). Now the steps that passed asleep are EMPTY (not live), and the back-fill
+    retries with back-off until DNS is back, then fills them with the exchange's own prices."""
+    from moneyflow import stats
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    t0 = 1795528800.0                                      # on a 5-minute boundary
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    truth = lambda t: 100.0 + (t - t0) / 3600.0             # noqa: E731 - the exchange: +1 an hour
+    for s in range(0, 601, 10):                             # 10 minutes of live ticks
+        clk.set_fixed(t0 + s)
+        btc.on_price(truth(t0 + s), t0 + s, t0 + s)
+        eng.tick()
+    wake = t0 + 600 + 7200                                   # two hours asleep
+    clk.set_fixed(wake)
+    eng.tick()                                               # the first tick after waking closes those steps
+    asleep = range(int((t0 + 900) // G5_STEP), int((wake - 300) // G5_STEP))
+    assert all(btc.g5.get(k) != btc.g5.get(k) and not btc.g5.is_live(k) for k in asleep)   # empty, not carried
+    assert btc.holes["g5"] is not None and btc.holes["g1"] is not None
+    assert stats.price_at(btc, wake - 1800, wake) != stats.price_at(btc, wake - 1800, wake)  # unknown, not 100.17
+    attempts = lambda: eng.backfill_state.get("attempt", 0)  # noqa: E731
+    klines, calls = _exchange(truth, fail=lambda: attempts() <= 2)                 # DNS down for two tries
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["state"] == "done" and eng.backfill_state["attempts"] == 3
+    assert btc.holes == {"g1": None, "g5": None}
+    for k in asleep:                                         # the exchange's prices, live
+        assert btc.g5.get(k) == truth((k + 1) * G5_STEP) and btc.g5.is_live(k)
+    assert stats.price_at(btc, wake - 1800, wake) == truth(wake - 1800)
+    assert len(set(btc.g5.get(k) for k in asleep)) == len(asleep)                   # no flat stretch left
+
+
+def test_an_outage_while_awake_is_back_filled_once_the_feed_is_back(cfg, keys, monkeypatch, tmp_path):
+    """No sleep, the network just drops: the feed falls silent (no heartbeat), its steps are empty, and
+    the back-fill starts when it delivers again (a recovered feed cuts the back-off short once)."""
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G1_STEP
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    truth = lambda t: 200.0 - (t - t0) / 600.0              # noqa: E731
+    for s in range(0, 1801, 5):                              # live, then silent 10:00-25:00, then live again
+        clk.set_fixed(t0 + s)
+        if not 600 <= s < 1500:
+            btc.on_price(truth(t0 + s), t0 + s, t0 + s)
+        eng.tick()
+    silent = range(int((t0 + 660) // G1_STEP), int((t0 + 1500) // G1_STEP))
+    assert all(btc.g1.get(k) != btc.g1.get(k) for k in silent) and btc.recovered
+    klines, _ = _exchange(truth, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng._backfill("the feeds are back"))
+    assert all(btc.g1.get(k) == truth((k + 1) * G1_STEP) and btc.g1.is_live(k) for k in silent)
+
+
+def test_housekeeping_starts_the_backfill_and_a_recovered_feed_cuts_its_back_off_short(cfg, keys, tmp_path):
+    """Every 5 s: holes start the back-fill; while it waits out a back-off, a feed that delivers again
+    wakes it, once per recovery (not every 5 s while the exchange's REST may still be failing)."""
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    started = []
+    eng.want_backfill = started.append
+    eng.check_holes()
+    assert started == []                                      # no holes, nothing to do
+    btc.holes["g5"] = 1795528800.0 - 3600
+    eng.check_holes()
+    assert started == ["network outage"]
+    eng._backfill_task = types.SimpleNamespace(done=lambda: False)      # running, waiting out a back-off
+    eng.check_holes()
+    assert started == ["network outage"]                      # not restarted, not woken
+    btc.recovered = True                                      # the feed delivers again
+    eng.check_holes()
+    eng.check_holes()
+    assert started == ["network outage", "the feeds are back"] and not btc.recovered
+
+
+def test_a_gap_the_exchange_has_no_data_for_is_given_up_not_retried_forever(cfg, keys, monkeypatch, tmp_path):
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    btc.on_price(100.0, t0, t0)
+    eng.tick()
+    clk.set_fixed(t0 + 3600)
+    eng.tick()
+    calls = []
+
+    async def nothing(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        calls.append(symbol)
+        return []                                            # answered, but no data for that range
+    monkeypatch.setattr(bn, "fetch_klines", nothing)
+    asyncio.run(asyncio.wait_for(eng._backfill("wake"), timeout=5))
+    assert btc.holes == {"g1": None, "g5": None} and eng.backfill_state["state"] == "done"
+
+
+def test_an_old_cache_with_a_flat_live_night_is_downloaded_again(cfg, keys, monkeypatch, tmp_path):
+    """A cache from before this fix (version 1) can hold a sleep's flat stretch flagged live, like
+    the 25 Nov night. Its whole range is downloaded again at the next start; a newer cache's empty
+    steps (a past outage) are downloaded too, not left as holes for good."""
+    import json
+    from moneyflow import history
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    now = 1795528800.0
+    truth = lambda t: 100.0 + (t - now) / 86400.0           # noqa: E731
+    old, _ = _gap_engine(cfg, keys, now, tmp_path)
+    btc = old.instruments["binance_spot:BTCUSDT"]
+    k_now = int(now // G5_STEP)
+    rows = [(k * G5_STEP, truth((k + 1) * G5_STEP)) for k in range(k_now - 2000, k_now)]
+    flat = range(k_now - 300, k_now - 274)                    # 26 steps carried at one price
+    rows = [(t, rows[int(t // G5_STEP) - k_now + 2000 - 1][1] if int(t // G5_STEP) in flat else c)
+            for t, c in rows]
+    btc.seed("g5", rows, now)
+    assert all(btc.g5.is_live(k) for k in flat)
+    history.save(tmp_path, btc)
+    f = next(tmp_path.glob("binance_spot_BTCUSDT.json"))
+    d = json.loads(f.read_text())
+    d["v"] = 1                                               # written by the old code
+    f.write_text(json.dumps(d))
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path)
+    klines, calls = _exchange(truth, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    b2 = eng.instruments["binance_spot:BTCUSDT"]
+    assert all(b2.g5.get(k) == truth((k + 1) * G5_STEP) for k in flat)                # the real prices now
+    assert b2.holes == {"g1": None, "g5": None}
+    assert json.loads(f.read_text())["v"] == history.VERSION == 2
+    # a version-2 cache with empty steps (a past outage): marked, and filled at the next start
+    k_hole = k_now - 100
+    b2.g5.put(k_hole, float("nan"), False)
+    history.save(tmp_path, b2)
+    eng3, _ = _gap_engine(cfg, keys, now, tmp_path)
+    b3 = eng3.instruments["binance_spot:BTCUSDT"]
+    history.load(tmp_path, b3, now)
+    assert b3.holes["g5"] == k_hole * G5_STEP
+    asyncio.run(eng3.seed_history(incremental=True))
+    assert b3.g5.get(k_hole) == truth((k_hole + 1) * G5_STEP) and b3.holes["g5"] is None
+
+
+
+def test_a_quiet_market_on_a_live_feed_is_covered_by_the_feeds_heartbeat(cfg, keys, tmp_path):
+    """No new price for minutes is normal for a quiet market: while the instrument's connector keeps
+    delivering (pings, other symbols), its steps carry the price and stay live, with no hole."""
+    from moneyflow.series import G1_STEP
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    health = types.SimpleNamespace(last_msg=None, last_ok=None)
+    eng.connectors = {"binance_spot": types.SimpleNamespace(health=health)}
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    btc.on_price(100.0, t0, t0)
+    for s in range(0, 901, 5):                                # 15 quiet minutes, the feed pinging
+        clk.set_fixed(t0 + s)
+        health.last_msg = t0 + s
+        eng.tick()
+    ks = range(int(t0 // G1_STEP), int((t0 + 840) // G1_STEP))
+    assert all(btc.g1.get(k) == 100.0 and btc.g1.is_live(k) for k in ks) and btc.holes == {"g1": None, "g5": None}

@@ -7,9 +7,13 @@ import math
 import re
 from pathlib import Path
 
+from . import clock
 from .series import Instrument, NaN
 
-VERSION = 1
+# 2: a step its feed did not cover is never flagged live (it is empty until back-filled). A version-1
+# cache can hold a sleep's or an outage's flat stretch flagged live (25 Nov: Bitcoin flat for 26
+# steps), so its whole range is downloaded again once.
+VERSION = 2
 
 
 def _file(dirpath: Path, inst: Instrument) -> Path:
@@ -59,7 +63,7 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
         d = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if d.get("v") != VERSION or d.get("key") != inst.key:
+    if d.get("v") not in (1, VERSION) or d.get("key") != inst.key:
         return None
     for name in ("g1", "g5"):
         part = d.get(name)
@@ -85,7 +89,27 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
         if last == last and not (inst.price == inst.price):
             inst.price = last
             inst.ts = (inst.g5.last_k + 1) * inst.g5.step
+    mark_holes(inst, untrusted=d.get("v") != VERSION)
     return inst.g5.last_k
+
+
+def mark_holes(inst: Instrument, untrusted: bool = False) -> None:
+    """Register what a loaded cache lacks, so the history download fills it: steps of an open market
+    with no value (a past sleep or outage) and, from a version-1 cache, its whole range."""
+    for name in ("g1", "g5"):
+        g = getattr(inst, name)
+        if g.last_k is None:
+            continue
+        first = next((k for k in range(g.first_k(), g.last_k + 1) if g.get(k) == g.get(k)), None)
+        if first is None:
+            continue
+        if untrusted:
+            inst._hole(name, first * g.step)
+            continue
+        for k in range(first, g.last_k + 1):
+            if g.get(k) != g.get(k) and clock.market_open(inst.hours, (k + 1) * g.step - 1):
+                inst._hole(name, k * g.step)
+                break
 
 
 def last_good_ts(inst: Instrument) -> float | None:

@@ -140,6 +140,12 @@ class Instrument:
         self.lat_ms: deque = deque(maxlen=400)
         self.msgs = 0
         self._live_seen = False             # a LIVE message arrived this session (cache/history do not count)
+        # the newest moment real data covered (a message for it, or its feed's heartbeat): a step its
+        # feed did not cover (a sleep, a network outage) is unknown, never the old price carried as live
+        self._seen_ts = NaN
+        self.holes: dict[str, float | None] = {"g1": None, "g5": None}   # first such step, until back-filled
+        self._gap_open = False              # the last closed step was uncovered...
+        self.recovered = False              # ...and since then one was covered: the feed is back
         self._k1 = None                     # open (not yet closed) 1-minute step
         self._k5 = None                     # open 5-minute step
         self._open_any = False              # did the open steps see a real update?
@@ -158,6 +164,7 @@ class Instrument:
             self.extra["ext_price"], self.extra["ext_ts"] = price, ev
             self.recv_ts = recv_ts
             self.msgs += 1
+            self.feed_alive(recv_ts)
             return
         if self._k1 is not None and int(ev // G1_STEP) > self._k1:
             self.roll(ev)                   # close finished steps with the previous price
@@ -168,6 +175,7 @@ class Instrument:
         self.recv_ts = recv_ts
         self.msgs += 1
         self._live_seen = True
+        self.feed_alive(recv_ts)
         if ev_ts is not None and measure:
             lat = (recv_ts - ev_ts) * 1000.0
             if lat <= 60_000:
@@ -182,10 +190,21 @@ class Instrument:
     def live_seen(self) -> bool:
         return self._live_seen
 
+    def feed_alive(self, ts: float | None) -> None:
+        """Real data, or the feed's own heartbeat, reached us at `ts` (local, NTP-corrected)."""
+        if ts is not None and not (self._seen_ts >= ts):
+            self._seen_ts = ts
+
+    def _hole(self, grid: str, t0: float) -> None:
+        h = self.holes.get(grid)
+        if h is None or t0 < h:
+            self.holes[grid] = t0
+
     def note_message(self, recv_ts: float, ev_ts: float | None = None) -> None:
         """A message that proves the feed is alive without a new price (e.g. an unchanged quote)."""
         self.recv_ts = recv_ts
         self.msgs += 1
+        self.feed_alive(recv_ts)
         if ev_ts is not None:
             self.lat_ms.append((recv_ts - ev_ts) * 1000.0)
 
@@ -221,22 +240,41 @@ class Instrument:
         # flagged live, it froze the bonds node at that close for the whole US session instead of
         # letting it follow its 24/7 proxy.
         traded = self._live_seen
+        # ...and only for a step its feed covered: data or a heartbeat at or after the step's start. A
+        # step that passed while the PC slept or the network was down is UNKNOWN (NaN, not live) until
+        # it is back-filled from the exchange. Carried as live, the 25 Nov night (Bitcoin flat for
+        # 26 steps) made σ too low and every Binance series differ from the exchange.
+        seen = self._seen_ts
         start = max(self._k1, k1_now - G1_SIZE)
         for k in range(start, k1_now):
-            t_end = (k + 1) * G1_STEP
-            self.g1.put(k, p, traded and clock.market_open(self.hours, t_end - 1))
+            t0 = k * G1_STEP
+            open_ = clock.market_open(self.hours, t0 + G1_STEP - 1)
+            if traded and open_ and not (seen >= t0):
+                self.g1.put(k, NaN, False)
+                self._hole("g1", t0)
+                self._gap_open = True
+            else:
+                self.g1.put(k, p, traded and open_)
+                if self._gap_open and traded and open_:
+                    self._gap_open, self.recovered = False, True
         k5_now = int(now // G5_STEP)
         if k5_now > self._k5:
             for k in range(max(self._k5, k5_now - G5_SIZE), k5_now):
-                t_end = (k + 1) * G5_STEP
-                self.g5.put(k, p, traded and clock.market_open(self.hours, t_end - 1))
+                t0 = k * G5_STEP
+                open_ = clock.market_open(self.hours, t0 + G5_STEP - 1)
+                covered = not (traded and open_ and not (seen >= t0))
+                if covered:
+                    self.g5.put(k, p, traded and open_)
+                else:
+                    self.g5.put(k, NaN, False)
+                    self._hole("g5", t0)
                 if self.v5 is not None:
-                    self._close_volume(k)
+                    self._close_volume(k, covered)
             self._k5 = k5_now
         self._k1 = k1_now
         self._open_any = False
 
-    def _close_volume(self, k5: int) -> None:
+    def _close_volume(self, k5: int, covered: bool = True) -> None:
         m0 = k5 * (G5_STEP // G1_STEP)
         q = tb = 0.0
         seen = False
@@ -260,7 +298,7 @@ class Instrument:
                     tb_known = False
         if seen:
             self.v5.put(k5, q, tb if tb_known else NaN)
-        elif self._live_seen and clock.market_open(self.hours, (k5 + 1) * G5_STEP - 1):
+        elif covered and self._live_seen and clock.market_open(self.hours, (k5 + 1) * G5_STEP - 1):
             self.v5.put(k5, 0.0, 0.0)       # a quiet step on a live feed (no feed: unknown, not zero)
         # drop anything older than this step (late messages)
         for d in (self._vol_min, self._vol_acc):
@@ -295,6 +333,9 @@ class Instrument:
                 k = int(t // step)
                 if k < k_until:
                     self.v5.put(k, q, tb)
+        h = self.holes.get(grid)
+        if h is not None and by_k and k_first * step <= h and max(by_k) * step >= h:
+            self.holes[grid] = None          # the exchange's own data now covers the gap
         if self.price != self.price and last == last:            # no live price yet: use the last close
             self.price = last
             self.ts = closes[-1][0] + step
@@ -324,6 +365,11 @@ class Derived(Instrument):
     def value_step(self, grid: str, k: int) -> float:
         raise NotImplementedError
 
+    def inputs_live(self, grid: str, k: int) -> bool:
+        """A computed step is live only if what it is computed from was (a step its inputs carried
+        through a sleep or an outage is not trading, whatever the market hours say)."""
+        return all(getattr(i, grid).is_live(k) for i in self.inputs)
+
     def refresh(self, now: float) -> None:
         """Recompute the live value and close finished steps from the inputs' grids."""
         k1_now = int(now // G1_STEP)
@@ -333,12 +379,14 @@ class Derived(Instrument):
                 for k in range(max(self._k5, k5_now - G5_SIZE), k5_now):
                     v = self.value_step("g5", k)
                     if isnum(v):
-                        self.g5.put(k, v, clock.market_open(self.hours, (k + 1) * G5_STEP - 1))
+                        self.g5.put(k, v, clock.market_open(self.hours, (k + 1) * G5_STEP - 1)
+                                    and self.inputs_live("g5", k))
                 self._k5 = k5_now
             for k in range(max(self._k1, k1_now - G1_SIZE), k1_now):
                 v = self.value_step("g1", k)
                 if isnum(v):
-                    self.g1.put(k, v, clock.market_open(self.hours, (k + 1) * G1_STEP - 1))
+                    self.g1.put(k, v, clock.market_open(self.hours, (k + 1) * G1_STEP - 1)
+                                and self.inputs_live("g1", k))
         if self._k1 is None or k1_now > self._k1:
             self._k1, self._k5 = k1_now, int(now // G5_STEP)
         v = self.value_live(now)
@@ -361,7 +409,7 @@ class Derived(Instrument):
             for k in range(k0, int(until // g.step)):
                 v = self.value_step(gname, k)
                 if isnum(v):
-                    g.put(k, v, clock.market_open(self.hours, (k + 1) * g.step - 1))
+                    g.put(k, v, clock.market_open(self.hours, (k + 1) * g.step - 1) and self.inputs_live(gname, k))
         self._k1, self._k5 = int(until // G1_STEP), int(until // G5_STEP)
         v = self.value_live(until)
         if isnum(v):
@@ -528,6 +576,9 @@ class Stitched(Derived):
     def live_seen(self) -> bool:
         return (self._active or self.proxy).live_seen
 
+    def inputs_live(self, grid: str, k: int) -> bool:
+        return getattr(self.primary, grid).is_live(k) or getattr(self.proxy, grid).is_live(k)
+
     def value_step(self, grid: str, k: int) -> float:
         g = getattr(self, grid)
         gp, gx = getattr(self.primary, grid), getattr(self.proxy, grid)
@@ -560,6 +611,10 @@ class Stitched(Derived):
         k1 = int(now // G1_STEP) - 1
         base = self.g1.get(k1)
         xb = self.proxy.g1.get(k1)
+        if isnum(base) and not isnum(xb):
+            # the proxy's step is empty (its feed was down): the chain carried its value from the
+            # proxy's last known close, so the move runs from there
+            xb = self.proxy.g1.asof((k1 + 1) * G1_STEP, max_back=G1_SIZE)
         x = self.proxy.price
         if not isnum(base):
             base = self.primary.price

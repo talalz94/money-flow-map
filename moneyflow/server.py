@@ -328,7 +328,8 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
         now = engine.clock.now()
         srcs = engine.sources(now)
         return _json({"status": "ok", "version": __version__, "process": engine.process_info(),
-                      "clock": engine.clock.info(), "history": engine.seed_state, "resumes": engine.resumes,
+                      "clock": engine.clock.info(), "history": engine.seed_state, "backfill": engine.backfill_state,
+                      "resumes": engine.resumes,
                       "clients": hub.n_clients, "idle": idle.info(), "webhooks": {"targets": len(hub.webhooks.targets),
                                                              "sent": hub.webhooks.sent, "failed": hub.webhooks.failed},
                       "connectors": {s["id"]: s["state"] for s in srcs}})

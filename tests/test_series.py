@@ -29,10 +29,21 @@ def test_instrument_rolls_steps_and_carries_forward():
     inst.on_price(101.0, t0 + 50, t0 + 50.1)
     inst.on_price(102.0, t0 + 61, t0 + 61.1)                     # next minute closes the first at 101
     assert inst.g1.get(int(t0 // 60)) == 101.0
-    inst.roll(t0 + 5 * 60 + 1)                                   # idle: carried forward
+    inst.feed_alive(t0 + 5 * 60)                                 # a quiet market: the feed's heartbeat
+    inst.roll(t0 + 5 * 60 + 1)                                   # idle on a live feed: carried forward
     assert inst.g1.get(int(t0 // 60) + 4) == 102.0
     assert inst.g5.get(int(t0 // 300)) == 102.0 and inst.g5.is_live(int(t0 // 300))
     assert inst.latency_ms() == pytest.approx(100.0, abs=1)
+    # the feed goes quiet with no heartbeat (asleep, or the network down): unknown, not the old price
+    inst.roll(t0 + 20 * 60 + 1)
+    for k in range(int(t0 // 60) + 6, int(t0 // 60) + 20):
+        assert inst.g1.get(k) != inst.g1.get(k) and not inst.g1.is_live(k)
+    assert inst.g5.get(int(t0 // 300) + 2) != inst.g5.get(int(t0 // 300) + 2)
+    assert not inst.g5.is_live(int(t0 // 300) + 2) and inst.holes["g5"] == t0 + 600
+    assert inst.v5.get(int(t0 // 300) + 2)[0] != inst.v5.get(int(t0 // 300) + 2)[0]     # volume unknown, not 0
+    inst.on_price(103.0, t0 + 20 * 60 + 5, t0 + 20 * 60 + 5.1)  # the feed is back
+    inst.roll(t0 + 21 * 60 + 1)
+    assert inst.g1.get(int(t0 // 60) + 20) == 103.0 and inst.g1.is_live(int(t0 // 60) + 20) and inst.recovered
 
 
 def test_latency_excludes_polled_prices_and_late_prints():
@@ -177,3 +188,26 @@ def test_stitched_uses_primary_when_open_and_scaled_proxy_otherwise():
     st.refresh(t_eve + 62)
     assert st.active_source(t_eve + 62) is prox
     assert st.price == pytest.approx(80.0 * (1 + 0.03 / 3), rel=1e-6)
+
+
+
+def test_a_computed_series_is_not_live_while_its_inputs_were_down():
+    """Bonds outside US hours follow the TMF proxy. While the proxy's feed is down the chain carries
+    its last value: a known value, but not trading, so not live (σ must not count it)."""
+    prim = Instrument("alpaca:TLT", "alpaca", "TLT", "us_regular")
+    prox = Instrument("bf:TMF", "bf", "TMF", "24/7")
+    st = Stitched("s", prim, prox, beta=3.0)
+    t0, quiet_from = ny_ts(2026, 11, 24, 15, 58), ny_ts(2026, 11, 24, 18, 5)
+    prim.on_price(80.0, t0, t0)                               # TLT's close anchors the chain
+    prox.on_price(30.0, t0, t0)
+    st.refresh(t0)
+    for tt in range(int(t0) + 60, int(ny_ts(2026, 11, 24, 18, 20)) + 1, 60):
+        if tt <= quiet_from:                                  # the proxy ticks, then its feed goes down
+            prox.on_price(30.0 + (tt - t0) / 1e5, tt, tt)
+        prox.roll(tt + 1)
+        prim.roll(tt + 1)
+        st.refresh(tt + 1)
+    k_live, k_down = int(ny_ts(2026, 11, 24, 17, 30) // G1_STEP), int(ny_ts(2026, 11, 24, 18, 15) // G1_STEP)
+    assert st.g1.is_live(k_live) and prox.g1.is_live(k_live)             # TLT closed, the proxy live
+    assert not prox.g1.is_live(k_down) and not st.g1.is_live(k_down)     # the proxy down: carried, not live
+    assert st.g1.get(k_down) == st.g1.get(k_down)                         # (still a value: the chain's last)

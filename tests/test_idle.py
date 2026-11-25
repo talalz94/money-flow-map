@@ -143,3 +143,35 @@ def test_serve_stays_up_while_an_app_streams_then_stops(tmp_path, keys, no_feeds
     assert events["health"]["streams"] == 1 and events["health"]["stops_in_s"] is None
     assert 1.0 <= events["stopped_after_s"] < 6
     assert _port_free(port)
+
+
+def test_auto_stop_still_works_while_a_backfill_keeps_retrying(tmp_path, keys, monkeypatch):
+    """A back-fill retrying against a dead network (DNS down) must not keep the app up, block the
+    loop, or hang the stop: the auto-stop fires on time and stop() cancels the back-fill."""
+    from moneyflow.connectors import binance as bn
+    calls = []
+
+    async def dns_down(*a, **k):
+        calls.append(1)
+        raise OSError(11001, "getaddrinfo failed")
+    monkeypatch.setattr(bn, "fetch_klines", dns_down)
+
+    engines = []
+
+    async def start(self):                     # no live feeds: just a gap, and its failing back-fill
+        engines.append(self)
+        self.cfg = dict(self.cfg, connectors=dict(self.cfg["connectors"], yahoo={"enabled": False}))
+        self.BACKFILL_SETTLE, self.BACKFILL_FIRST, self.BACKFILL_MAX = 0.0, 0.05, 0.1
+        self.seed_state["state"] = "done"
+        self.instruments["binance_spot:BTCUSDT"].holes["g5"] = self.clock.now() - 3600
+        self.want_backfill("test")
+    monkeypatch.setattr(Engine, "start", start)
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0.02)        # a 1.2 s grace
+    t0 = time.monotonic()
+    asyncio.run(asyncio.wait_for(cli.serve(cfg, keys, dashboard=False, open_browser=False), timeout=20))
+    took = time.monotonic() - t0
+    assert 1.2 <= took < 6, took                  # stopped on time, the back-fill did not hold it up
+    assert len(calls) >= 3                        # ...while it kept retrying
+    assert engines[0]._backfill_task.done() and engines[0].backfill_state.get("state") == "retrying"
+    assert _port_free(port)

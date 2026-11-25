@@ -83,6 +83,10 @@ class Engine:
         self.listeners: list = []
         self.started_at = time.time()
         self.seed_state = {"state": "pending", "done": 0, "total": 0, "errors": []}
+        # filling what a sleep or a network outage left empty (shown under /api/health "backfill")
+        self.backfill_state: dict = {"state": "idle"}
+        self._backfill_task: asyncio.Task | None = None
+        self._backfill_wake: asyncio.Event | None = None
         self.resumes = 0
         self._last_wall = time.time()
         self._tasks: list[asyncio.Task] = []
@@ -286,14 +290,16 @@ class Engine:
                 self._spawn(self._start_stock(sym), f"stock:{sym}")
         ent["picked_at"] = now
 
-    def _spawn(self, coro, name: str) -> None:
-        """Run a background task, keeping a reference to it (an unreferenced task can be collected)."""
+    def _spawn(self, coro, name: str) -> asyncio.Task | None:
+        """Run a background task, keeping a reference to it (an unreferenced task can be collected);
+        stop() cancels it."""
         try:
             task = asyncio.get_running_loop().create_task(coro, name=name)
         except RuntimeError:                                 # no event loop (offline use, tests)
             coro.close()
-            return
+            return None
         self._tasks = [t for t in self._tasks if not t.done()] + [task]
+        return task
 
     async def _start_stock(self, sym: str) -> None:
         """History (cache first, then the missing tail) and the live index price of a picked stock."""
@@ -304,6 +310,9 @@ class Engine:
         try:
             history.load(self.cache_dir, inst, now)
             last = history.last_good_ts(inst)
+            for h in inst.holes.values():                 # a gap in the cache (or an old cache): from there
+                if h is not None:
+                    last = min(last or h, h)
             days = int(self.cfg.get("general", {}).get("history_days", 35))
             since5 = max(now - days * 86400, (last or 0) - 600)
             await self._binance_history(inst, since5, max(now - 86400 + 60, since5 - 600), now)
@@ -512,10 +521,11 @@ class Engine:
         inst.seed("g5", [(t, c) for t, c, _, _ in k5], now, [(t, q, tb) for t, _, q, tb in vol])
         inst.seed("g1", [(t, c) for t, c, _, _ in k1], now)
 
-    async def seed_history(self, incremental: bool = False, since: float | None = None) -> None:
-        """Fill the grids: disk cache first, then REST for whatever is missing. `since` (after a sleep)
-        forces a re-download from that time: the gap was filled with the last pre-sleep price by the
-        clock tick, so "the newest cached step" would wrongly say there is nothing to fetch."""
+    async def seed_history(self, incremental: bool = False, since: float | None = None,
+                           state: dict | None = None) -> None:
+        """Fill the grids: disk cache first, then REST for whatever is missing: from the newest good
+        step, or from the first step a live feed left empty (a sleep, a network outage: `holes`),
+        or from `since`. Instruments whose download failed are listed in state["failed"]."""
         from .connectors import alpaca as alp, hyperliquid as hl, pollers
         now = self.clock.now()
         days = int(self.cfg.get("general", {}).get("history_days", 35))
@@ -525,9 +535,13 @@ class Engine:
             t = history.last_good_ts(inst) or horizon
             if since is not None:
                 t = min(t, since)
+            for h in inst.holes.values():
+                if h is not None:
+                    t = min(t, h)
             return max(horizon, t - 600)
-        st = self.seed_state
-        st.update(state="running", done=0, errors=[], started=clock.iso(now))
+        startup = state is None
+        st = self.seed_state if startup else state
+        st.update(state="running", done=0, errors=[], failed=[], started=clock.iso(now))
         insts = [i for i in self.instruments.values() if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")]
         st["total"] = len(insts) + 2
         if not incremental:
@@ -551,6 +565,7 @@ class Engine:
                         inst.seed("g1", [(t, c) for t, c, _, _ in k1], now)
                 except Exception as e:  # noqa: BLE001
                     st["errors"].append(self.keys.redact(f"{inst.key}: {e}")[:200])
+                    st["failed"].append(inst.key)
                     log.warning("history %s: %s", inst.key, self.keys.redact(e))
                 finally:
                     st["done"] += 1
@@ -570,6 +585,9 @@ class Engine:
                         # carried price, which says nothing about the sessions since. Five days of
                         # bars cover a recent cache; otherwise take the full 60.
                         last = history.last_good_ts(i)
+                        for h in i.holes.values():
+                            if h is not None:
+                                last = min(last or h, h)
                         rng = "5d" if last and now - last < 4 * 86400 else "60d"
                         try:
                             rows = await pollers.yahoo_chart(self.ctx.session, i.symbol, "5m", rng)
@@ -583,6 +601,7 @@ class Engine:
                                 i.seed("g1", rows1, rows1[-1][0] + 60)
                         except Exception as e:  # noqa: BLE001
                             st["errors"].append(f"yahoo {i.symbol}: {e}"[:200])
+                            st["failed"].append(i.key)
                 st["done"] += len(alp_insts)
                 return
             try:
@@ -598,6 +617,7 @@ class Engine:
                         i.seed("g1", [(t, c) for t, c, _ in rows1], now)
             except Exception as e:  # noqa: BLE001
                 st["errors"].append(self.keys.redact(f"alpaca: {e}")[:200])
+                st["failed"].extend(i.key for i in alp_insts)
                 log.warning("history alpaca: %s", self.keys.redact(e))
             finally:
                 st["done"] += len(alp_insts)
@@ -645,7 +665,8 @@ class Engine:
         self._cache.clear()
         st.update(state="done", finished=clock.iso(now))
         self.save_cache()
-        log.info("history ready (%d instruments, %d errors)", len(insts), len(st["errors"]))
+        if startup:
+            log.info("history ready (%d instruments, %d errors)", len(insts), len(st["errors"]))
 
     def _funding_only(self) -> set:
         used = set()
@@ -675,10 +696,23 @@ class Engine:
             self._cache.clear()
         self._roll_seen = roll
         for inst in self.instruments.values():
+            inst.feed_alive(self._feed_seen(inst.source))   # a quiet market on a live feed is covered
             inst.roll(now)
         self._ensure_share_anchor(now)
         for d in self.derived:
             d.refresh(now)
+
+    FEEDS = {"alpaca": ("alpaca", "alpaca_rest")}    # the connectors that deliver a source's prices
+
+    def _feed_seen(self, source: str) -> float | None:
+        """The newest message or successful poll of the connector(s) feeding `source`."""
+        best = None
+        for name in self.FEEDS.get(source, (source,)):
+            h = getattr(self.connectors.get(name), "health", None)
+            for t in (getattr(h, "last_msg", None), getattr(h, "last_ok", None)):
+                if t is not None and (best is None or t > best):
+                    best = t
+        return best
 
     def _ensure_share_anchor(self, now: float) -> None:
         """Anchor the stablecoin share as soon as everything it needs is in: the total market cap,
@@ -1185,6 +1219,8 @@ class Engine:
                 log.warning("wall clock jumped %.0fs (sleep/hibernate?): resyncing and reconnecting", gap)
                 await self.on_resume(gap)
                 last_sync = time.time()
+            elif self.seed_state.get("state") == "done":
+                self.check_holes()
             if time.time() - last_sync > 1800:
                 await self.clock.sync()
                 last_sync = time.time()
@@ -1196,20 +1232,114 @@ class Engine:
         conn = self.ctx.session.connector if self.ctx.session else None
         if conn is not None and hasattr(conn, "clear_dns_cache"):
             conn.clear_dns_cache()
-        gap_start = self.clock.now() - gap
         await self.clock.sync()
         for c in self.connectors.values():
             c.kick()
-        if gap > 120:
-            self._refill_task = asyncio.create_task(self._refill(gap_start))
+        self.want_backfill("wake")          # the steps that passed asleep are holes since the next tick
 
-    async def _refill(self, gap_start: float):
-        await asyncio.sleep(10)     # let the network come back first
+    # ── back-fill: what a sleep or a network outage left empty ──────────────────────────────
+    BACKFILL_SETTLE = 10.0                  # let the network come back first
+    BACKFILL_FIRST, BACKFILL_MAX = 30.0, 900.0
+
+    def _fillable(self, inst: Instrument) -> bool:
+        """Can the exchange's REST history fill this instrument's holes?"""
+        if inst.source in ("binance_spot", "binance_fut"):
+            return not (inst.source == "binance_fut" and inst.symbol in self._funding_only())
+        if inst.source == "hyperliquid":
+            return "hyperliquid" in self.connectors
+        if inst.source == "alpaca":
+            c = self.connectors.get("alpaca")
+            return bool(c is not None and c.available()[0]) or cfgmod.connector_enabled(self.cfg, "yahoo")
+        return False
+
+    def holes(self) -> dict[str, float]:
+        """{instrument: its first step a live feed left empty}, for those the exchange can fill."""
+        out = {}
+        for i in self.instruments.values():
+            hs = [h for h in i.holes.values() if h is not None]
+            if hs and self._fillable(i):
+                out[i.key] = min(hs)
+        return out
+
+    def check_holes(self) -> None:
+        """A network outage while awake leaves holes too (every 5 s): start the back-fill for them, and
+        when a feed that left a hole delivers again, cut the back-off short, once per recovery."""
+        back = [i for i in self.instruments.values() if i.recovered]
+        for i in back:
+            i.recovered = False
+        if self.holes() and (back or self._backfill_task is None or self._backfill_task.done()):
+            self.want_backfill("the feeds are back" if back else "network outage")
+
+    def want_backfill(self, reason: str) -> None:
+        """Start the back-fill (or wake it from its back-off: the feeds are back)."""
+        if self._backfill_task is not None and not self._backfill_task.done():
+            if self._backfill_wake is not None:
+                self._backfill_wake.set()
+            return
+        self._backfill_task = self._spawn(self._backfill(reason), "backfill")
+
+    async def _backfill(self, reason: str) -> None:
+        """Download what a sleep or a network outage left empty, until nothing is missing. After a
+        failure (on 25 Nov the PC woke with DNS down, every request failed and the old one-shot refill
+        never tried again: the gap stayed flat in the history for good) it retries after 30 s,
+        doubling to 15 min, sooner when the feeds come back, and gives up only on a gap older than
+        the history or one the exchange itself has no data for. A task: it never blocks the event
+        loop or the auto-stop, and stop() cancels it."""
+        self._backfill_wake = asyncio.Event()
+        delay = self.BACKFILL_FIRST
         try:
-            await self.seed_history(incremental=True, since=gap_start)
-            log.info("history gap since %s refilled", clock.iso(gap_start))
-        except Exception:  # noqa: BLE001
-            log.exception("gap refill failed")
+            await asyncio.sleep(self.BACKFILL_SETTLE)
+            attempt = 0
+            while True:
+                now = self.clock.now()
+                horizon = now - int(self.cfg.get("general", {}).get("history_days", 35)) * 86400
+                for i in self.instruments.values():         # a gap older than the history is moot
+                    for g, h in list(i.holes.items()):
+                        if h is not None and h < horizon:
+                            i.holes[g] = None
+                todo = self.holes()
+                if not todo:
+                    if attempt:
+                        self.backfill_state = {"state": "done", "reason": reason, "attempts": attempt,
+                                               "finished": clock.iso(now)}
+                    return
+                attempt += 1
+                since = min(todo.values())
+                st = {"reason": reason, "attempt": attempt, "since": clock.iso(since), "missing": sorted(todo)}
+                self.backfill_state = st
+                try:
+                    await self.seed_history(incremental=True, since=since, state=st)
+                except Exception as e:  # noqa: BLE001 - whatever it was, try again later
+                    st.setdefault("errors", []).append(self.keys.redact(e)[:200])
+                    st["failed"] = sorted(todo)
+                left = self.holes()
+                if not left:
+                    self.backfill_state = {"state": "done", "reason": reason, "attempts": attempt,
+                                           "since": clock.iso(since), "finished": clock.iso(self.clock.now())}
+                    log.info("history gap since %s back-filled (%s, attempt %d)", clock.iso(since), reason, attempt)
+                    return
+                failed = set(st.get("failed") or [])
+                for key in [k for k in left if k not in failed]:
+                    # downloaded fine, still empty: the exchange has no data there either
+                    log.info("history %s: no exchange data for the gap since %s; left empty", key, clock.iso(left[key]))
+                    inst = self.instruments[key]
+                    inst.holes = {g: None for g in inst.holes}
+                if not self.holes():
+                    self.backfill_state = {"state": "done", "reason": reason, "attempts": attempt,
+                                           "finished": clock.iso(self.clock.now())}
+                    return
+                st.update(state="retrying", retry_in_s=delay)
+                log.warning("history gap since %s not back-filled yet (%d instruments, e.g. %s): retrying in %.0f s",
+                            clock.iso(since), len(left), (st.get("errors") or ["?"])[0][:120], delay)
+                self._backfill_wake.clear()
+                try:
+                    await asyncio.wait_for(self._backfill_wake.wait(), timeout=delay)
+                    await asyncio.sleep(self.BACKFILL_SETTLE)   # the feeds just came back: let them settle
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(self.BACKFILL_MAX, delay * 2)
+        finally:
+            self._backfill_wake = None
 
     async def stop(self) -> None:
         for t in self._tasks:

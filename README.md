@@ -700,7 +700,21 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 - **Sleep or hibernation.**
   - A watchdog notices the wall clock jumping (more than 25 s in a 5 s tick).
   - It then clears the DNS cache, re-syncs the clock by NTP and **kicks every connector** into an immediate reconnect.
-  - After gaps over 2 minutes it **downloads the missing history** for every instrument.
+  - Then it **back-fills the missing history** from the exchanges (below).
+- **What a sleep or a network outage leaves behind.**
+  - A step counts as data only if its feed covered it: a message, or the feed's own heartbeat (a
+    quiet market on a live feed is fine). A step that passed while the PC slept or the network was
+    down is **empty**: no price, not live. It is never the last price carried forward as if it
+    traded, which made σ too low and the history differ from the exchange (the 25 Nov night).
+    Computed series (the dollar, bonds, the stablecoin share) are live only where their inputs are.
+  - A **back-fill** downloads the empty steps. After a failure (DNS down after waking, no network)
+    it retries after 30 s, doubling to 15 min, and at once when a feed delivers again. It stops only
+    when nothing is missing, when the gap is older than the history, or when the exchange has no
+    data there either. It runs in the background: it never holds up the auto-stop, and it stops
+    with the app. Its state is under `/api/health` (`backfill`).
+  - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
+    before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
+    range is downloaded again once.
   - With no dashboard open, it stops by itself within 5 minutes of the PC waking (auto-stop,
     section 1). An open dashboard reconnects within that time and keeps it running.
 - **Pollers** back off on errors (10 s doubling to 15 min) and recover by themselves.
@@ -721,7 +735,15 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - reconnection after server drops, after silence and after a `kick()`;
   - poller back-off;
   - the resume path;
-  - that the sleep gap is re-downloaded, not left flat. That bug was caught here: the 1-second tick had already filled the gap with the pre-sleep price.
+  - that the sleep gap is re-downloaded, not left flat. That bug was caught here: the 1-second tick had already filled the gap with the pre-sleep price;
+  - a wake with DNS failing for the first two tries: the gap ends filled with the exchange's prices,
+    and no step is left carried as live (it was empty, not live, meanwhile);
+  - an outage while awake, back-filled once the feed is back; a recovered feed waking the back-off
+    once, not every 5 s; a gap the exchange has no data for given up, not retried forever;
+  - a quiet market on a live feed staying live (the heartbeat), and a computed series not live
+    while its input was down;
+  - an old cache with a flat night flagged live, downloaded again; and (`tests/test_idle.py`) the
+    auto-stop firing on time while a back-fill keeps failing.
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -737,8 +759,20 @@ The same test was repeated **in place on the running service** after the verific
 It detected a 154 s jump and all six streams reconnected. **All 11 assets were live again 12 s
 after waking**, and the gap's history was back-filled 15 s after.
 
-Real network loss was not simulated on this PC: that needs admin rights and would cut your
-connection. It is covered by the drop and silence tests and by the same reconnect code.
+**Sleep with DNS down, tested live** (25 Nov 2026, the 25 Nov morning reproduced on test copies
+without keys). Inside each copy the resolver was made to fail, as getaddrinfo did that morning. The
+process was then frozen for 12 minutes, which is what a sleep looks like to the app, and DNS stayed
+down for 2.5 minutes after waking:
+
+| | Before this fix (commit 66ace16) | Now |
+|---|---|---|
+| The sleep's 1-minute steps (16:48-16:57 UTC) | 10 of 10 held the pre-sleep price (58,270.01), flagged live, while Binance moved from 58,241.66 to 58,377.32 | empty while DNS was down, then 10 of 10 equal to Binance's |
+| Back-fill | one try 10 s after waking, failed, never again | 3 tries failed while DNS was down; the 4th, 73 s after DNS came back, filled the gap |
+| `tools/verify_against_exchange.py` (35 days × 6 series) | 6 mismatches: the 25 Nov night still flat in the cache (27-49 steps per series) | all 10,078 steps of all six series equal Binance's (the old cache was downloaded again once), and so do σ and z |
+
+A real network cut needs admin rights and would cut your own connection, so the DNS outage was
+simulated inside the test copy. The websocket drops it causes are covered by the drop and silence
+tests and by the Finnhub relay test (section 10).
 Closing the console window uses the same graceful-stop handler as Ctrl+Break, which was tested;
 closing the window itself was not.
 
@@ -1048,6 +1082,20 @@ new code:
   day), as are 12 for this round's changes.
 - **Not fixed** (section 11): the screen's 1H volume ratio is the last whole hour's; the one-off
   cap can miss an event that straddles the 17:00 roll.
+
+
+**Sixth round (25 Nov 2026): the sleep and outage gap.** The cache held the night of 25 Nov
+(00:30-06:00 UTC) as flat prices flagged live: Bitcoin did not move for 26 five-minute steps. The PC
+had woken from sleep with DNS down. Every history download failed, and the one-shot refill never
+tried again (it even logged "refilled"). Fixed (section 9):
+- a step its feed did not cover is empty, never the old price as live;
+- the back-fill retries until it succeeds;
+- an old cache's range is downloaded again once.
+
+Live, the before and after are in section 9. The tests cover the wake with DNS failing first, an
+outage while awake, the auto-stop while back-fills keep failing, and an old cache. A mutation check
+of this fix (10 changes, from carried steps flagged live again to a back-fill that never retries) is
+caught by them all.
 
 ---
 
