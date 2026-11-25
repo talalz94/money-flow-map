@@ -28,6 +28,7 @@ read as a **local JSON API** (REST, WebSocket, SSE, webhooks) for other apps, pl
 10. [Tests and tools](#10-tests-and-tools)
 11. [Limits: what is real-time and what is not](#11-limits-what-is-real-time-and-what-is-not)
 12. [Project layout](#12-project-layout)
+13. [License](#13-license)
 
 ---
 
@@ -812,7 +813,9 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   guard and token, headless mode, and no keys in any response.
 - **Offline replay:** `tests/data/replay_sample.jsonl.gz` holds real frames recorded on 24 Nov 2026
   around the US open, replayed through the real connector parsers, the engine and the snapshot
-  builder. The test checks prices, the DXY formula, latency and the schema.
+  builder. The test checks prices, the DXY formula, latency and the schema. The recording is raw
+  provider data, which their terms do not allow republishing, so it is not in this repository:
+  record your own with `tools/record.py` (the replay test skips without one).
 - **Tools:**
   - `tools/selftest.py`: checks a **running** service end to end.
   - `tools/record.py`: record live frames for replay.
@@ -1229,8 +1232,13 @@ moneyflow/
   static/         the dashboard (index.html, app.js, style.css)
   schema/         snapshot.schema.json
   default.toml    every option, documented
-tests/            pytest suite + data/ (FOMC page excerpt, recorded frames)
+tests/            pytest suite + data/ (FOMC page excerpt; recorded frames stay local)
 tools/            record.py, check_latency.py, measure_resources.py
 examples/         client.py, webhook_receiver.py
 start.ps1 / start.bat
 ```
+
+## 13. License
+
+[MIT](LICENSE). The license covers the code and documents in this repository. Market data is not
+included: what the program downloads stays under each provider's terms (section 4).

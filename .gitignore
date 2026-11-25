@@ -6,13 +6,14 @@
 *.pem
 secrets*.toml
 
-# Local data, caches, recordings, reports with machine details (root folder only:
-# tests/data/ holds the test fixtures and IS tracked)
+# Local data, caches, recordings, reports with machine details
 /data/
 /reports/
 *.log
+# Recorded frames (including tests/data/replay_sample.jsonl.gz) are raw data from the providers
+# (Binance, Coinbase, Alpaca, Finnhub), whose terms do not allow republishing it: local only.
+# Record your own with tools/record.py; tests/test_replay.py skips without one.
 *.jsonl.gz
-!tests/data/*.jsonl.gz
 
 # The example screenshot is a third-party video frame: keep it local, never publish it
 reference/

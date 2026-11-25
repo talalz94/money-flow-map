@@ -17,6 +17,9 @@ from moneyflow.series import DXY
 from moneyflow.server import one_tf
 
 SAMPLE = DATA / "replay_sample.jsonl.gz"
+if not SAMPLE.exists():
+    pytest.skip("tests/data/replay_sample.jsonl.gz is local only (raw provider data is not published); "
+                "record one with tools/record.py", allow_module_level=True)
 SCHEMA = json.loads((Path(__file__).resolve().parents[1] / "moneyflow" / "schema" / "snapshot.schema.json").read_text())
 
 
