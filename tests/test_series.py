@@ -239,3 +239,44 @@ def test_a_computed_series_counts_as_trading_only_where_all_its_inputs_do():
         d.refresh(t0 + s)
     k = int((t0 + 300) // G1_STEP)
     assert d.g1.get(k) == 75.0 and a.g1.is_live(k) and not b.g1.is_live(k) and not d.g1.is_live(k)
+
+
+
+def test_a_seeded_close_is_the_price_until_live_data_and_is_never_dated_ahead():
+    """Before any live price this session, a download newer than the price (the cache's close) takes
+    over. A bar still open is not used (it would date the price ahead, and live prices older than
+    that would be dropped as out of order). Once live data has come, a later download leaves it."""
+    t0 = 1795528800.0                                       # on a 5-minute boundary
+    inst = Instrument("x:A", "x", "A", "24/7")
+    inst.price, inst.ts = 50.0, t0 - 7200                    # the cache's last close
+    inst.seed("g5", [(t0 - 3600 + 300 * i, 60.0 + i) for i in range(12)], t0)
+    assert inst.price == 71.0 and inst.ts == t0
+    rows = [(t0 - 600 + 60 * i, 80.0 + i) for i in range(12)]          # the last one, [t0+60, t0+120), is open
+    inst.seed("g1", rows, t0 + 90)
+    assert inst.price == 90.0 and inst.ts == t0 + 60
+    inst.on_price(100.0, t0 + 70, t0 + 70)                    # live, older than the open bar's end
+    assert inst.price == 100.0
+    inst.seed("g5", [(t0 + 300 * i, 70.0) for i in range(3)], t0 + 900)   # a back-fill after live data
+    assert inst.price == 100.0 and inst.ts == t0 + 70
+
+
+
+def test_a_session_instruments_seeded_price_is_its_session_close_like_a_live_one():
+    """An ETF's live price stays on the regular session (pre/post-market prints are kept aside); a
+    download with extended-hours bars leaves it on the session's last close the same way."""
+    close = ny_ts(2026, 11, 24, 16, 0)
+    inst = Instrument("x:SPY", "x", "SPY", "us_regular")
+    rows = [(close - 3600 + 300 * i, 600.0 + i) for i in range(12)]          # 15:00-16:00
+    rows += [(close + 300 * i, 590.0) for i in range(24)]                     # after hours, 16:00-18:00
+    inst.seed("g5", rows, close + 7200)
+    assert inst.price == 611.0 and inst.ts == close
+
+
+def test_a_seed_with_no_bar_inside_the_grid_still_gives_a_missing_price_the_last_close():
+    """Bars that all fall before what the grid holds still give an instrument without a price their
+    last close (as before), dated at that bar."""
+    t0 = 1795528800.0
+    old = t0 - 3 * 86400                                    # the 1-minute grid holds one day
+    inst = Instrument("x:A", "x", "A", "24/7")
+    inst.seed("g1", [(old + 60 * i, 40.0 + i) for i in range(10)], t0)
+    assert inst.price == 49.0 and inst.ts == old + 600

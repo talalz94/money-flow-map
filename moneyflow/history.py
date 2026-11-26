@@ -84,11 +84,19 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
             if k >= k_now or k <= k_now - inst.v5.size:
                 continue
             inst.v5.put(k, NaN if q is None else q, NaN if tb is None else tb)
-    if inst.g5.last_k is not None:
-        last = inst.g5.get(inst.g5.last_k)
-        if last == last and not (inst.price == inst.price):
-            inst.price = last
-            inst.ts = (inst.g5.last_k + 1) * inst.g5.step
+    g = inst.g5
+    if g.last_k is not None and not (inst.price == inst.price):
+        # the newest step that held data (its live flag), not a stretch carried after it: a cache saved
+        # in the evening ends in hours of the close carried over shut hours (or, written by an older
+        # version, over a start whose download had not landed: a stale price), and dated at the save,
+        # that carried value outranked a newer download
+        ks = range(g.last_k, g.first_k() - 1, -1)
+        k = next((k for k in ks if g.is_live(k) and g.get(k) == g.get(k)), None)
+        if k is None:
+            k = next((k for k in ks if g.get(k) == g.get(k)), None)
+        if k is not None:
+            inst.price = g.get(k)
+            inst.ts = (k + 1) * g.step
     mark_holes(inst, untrusted=d.get("v") != VERSION, now=now)
     return inst.g5.last_k
 
@@ -120,6 +128,16 @@ def mark_holes(inst: Instrument, untrusted: bool = False, now: float | None = No
                 if clock.market_open(inst.hours, (k + 1) * g.step - 1):
                     inst._hole(name, k * g.step)
                     break
+    # a cache older than the 1-day grid leaves the 1-minute grid empty: its share of the time off is
+    # a hole too, from the 5-minute one or from the grid's first minute. Without it the minutes until
+    # the first live price carried the cache's 30-48 h old close, and TODAY and 1H read from it.
+    g1, h5 = inst.g1, inst.holes.get("g5")
+    if now is not None and h5 is not None and _empty(g1):
+        inst._hole("g1", max(h5, (int(now // g1.step) - g1.size + 1) * g1.step))
+
+
+def _empty(g) -> bool:
+    return g.last_k is None or all(g.get(k) != g.get(k) for k in range(g.first_k(), g.last_k + 1))
 
 
 def last_good_ts(inst: Instrument, max_back: int = 50) -> float | None:

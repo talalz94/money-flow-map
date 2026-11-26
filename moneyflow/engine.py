@@ -7,6 +7,7 @@ import datetime as dt
 import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +89,7 @@ class Engine:
         self._backfill_task: asyncio.Task | None = None
         self._backfill_wake: asyncio.Event | None = None
         self._feed_waiters: set[asyncio.Event] = set()   # retries that a recovered feed cuts short
+        self._save_lock = threading.Lock()  # one cache save at a time (they run in worker threads)
         self.resumes = 0
         self._last_wall = time.time()
         self._tasks: list[asyncio.Task] = []
@@ -661,13 +663,13 @@ class Engine:
                         try:
                             rows = await pollers.yahoo_chart(self.ctx.session, i.symbol, "5m", rng)
                             if rows:
-                                i.seed("g5", rows, rows[-1][0] + 300)
+                                i.seed("g5", rows, self._through_closed(i, rows[-1][0] + 300, now))
                                 i.extra["history_source"] = "Yahoo chart (no Alpaca key)"
                             # 1-minute bars too (two sessions cover the 1-day grid): without them the
                             # 1-minute bonds series fills US hours from the proxy, 0.03% off the real TLT
                             rows1 = await pollers.yahoo_chart(self.ctx.session, i.symbol, "1m", "2d")
                             if rows1:
-                                i.seed("g1", rows1, rows1[-1][0] + 60)
+                                i.seed("g1", rows1, self._through_closed(i, rows1[-1][0] + 60, now))
                             st["ok"].append(i.key)
                         except Exception as e:  # noqa: BLE001
                             st["errors"].append(f"yahoo {i.symbol}: {e}"[:200])
@@ -757,8 +759,7 @@ class Engine:
                 d.rebuild(now, since=None if startup else min(got))
         self._cache.clear()
         st.update(state="done", finished=clock.iso(now))
-        # off the event loop: writing every cache file stalled ticks, streams and pushes for seconds
-        await asyncio.get_running_loop().run_in_executor(None, self.save_cache)
+        await self._save_cache_off_loop()
         if startup:
             log.info("history ready (%d instruments, %d errors)", len(insts), len(st["errors"]))
 
@@ -771,14 +772,27 @@ class Engine:
         used |= set(self._stocks)                 # picked stocks: refilled after a sleep like any node
         return {i.symbol for i in self.instruments.values() if i.source == "binance_fut"} - used
 
-    def save_cache(self) -> None:
+    def save_cache(self, insts: list | None = None) -> None:
+        """Write the history cache. In a worker thread (see _save_cache_off_loop) `insts` is the list
+        taken on the event loop: the loop adds and drops picked stocks meanwhile, and iterating the
+        live dict from the thread raised "dictionary changed size during iteration". One save at a
+        time: two at once (housekeeping and a back-fill) wrote the same temporary files."""
+        if insts is None:
+            insts = list(self.instruments.values())
         n = 0
-        for i in self.instruments.values():
-            try:
-                n += history.save(self.cache_dir, i)
-            except OSError as e:
-                log.warning("cache %s: %s", i.key, e)
+        with self._save_lock:
+            for i in insts:
+                try:
+                    n += history.save(self.cache_dir, i)
+                except OSError as e:
+                    log.warning("cache %s: %s", i.key, e)
         log.debug("cached %d instruments", n)
+
+    async def _save_cache_off_loop(self) -> None:
+        """save_cache in a worker thread (writing every file on the loop stalled ticks, streams and
+        pushes for seconds), on the instruments as they are now."""
+        insts = list(self.instruments.values())
+        await asyncio.get_running_loop().run_in_executor(None, self.save_cache, insts)
 
     # ── the clock tick ──────────────────────────────────────────────────────────────────────
     def tick(self, now: float | None = None) -> None:
@@ -1306,21 +1320,31 @@ class Engine:
                 log.exception("tick failed")
             await asyncio.sleep(max(0.05, 1.0 - (time.monotonic() - t0)))
 
+    HOUSEKEEP_EVERY = 5.0
+
     async def _housekeeping(self):
-        """Sleep/resume detection (wall clock jumps), NTP re-sync, periodic cache saves."""
+        """Sleep/resume detection (wall clock jumps), NTP re-sync, periodic cache saves. An error in
+        one round is logged and the next round runs: nothing supervises this task, and one failed
+        save once ended wake detection, back-fills, hole checks, NTP and saves for the whole run."""
         last_sync = time.time()
         last_save = time.time()
+        last_error = 0.0
         while True:
             before = time.time()
-            await asyncio.sleep(5)
-            if await self._housekeep_once(time.time() - before):
-                last_sync = time.time()
-            if time.time() - last_sync > 1800:
-                await self.clock.sync()
-                last_sync = time.time()
-            if time.time() - last_save > 1800:
-                await asyncio.get_running_loop().run_in_executor(None, self.save_cache)
-                last_save = time.time()
+            await asyncio.sleep(self.HOUSEKEEP_EVERY)
+            try:
+                if await self._housekeep_once(time.time() - before):
+                    last_sync = time.time()
+                if time.time() - last_sync > 1800:
+                    last_sync = time.time()
+                    await self.clock.sync()
+                if time.time() - last_save > 1800:
+                    last_save = time.time()
+                    await self._save_cache_off_loop()
+            except Exception:  # noqa: BLE001 - whatever it was, the next round still runs
+                if time.time() - last_error > 600:          # (a fault every 5 s logs once per 10 min)
+                    last_error = time.time()
+                    log.exception("housekeeping round failed (continuing)")
 
     async def _housekeep_once(self, gap: float) -> bool:
         """One round of housekeeping after `gap` seconds of wall time (5 when awake): a jump means the
@@ -1346,6 +1370,20 @@ class Engine:
     # ── back-fill: what a sleep or a network outage left empty ──────────────────────────────
     BACKFILL_SETTLE = 10.0                  # let the network come back first
     BACKFILL_FIRST, BACKFILL_MAX = 30.0, 900.0
+
+    @staticmethod
+    def _through_closed(inst: Instrument, end: float, now: float) -> float:
+        """How far a download ending at `end` holds: on to `now` through hours its market is shut
+        (nothing trades: its last close is the price; a Saturday start left Friday 16:00 onwards
+        empty, so TODAY had no start price), never over open ones (a delayed feed's missing minutes
+        are unknown). Sessions open and close on 5-minute boundaries: a minute at a time until `end`
+        is on one, then five."""
+        step = 300 if end % 300 == 0 else 60
+        while end + step <= now and not clock.market_open(inst.hours, end + step - 1):
+            end += step
+            if end % 300 == 0:
+                step = 300
+        return end
 
     def _dxy_of(self, inst: Instrument):
         """The dollar index that `inst` is an FX leg of, if that index has its own history (ICE's)."""

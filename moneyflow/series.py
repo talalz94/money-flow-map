@@ -174,6 +174,10 @@ class Instrument:
         self.ts = ev
         self.recv_ts = recv_ts
         self.msgs += 1
+        if not self._live_seen and any(h is not None for h in self.holes.values()):
+            # the first live price after a start whose download failed: the network is back, so the
+            # back-fill's back-off (up to 15 min) is cut short, as after any outage
+            self.recovered = True
         self._live_seen = True
         self.feed_alive(recv_ts)
         if ev_ts is not None and measure:
@@ -345,9 +349,23 @@ class Instrument:
         # falls out of it anyway: a 1-day grid's first minute is never downloaded again)
         if h is not None and by_k and max(by_k) * step >= h and (k_first * step <= h or k_first <= k_until - g.size + 2):
             self.holes[grid] = None          # the exchange's own data now covers the gap
-        if self.price != self.price and last == last:            # no live price yet: use the last close
-            self.price = last
-            self.ts = closes[-1][0] + step
+        # no live price yet this session: the price is the newest close known, so a downloaded bar
+        # newer than what the cache gave takes over (Friday's session downloaded on a Saturday stayed
+        # behind the cache's Thursday close all weekend: TODAY read -2%). Only a bar the grid took
+        # (before `until`) counts: one still open would date the price in the future, and live
+        # prices older than that would be dropped as out of order. For an ETF, as for live prints,
+        # pre- and post-market bars are kept aside: its newest bar in the regular session.
+        if not self._live_seen:
+            for k in range(k_until - 1, k_first - 1, -1):
+                if k in by_k and (self.hours != "us_regular"
+                                  or clock.market_open("us_regular", (k + 1) * step - 1)):
+                    t_last = (k + 1) * step
+                    if self.price != self.price or self.ts is None or t_last > self.ts:
+                        self.price, self.ts = by_k[k], t_last
+                    break
+            else:
+                if self.price != self.price and last == last:   # no such bar: at least the last close
+                    self.price, self.ts = last, closes[-1][0] + step
         return n
 
     # ── summaries ───────────────────────────────────────────────────────────────────────────

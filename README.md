@@ -727,7 +727,8 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     Computed series (the dollar, bonds, the stablecoin share) are live only where their inputs are.
   - A **back-fill** downloads the empty steps. After a failure (DNS down after waking, no network)
     it retries after 30 s, doubling to 15 min, and 10 s after a feed delivers again (time for the
-    feeds to settle; also when that happens during a download). It stops only when nothing is
+    feeds to settle; also when that happens during a download, and on the first live price after a
+    start whose download failed). It stops only when nothing is
     missing, when the gap is older than the history, or when the exchange has no data there either
     (a gap that appeared during a download was not asked for, so it is the next attempt's). It runs
     in the background: it never holds up the auto-stop, and it stops with the app. Its state is
@@ -739,9 +740,16 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     inputs' gap, and writes the cache off the event loop (each attempt used to stall the app for a
     second or more).
   - The time the app was off counts as a gap too, from the first moment its market was open (an
-    ETF whose market stayed shut has nothing to download). If the first download at a start fails,
+    ETF whose market stayed shut has nothing to download), in the 1-minute grid as well (a cache
+    older than the day that grid holds leaves it empty). If the first download at a start fails,
     the retry still fetches it, and meanwhile the cache's last close is not carried as data (it
-    stood in as TODAY's start price for a whole session).
+    stood in as TODAY's start price for a whole session, and after 30-48 hours off TODAY read +44%
+    and 1H +94%).
+  - Until the first live price, an instrument's price is the newest close known: the cache's last
+    data (not the close carried after it), or a newer downloaded bar. For an ETF that is the
+    session's close: pre- and post-market bars are kept aside, as live prints are. Without a key,
+    an ETF's Yahoo history is carried on through the hours its market was shut since its last bar
+    (not over open ones: a delayed feed's minutes are unknown).
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once.
@@ -763,7 +771,11 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - Any websocket refused with 429 waits at least 2 minutes before retrying instead of hammering, and its status says why.
   - **Run one copy at a time;** other apps should read this service's API rather than open their own Finnhub or Alpaca streams.
 - **Closing the window or Ctrl+C / Ctrl+Break:** a graceful stop that saves the history cache. Tested: exit code 0 in 1.2 s, cache written.
-- **History** is saved to `data/cache/` every 30 minutes and on exit.
+- **History** is saved to `data/cache/` every 30 minutes, after each download and on exit. The files
+  are written in a worker thread, from the list of instruments taken on the event loop (which picks
+  and drops stocks meanwhile: reading its live list from the thread failed), one save at a time. An
+  error in a housekeeping round is logged and the next round runs (one failed save had ended wake
+  detection, back-fills and saves for the rest of the run).
 - **Tests:** `tests/test_reconnect.py` checks:
   - reconnection after server drops, after silence and after a `kick()`;
   - poller back-off;
@@ -784,7 +796,13 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     downloaded from each instrument's own gap; an attempt that got nothing neither saving nor
     rebuilding; the wake and housekeeping entry points; a gap found mid-download fetched next; a
     recovery during a download, or a kick while busy, not lost; an ETF covered by its REST
-    poller's heartbeat.
+    poller's heartbeat;
+  - the cache written in a worker thread while stocks are picked and dropped, two saves taking
+    turns, housekeeping going on after an error; a newer gap of the same instrument fetched, not
+    given up; the minutes after a failed start unknown, also after more than a day off; the first
+    live price waking the back-fill; the downloaded close as the price (an ETF from Alpaca and from
+    Yahoo, the dollar, a perpetual), never a bar still open or a pre/post-market one; the cache's
+    price dated at its last data; Yahoo's history carried over shut hours only.
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -1227,6 +1245,28 @@ before this round (fe74248) and now:
   (the midpoint rule off the whole hour, the volume baselines, "eased" released by a move the other
   way, the seed back-off, the retry of a dropped pick, the wake and housekeeping entry points) and
   this round's changes.
+
+**Ninth round (26 Nov 2026): a review of the eighth round.** Checked on the review's reproductions
+(offline), on the code before this round (ea819fb) and now:
+
+| | Before | Now |
+|---|---|---|
+| **The cache written in a worker thread while a stock is picked** (in housekeeping since the first version; after each download since the eighth round) | "dictionary changed size during iteration" after 6 of 26 files. In housekeeping nothing caught it: wake detection, back-fills, hole checks, NTP and saves stopped for the rest of the run | the thread writes the list taken on the event loop, one save at a time; housekeeping logs an error and goes on |
+| **An ETF's price after a Saturday start** (cache from Thursday at 600, Friday's session downloaded at 612) | 600, dated Thursday: TODAY −1.96% all weekend, until the first live trade | 612, dated Friday 16:00; TODAY 0.00% |
+| **A failed download after 30 or 48 hours off**, live prices from 20 or 10 minutes after the start | TODAY +43.6% and 1H +94.3%, read from the 30-48 hour old close | unknown until the data is back |
+| **Live, a copy without keys** started from a cache that ended in a stale price carried after its last data | SPY 704.12 (that carried value) instead of its 716.71 close; TODAY −1.76% | SPY 716.71, its session close, dated 16:00; TODAY +0.00% |
+
+- **Also:**
+  - the first live price after a start whose download failed wakes the back-fill (it waited out its
+    back-off, up to 15 minutes);
+  - without a key, an ETF's Yahoo history is carried over the hours its market was shut (a Saturday
+    start had no TODAY start price);
+  - a downloaded ETF price is its regular session's close, as for live prints.
+- **Tests: 195 pass.** The new ones cover each item above, and three changes the suite let through:
+  the 1-minute half of the eighth round's time-off fix, the save in a worker thread, and the
+  give-up rule for a newer gap of the same instrument.
+- **Mutation check: 53 of 53 changes are caught:** the eighth round's 36, the review's three
+  and this round's 14.
 
 ---
 

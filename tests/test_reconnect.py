@@ -3,6 +3,7 @@ import asyncio
 import types
 
 import aiohttp
+import pytest
 from aiohttp import web
 
 from moneyflow import clock
@@ -857,7 +858,7 @@ def test_a_backfill_that_downloads_nothing_does_not_stall_the_loop(cfg, keys, mo
     clk.set_fixed(t0 + 3600)
     eng.tick()
     saves, rebuilds = [], []
-    eng.save_cache = lambda: saves.append(1)
+    eng.save_cache = lambda insts=None: saves.append(1)
     for d in eng.derived:
         d.rebuild = lambda until, since=None, d=d: rebuilds.append((type(d).__name__, since))
     klines, _ = _exchange(lambda t: 100.0, fail=lambda: eng.backfill_state.get("attempt", 0) <= 2)
@@ -1014,3 +1015,350 @@ def test_keyless_etfs_download_60_days_when_a_gap_is_older_than_the_5_day_range(
     monkeypatch.setattr(pollers, "yahoo_chart", chart)
     asyncio.run(eng.seed_history(incremental=True, only={etf.key}, state={}))
     assert (etf.symbol, "5m", "60d") in asked
+
+
+
+# ── round 9: the cache written off the loop, the downloaded price, a day or more off ────────────────
+def _slow_save(monkeypatch, seconds=0.004):
+    """history.save replaced by a stand-in as slow as a file write; records which threads ran it and
+    how many saves overlapped."""
+    import threading
+    import time
+    from moneyflow import history
+    rec = {"threads": set(), "keys": [], "active": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def save(dirpath, inst):
+        with lock:
+            rec["active"] += 1
+            rec["peak"] = max(rec["peak"], rec["active"])
+            rec["threads"].add(threading.get_ident())
+        time.sleep(seconds)
+        with lock:
+            rec["active"] -= 1
+            rec["keys"].append(inst.key)
+        return True
+    monkeypatch.setattr(history, "save", save)
+    return rec
+
+
+def test_a_save_off_the_loop_survives_stocks_picked_and_dropped_meanwhile(cfg, keys, monkeypatch, tmp_path):
+    """The cache is written in a worker thread while the loop picks and drops stocks. Iterating the
+    live dict there raised "dictionary changed size during iteration" (after 6 of 26 files), which
+    once ended housekeeping for good; the save works on the list taken on the loop."""
+    import threading
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    rec = _slow_save(monkeypatch)
+    before = list(eng.instruments)
+
+    async def go():
+        task = asyncio.create_task(eng._save_cache_off_loop())
+        await asyncio.sleep(0.03)                                   # the thread is writing...
+        eng.instrument("binance_fut", "NVDAUSDT", "24/7", True, "NVDA", "index")   # ...a stock is picked
+        eng.instruments.pop("binance_spot:XRPUSDT")                 # ...and one is dropped
+        await task
+    asyncio.run(go())
+    assert sorted(rec["keys"]) == sorted(before) and threading.get_ident() not in rec["threads"]
+
+
+def test_two_saves_at_once_take_turns(cfg, keys, monkeypatch, tmp_path):
+    """Housekeeping's save and a back-fill's can overlap: both wrote the same temporary files."""
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    rec = _slow_save(monkeypatch, 0.002)
+
+    async def go():
+        await asyncio.gather(eng._save_cache_off_loop(), eng._save_cache_off_loop())
+    asyncio.run(go())
+    assert rec["peak"] == 1 and len(rec["keys"]) == 2 * len(eng.instruments)
+
+
+def test_housekeeping_goes_on_after_an_error(cfg, keys, tmp_path, caplog):
+    """Nothing supervises housekeeping: one error (a failed save) ended wake detection, back-fills,
+    hole checks, NTP and saves for the rest of the run. Now it is logged and the next round runs."""
+    import logging
+    caplog.set_level(logging.ERROR, logger="moneyflow.engine")
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    eng.HOUSEKEEP_EVERY = 0.01
+    rounds = []
+
+    async def once(gap):
+        rounds.append(gap)
+        if len(rounds) == 1:
+            raise RuntimeError("dictionary changed size during iteration")
+        return False
+    eng._housekeep_once = once
+
+    async def go():
+        task = asyncio.create_task(eng._housekeeping())
+        await asyncio.sleep(0.3)
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(go())
+    assert len(rounds) >= 3 and "housekeeping round failed" in caplog.text
+
+
+def test_a_backfill_writes_the_cache_in_a_worker_thread(cfg, keys, monkeypatch, tmp_path):
+    """Writing every cache file on the event loop stalled ticks and pushes for a second or more
+    (the other tests replace save_cache, so they cannot tell which thread runs it)."""
+    import threading
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    _tick(eng, clk, t0, t0 + 300, feed=lambda t: btc.on_price(100.0, t, t))
+    clk.set_fixed(t0 + 3600)
+    eng.tick()
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    rec = _slow_save(monkeypatch, 0.0)
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["state"] == "done"
+    assert rec["keys"] and threading.get_ident() not in rec["threads"]
+
+
+def test_a_gap_of_the_same_instrument_opening_after_its_download_is_fetched_next(cfg, keys, monkeypatch, tmp_path, caplog):
+    """BTC's download has landed; while the cache is written its feed misses a step. That newer gap
+    was not asked for, so the next attempt fetches it (with any answered instrument counted as
+    "asked", it was given up as "no exchange data")."""
+    import logging
+    from moneyflow.connectors import binance as bn
+    caplog.set_level(logging.INFO, logger="moneyflow.engine")
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    btc.holes["g5"] = t0 - 3600
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    saves = []
+
+    def save(insts=None):
+        if not saves:                                         # the loop ticks on meanwhile
+            clk.set_fixed(t0 + 900)
+            btc._hole("g5", t0 + 300)
+        saves.append(1)
+    eng.save_cache = save
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["attempts"] == 2 and btc.holes == {"g1": None, "g5": None}
+    assert "no exchange data" not in caplog.text
+
+
+def test_a_failed_first_download_leaves_the_minutes_since_the_start_unknown_too(cfg, keys, monkeypatch, tmp_path):
+    """As with the 5-minute steps, with a cache that holds 1-minute steps too (as every real one
+    does): until the first live price the minutes after the start are unknown, not the 6-hour-old
+    close, so TODAY waits for data instead of reading the night's move from that old price."""
+    from conftest import ny_ts
+    from moneyflow import history, stats
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G1_STEP, G5_STEP
+    now = ny_ts(2026, 11, 24, 16, 50)
+    closed = now - 6 * 3600
+    truth = lambda t: 100.0 + (t - now) / 3600 * 3           # noqa: E731
+    old, _ = _gap_engine(cfg, keys, closed, tmp_path)
+    b0 = old.instruments["binance_spot:BTCUSDT"]
+    k5, k1 = int(closed // G5_STEP), int(closed // G1_STEP)
+    b0.seed("g5", [(k * G5_STEP, truth((k + 1) * G5_STEP)) for k in range(k5 - 2000, k5)], closed)
+    b0.seed("g1", [(k * G1_STEP, truth((k + 1) * G1_STEP)) for k in range(k1 - 1400, k1)], closed)
+    history.save(tmp_path, b0)
+    eng, clk = _gap_engine(cfg, keys, now, tmp_path)
+    klines, _ = _exchange(truth, fail=lambda: True)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    _tick(eng, clk, now, now + 1200)                           # 20 minutes, no live data
+    k = int((now + 300) // G1_STEP)
+    assert btc.g1.get(k) != btc.g1.get(k) and not btc.g1.is_live(k)
+    t1 = now + 1500
+    _tick(eng, clk, now + 1210, t1, feed=lambda t: btc.on_price(truth(t), t, t))
+    pct = stats.window_return(btc, stats.window_for("today", t1), t1)[1]
+    assert pct != pct                                          # unknown start: the window waits
+
+
+@pytest.mark.parametrize("off_hours,tf,live_after,read_after", [(30, "today", 1200, 1800), (48, "1h", 600, 3690)])
+def test_after_a_day_or_more_off_a_failed_download_leaves_the_minutes_unknown(off_hours, tf, live_after, read_after,
+                                                                            cfg, keys, monkeypatch, tmp_path):
+    """Off longer than the 1-day grid holds, the 1-minute grid loads nothing and got no hole, so
+    until the first live price its minutes carried the cache's 30-48 h old close: with the download
+    failing, TODAY read +43.6% and 1H +94%. Now the time off is a hole there too."""
+    from conftest import ny_ts
+    from moneyflow import history, stats
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    now = ny_ts(2026, 11, 24, 16, 50)
+    closed = now - off_hours * 3600
+    truth = lambda t: 100.0 + (t - now) / 3600              # noqa: E731
+    old, _ = _gap_engine(cfg, keys, closed, tmp_path)
+    b0 = old.instruments["binance_spot:BTCUSDT"]
+    k_c = int(closed // G5_STEP)
+    b0.seed("g5", [(k * G5_STEP, truth((k + 1) * G5_STEP)) for k in range(k_c - 2000, k_c)], closed)
+    b0.seed("g1", [(k * 60, truth((k + 1) * 60)) for k in range(int(closed // 60) - 1000, int(closed // 60))], closed)
+    history.save(tmp_path, b0)
+    eng, clk = _gap_engine(cfg, keys, now, tmp_path)
+    klines, _ = _exchange(truth, fail=lambda: True)          # the network is down
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    assert btc.g1.last_k is None and btc.holes["g1"] is not None
+    t1 = now + read_after
+    _tick(eng, clk, now, t1, feed=lambda t: btc.on_price(truth(t), t, t) if t >= now + live_after else None)
+    pct = stats.window_return(btc, stats.window_for(tf, t1), t1)[1]
+    assert pct != pct                                          # was +43.6% (TODAY), +94% (1H)
+
+
+def test_the_first_live_price_after_a_failed_start_cuts_the_back_off_short(cfg, keys, monkeypatch, tmp_path):
+    """Started without network: the download fails and the back-fill backs off (up to 15 min). No
+    gap ever opened in a live feed, so nothing said the network was back; the first live price does."""
+    import time
+    from moneyflow import history
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    now = 1795528800.0
+    closed = now - 6 * 3600
+    old, _ = _gap_engine(cfg, keys, closed, tmp_path)
+    b0 = old.instruments["binance_spot:BTCUSDT"]
+    k_c = int(closed // G5_STEP)
+    b0.seed("g5", [(k * G5_STEP, 100.0) for k in range(k_c - 2000, k_c)], closed)
+    history.save(tmp_path, b0)
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path)
+    eng.BACKFILL_FIRST = eng.BACKFILL_MAX = 60.0
+    up = [False]
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: not up[0])
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())                            # the first download fails
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    assert btc.holes["g5"] is not None
+
+    async def go():
+        eng.check_holes()                                      # housekeeping: the back-fill starts...
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if eng.backfill_state.get("state") == "retrying":
+                break
+        assert eng.backfill_state.get("state") == "retrying"   # ...fails, and waits 60 s
+        up[0] = True
+        btc.on_price(100.0, now + 1, now + 1)                  # the first live price
+        eng.check_holes()                                      # the next housekeeping round
+        await asyncio.wait_for(eng._backfill_task, timeout=5)
+    t = time.monotonic()
+    asyncio.run(go())
+    assert time.monotonic() - t < 5 and eng.backfill_state["state"] == "done" and btc.holes["g5"] is None
+
+
+@pytest.mark.parametrize("kind", ["alpaca", "yahoo", "perp"])
+def test_a_download_newer_than_the_cache_becomes_the_price(kind, cfg, keys, monkeypatch, tmp_path):
+    """The cache was written on Thursday evening (600); the app starts on Saturday and the download
+    brings Friday's session (612). The price is the download's newest close: it stayed the cache's
+    600 all weekend (TODAY -1.96%, 1W off by Friday's move) until the first live trade. Checked for
+    an ETF from Alpaca, the same ETF from Yahoo without a key (with the dollar, from ICE), and a perp."""
+    from conftest import ny_ts
+    from moneyflow import history, stats
+    from moneyflow.connectors import alpaca as alp
+    from moneyflow.connectors import binance as bn
+    from moneyflow.connectors import pollers
+    from moneyflow.series import G5_STEP
+    thu, fri, sat = ny_ts(2026, 11, 19, 18, 0), ny_ts(2026, 11, 20, 0, 0), ny_ts(2026, 11, 21, 12, 0)
+    truth = lambda t: 600.0 if t < fri else 612.0           # noqa: E731
+    key = "binance_fut:SPYUSDT" if kind == "perp" else "alpaca:SPY"
+    old, _ = _gap_engine(cfg, keys, thu, tmp_path)
+    k = int(thu // G5_STEP)
+    old.instruments[key].seed("g5", [(j * G5_STEP, 600.0) for j in range(k - 2000, k)], thu)
+    history.save(tmp_path, old.instruments[key])
+    eng, _ = _gap_engine(cfg, keys, sat, tmp_path)
+
+    def session(start, step):
+        t, rows = int(start // step) * step, []
+        while t + step <= sat:
+            if kind == "perp" or clock.market_open("us_regular", t):
+                rows.append((t, truth(t)))
+            t += step
+        return rows
+    klines, _ = _exchange(truth, fail=lambda: kind != "perp")
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    if kind == "alpaca":
+        eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={})
+
+        async def bars(conn, symbols, tf, start, end=None, feed="iex"):
+            return {s: [(t, c, 1e6) for t, c in session(start, 300 if tf == "5Min" else 60)] for s in symbols}
+        monkeypatch.setattr(alp, "fetch_bars", bars)
+    elif kind == "yahoo":
+        eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+
+        async def chart(session_, symbol, interval, rng):
+            return session(sat - int(rng[:-1]) * 86400, 300 if interval == "5m" else 60)
+        monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    asyncio.run(eng.seed_history())
+    inst = eng.instruments[key]
+    last_bar_end = sat if kind == "perp" else ny_ts(2026, 11, 20, 16, 0)
+    assert inst.price == 612.0 and inst.ts == last_bar_end
+    assert stats.window_return(inst, stats.window_for("today", sat), sat)[1] == 0.0
+    if kind == "yahoo":
+        usd = eng.series["usd"].inst                           # computed, history from ICE: same rule
+        assert usd.price == 612.0 and usd.ts == last_bar_end
+
+
+
+def test_a_delayed_download_is_not_carried_over_open_hours(cfg, keys, monkeypatch, tmp_path):
+    """Without a key, an ETF's bars come from Yahoo, 15 minutes late in a session: those minutes
+    stay unknown (carried, they would be the last close flagged as trading). Only shut hours after
+    the last bar are carried (the weekend after Friday's close, in the test above)."""
+    from conftest import ny_ts
+    from moneyflow.connectors import binance as bn
+    from moneyflow.connectors import pollers
+    from moneyflow.series import G5_STEP
+    now = ny_ts(2026, 11, 24, 11, 0)
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path)
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+
+    async def chart(session_, symbol, interval, rng):
+        step = 300 if interval == "5m" else 60
+        t, rows = int((now - 2 * 86400) // step) * step, []
+        while t + step <= now - 900:                            # 15 minutes late
+            if clock.market_open("us_regular", t):
+                rows.append((t, 600.0))
+            t += step
+        return rows
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: True)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    spy = eng.instruments["alpaca:SPY"]
+    late = range(int((now - 900) // G5_STEP), int(now // G5_STEP))
+    assert all(spy.g5.get(k) != spy.g5.get(k) and not spy.g5.is_live(k) for k in late)
+    assert spy.price == 600.0 and spy.ts == now - 900
+
+
+
+def test_a_cache_dates_its_price_at_its_last_data_not_at_the_close_carried_after_it(cfg, keys, tmp_path):
+    """A cache saved in the evening ends in hours of steps carried after the close; one written by an
+    older version could even carry a stale price there (a start whose download had not landed). Its
+    price is its last data, dated then: dated at the save, the carried value outranked the download
+    of the same session (seen live: SPY at 704.12 instead of its 716.70 close)."""
+    from conftest import ny_ts
+    from moneyflow import history
+    from moneyflow.series import G5_STEP
+    close, saved = ny_ts(2026, 11, 25, 16, 0), ny_ts(2026, 11, 25, 19, 55)
+    old, _ = _gap_engine(cfg, keys, saved, tmp_path)
+    spy = old.instruments["alpaca:SPY"]
+    k_c, k_s = int(close // G5_STEP), int(saved // G5_STEP)
+    spy.seed("g5", [(k * G5_STEP, 716.7) for k in range(k_c - 2000, k_c)], close)   # live in session hours
+    for k in range(k_c, k_s):
+        spy.g5.put(k, 704.12, False)                                 # a stale price carried after it
+    history.save(tmp_path, spy)
+    now = ny_ts(2026, 11, 25, 21, 20)
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path)
+    inst = eng.instruments["alpaca:SPY"]
+    history.load(tmp_path, inst, now)
+    assert inst.price == 716.7 and inst.ts == close
+
+
+def test_a_download_is_carried_over_shut_hours_only():
+    """On to now through the hours the market was shut since the download's last bar, never over
+    open ones, to the minute when the bar does not end on a 5-minute step (a 1-minute bar at 15:58)."""
+    from conftest import ny_ts
+    from moneyflow.series import Instrument
+    etf = Instrument("x:SPY", "x", "SPY", "us_regular")
+    close, sat, mon_open = ny_ts(2026, 11, 20, 16, 0), ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 23, 9, 30)
+    assert Engine._through_closed(etf, close, sat) == sat                         # the weekend: carried
+    assert Engine._through_closed(etf, close, mon_open + 600) == mon_open         # up to Monday's open
+    assert Engine._through_closed(etf, close - 120, sat) == close - 120           # 15:58: open minutes left
+    assert Engine._through_closed(etf, close - 600, close - 60) == close - 600    # in the session: left
