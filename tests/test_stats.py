@@ -280,3 +280,20 @@ def test_the_first_five_minutes_of_a_session_read_the_opening_step():
     assert how == "same-clock" and n >= 8 and sig > 0
     week = now - 7 * 86400
     assert stats.price_at(hyg, week, now) == hyg.g5.get(int(week // 300)) != hyg.g5.get(int(week // 300) - 1)
+
+
+def test_an_hour_after_the_open_1h_starts_at_the_opening_minute():
+    """From 10:30:00 to 10:31 1H starts inside the session's first 1-minute step. The step before holds
+    the shut market's close, so for that minute of every session 1H took in the night's opening gap
+    (an ETF that opened 1% up and stayed there read +1.0%, true 0). At 10:30:00 exactly the start is
+    before the first print: the gap is in."""
+    spy = Instrument("a:SPY", "a", "SPY", "us_regular")
+    opened = ny_ts(2026, 11, 23, 9, 30)
+    now = opened + 3600
+    for k in range(int(now // 60) - 1439, int(now // 60)):
+        live = clock.market_open("us_regular", (k + 1) * 60 - 1)
+        spy.g1.put(k, 101.0 if live else 100.0, live)
+    spy.price, spy.ts = 101.0, now
+    assert stats.window_return(spy, stats.window_for("1h", now), now)[1] == pytest.approx(1.0)
+    for t in (now + 15, now + 30, now + 45, now + 60):
+        assert stats.window_return(spy, stats.window_for("1h", t), t)[1] == 0.0, t

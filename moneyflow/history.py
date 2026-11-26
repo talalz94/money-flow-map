@@ -17,7 +17,8 @@ from .series import Instrument, NaN
 # 3: an ETF's steps outside its regular session hold the session's last close. Older caches can hold
 # pre- and post-market bars there (carried over nights and weekends): they are rewritten on loading.
 # 4: ... and none of them is empty: a download with no bar for an ETF (a weekend, a holiday, before its
-# first print) carried nothing, so older caches can hold an empty night or weekend: filled on loading.
+# first print) carried nothing, so older caches can hold an empty night or weekend: filled on loading
+# (any version: a start-up download that failed until after the first roll left them empty too).
 VERSION = 4
 
 
@@ -150,7 +151,9 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
             if k >= k_now or k <= k_now - g.size:
                 continue
             g.put(k, NaN if v is None else float(v), bool(lv))
-        if inst.hours == "us_regular" and version < VERSION:
+        if inst.hours == "us_regular":
+            # any version: a start-up download that failed until after the first roll left shut hours
+            # empty in format 4 too (and later starts download only from the newest value)
             _session_closes(g, inst.hours, rewrite=version < 3)
     if inst.v5 is not None and d.get("v5"):
         part = d["v5"]
@@ -179,9 +182,20 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
 
 def _session_closes(g, hours: str, rewrite: bool = True) -> None:
     """Steps outside the session take the session's last close, as the live series and the download
-    write them: an empty one is filled (format 3 and older), and with `rewrite` (format 2 and older) one
-    holding a pre- or post-market print is replaced (unknown before the grid's first session step)."""
+    write them: an empty one is filled, and with `rewrite` (format 2 and older) one holding a pre- or
+    post-market print is replaced (unknown before the grid's first session step)."""
     if g.last_k is None:
+        return
+    if not rewrite:
+        # the steps outside the session hold that close already: an empty one takes the value before
+        # it (market hours looked up for empty steps only: this runs at every start, for every ETF)
+        carry = NaN
+        for k in range(g.first_k(), g.last_k + 1):
+            v = g.get(k)
+            if v == v:
+                carry = v
+            elif carry == carry and not clock.market_open(hours, (k + 1) * g.step - 1):
+                g.put(k, carry, False)
         return
     carry = NaN
     for k in range(g.first_k(), g.last_k + 1):

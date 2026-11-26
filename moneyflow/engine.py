@@ -34,6 +34,8 @@ FLOW_STATUSES = ("live", "delayed", "closed")
 # trades: measured 24 Nov 2026, IEF went 150 s without one at 11:30 New York. Their price is
 # still the latest real trade, and its true age is always shown.
 SOURCE_STALE_S = {"alpaca": 600.0}
+# the sources whose history is downloaded and cached (the cache is loaded for these at the start)
+HISTORY_SOURCES = ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
 DISCLAIMER = ("A heuristic read of public prices, not a fact and not advice. Flows between assets are inferred from "
               "simultaneous opposite moves; nobody can see where each dollar actually goes.")
 
@@ -606,7 +608,7 @@ class Engine:
         startup = state is None
         st = self.seed_state if startup else state
         st.update(state="running", done=0, errors=[], failed=[], ok=[], started=clock.iso(now))
-        insts = [i for i in self.instruments.values() if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
+        insts = [i for i in self.instruments.values() if i.source in HISTORY_SOURCES
                  and (only is None or i.key in only)]
         st["total"] = len(insts) + 2
         if not incremental:
@@ -782,7 +784,10 @@ class Engine:
         live dict from the thread raised "dictionary changed size during iteration". One save at a
         time: two at once (housekeeping and a back-fill) wrote the same temporary files."""
         if insts is None:
-            insts = list(self.instruments.values())
+            # (the final save) what the next start loads first: a window close gives the save about
+            # 4.5 s, and on a busy PC it takes longer; the FX legs' and Coinbase's files are read only
+            # by tools/replay_flows.py
+            insts = sorted(self.instruments.values(), key=lambda i: i.source not in HISTORY_SOURCES)
         n = 0
         with self._save_lock:
             for i in insts:
@@ -1298,7 +1303,7 @@ class Engine:
                 log.exception("history seeding failed")
             first = False
             missing = [i.key for i in self.instruments.values()
-                       if i.source in ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
+                       if i.source in HISTORY_SOURCES
                        and i.g5.last_k is None and i.symbol not in self._funding_only()
                        and i.symbol not in self._stocks         # picked stocks load their own history
                        and not (i.source == "alpaca" and not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"))]
@@ -1325,6 +1330,9 @@ class Engine:
             await asyncio.sleep(max(0.05, 1.0 - (time.monotonic() - t0)))
 
     HOUSEKEEP_EVERY = 5.0
+    # the cache saved every 10 minutes (was 30): a final save cut short (a window close on a busy PC:
+    # Windows allows it about 4.5 s) leaves the files it did not reach at most this old
+    SAVE_EVERY = 600.0
 
     async def _housekeeping(self):
         """Sleep/resume detection (wall clock jumps), NTP re-sync, periodic cache saves. An error in
@@ -1342,7 +1350,7 @@ class Engine:
                 if time.time() - last_sync > 1800:
                     last_sync = time.time()
                     await self.clock.sync()
-                if time.time() - last_save > 1800:
+                if time.time() - last_save > self.SAVE_EVERY:
                     last_save = time.time()
                     await self._save_cache_off_loop()
             except Exception:  # noqa: BLE001 - whatever it was, the next round still runs
@@ -1537,12 +1545,17 @@ class Engine:
         if self.ctx.session is not None:
             await self.ctx.session.close()
 
-    def save_cache_logged(self) -> None:
-        """The final save, its time in the log."""
+    def save_cache_logged(self, done=None) -> None:
+        """The final save, then `done` set (a threading.Event: a closing console window's handler
+        waits for it) and only then its time logged (a log line can wait on the console)."""
         t = time.monotonic()
         try:
             self.save_cache()
         except Exception:  # noqa: BLE001
+            if done is not None:
+                done.set()
             log.exception("final cache save failed")
-        else:
-            log.info("history cache saved in %.1f s", time.monotonic() - t)
+            return
+        if done is not None:
+            done.set()
+        log.info("history cache saved in %.1f s", time.monotonic() - t)

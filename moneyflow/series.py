@@ -21,6 +21,11 @@ from . import clock
 NaN = float("nan")
 G1_STEP, G1_SIZE = 60, 1440
 G5_STEP, G5_SIZE = 300, 10080
+# The longest stretch of an open market an answer with no session bar for a symbol is read as "no
+# trade" over (a thin ETF before its first print, a start a few minutes after the open). Over a longer
+# one it is more likely the venue's own gap: a 200 answer without the symbol filled a 30-minute
+# outage of SPY with its 9:59 price, flagged live, and cleared the hole for good.
+QUIET_MAX_S = 900.0
 
 
 def isnum(x) -> bool:
@@ -87,6 +92,13 @@ class Grid:
         return [self.get(k) for k in range(k0, k1 + 1)]
 
 
+def _newest_value(g: Grid, k_now: int) -> int | None:
+    """The newest step before `k_now` holding a value."""
+    if g.last_k is None:
+        return None
+    return next((k for k in range(min(g.last_k, k_now - 1), g.last_k - g.size, -1) if g.get(k) == g.get(k)), None)
+
+
 class VolumeRing:
     """Per-step traded volume aligned with a Grid (quote currency; taker-buy part optional)."""
 
@@ -122,6 +134,8 @@ class VolumeRing:
 
 class Instrument:
     """One price series from one source (e.g. binance_fut:QQQUSDT index price)."""
+
+    computed = False                        # its price is recomputed from other instruments (Derived)
 
     def __init__(self, key: str, source: str, symbol: str, hours: str = "24/7", *,
                  volume: bool = False, label: str | None = None, delayed_s: float = 0.0):
@@ -235,6 +249,7 @@ class Instrument:
         if self._k1 is None:
             if self.price == self.price:
                 self._k1, self._k5 = k1_now, int(now // G5_STEP)
+                self._carry_shut(now)
             return
         if k1_now <= self._k1:
             return
@@ -284,6 +299,29 @@ class Instrument:
             self._k5 = k5_now
         self._k1 = k1_now
         self._open_any = False
+
+    def _carry_shut(self, now: float) -> None:
+        """The first roll after a start: the price (the cache's last close) over the steps its market
+        was shut in from the grids' newest value on, as the roll writes them while it runs. Up to the
+        first open step (a hole from loading the cache, for the download): nothing traded before it.
+        Left empty, a start-up download that failed until after the first 5-minute roll never filled
+        them: its retries start from the newest value, the start itself, and nothing marks shut hours
+        as missing. A Monday 7:30 start kept the weekend empty for good, every ETF's TODAY unknown."""
+        g5, g1 = self.g5, self.g1
+        k5_now = int(now // G5_STEP)
+        kv = _newest_value(g5, k5_now)
+        if kv is None:
+            return
+        k = kv + 1
+        while k < k5_now and not clock.market_open(self.hours, (k + 1) * G5_STEP - 1):
+            g5.put(k, self.price, False)
+            k += 1
+        # the 1-minute grid over the same shut stretch (sessions open and close on 5-minute steps)
+        k1_now, k1_end = int(now // G1_STEP), k * (G5_STEP // G1_STEP)
+        k1v = _newest_value(g1, k1_now)
+        k1 = max((kv + 1) * (G5_STEP // G1_STEP), k1_now - G1_SIZE + 1, -1 if k1v is None else k1v + 1)
+        for j in range(k1, min(k1_end, k1_now)):
+            g1.put(j, self.price, False)
 
     def _close_volume(self, k5: int, covered: bool = True) -> None:
         m0 = k5 * (G5_STEP // G1_STEP)
@@ -340,6 +378,22 @@ class Instrument:
         # as closes, Friday evening's prints were carried all weekend and became Monday's TODAY
         # reference (0.46% off a price that stays on the session).
         session = self.hours == "us_regular"
+        # No session bar at all for the symbol: "no trade" holds for shut hours and for a short stretch
+        # of an open market (QUIET_MAX_S). A longer one with no value of its own is left unknown, and
+        # so is what follows it up to the grid's next value of its own (the close it would carry, also
+        # into the shut hours after it, is unknown); the hole is from the first such stretch, for the
+        # back-fill (which gives up on it if the next answer is the same).
+        unknown: set[int] = set()
+        if since is not None and not any(k_from <= k < k_until and (not session or clock.market_open(
+                self.hours, (k + 1) * step - 1)) for k in by_k):
+            run = 0
+            for k in range(k_from, k_until):
+                if g.get(k) == g.get(k) or not clock.market_open(self.hours, (k + 1) * step - 1):
+                    run = 0
+                    continue
+                run += 1
+                if run * step > QUIET_MAX_S:
+                    unknown.add(k - run + 1)
         last, k_last = NaN, None
         for k in range(k_from - 1, k0 - 1, -1):            # the carry value: the newest close before
             if k in by_k and (not session or clock.market_open(self.hours, (k + 1) * step - 1)):
@@ -351,9 +405,10 @@ class Instrument:
             last = g.asof(k_from * step, max_back=g.size)
         if session and last != last and grid == "g1":
             last = self.g5.asof(k_from * step, max_back=12)   # an empty 1-day grid: the 5-minute one's
-        n, k_ext = 0, None
+        n, k_ext, blocked = 0, None, False
         for k in range(k_from, k_until):
             open_ = clock.market_open(self.hours, (k + 1) * step - 1)
+            blocked = blocked or k in unknown
             if k in by_k:
                 if open_ or not session:
                     last, k_last = by_k[k], k
@@ -362,9 +417,9 @@ class Instrument:
             elif k < k_first:
                 v = g.get(k)
                 if v == v:                           # up to the first bar the cache's own steps stay
-                    last = v
+                    last, blocked = v, False
                     continue
-            if last == last:
+            if last == last and not blocked:
                 g.put(k, last, open_)
                 n += 1
         if k_ext is not None and (k_ext + 1) * step > (self.extra.get("ext_ts") or 0):
@@ -379,30 +434,41 @@ class Instrument:
         # not trade, so a thin ETF's first trade after the start, or none at all, is no gap) and ends
         # after its start; or the data starts at the gap, or at the oldest step the grid holds
         # (anything older falls out of it anyway: a 1-day grid's first minute is never downloaded again)
-        if h is not None and (
-                (since is not None and h < until and since <= max(h, (k_until - g.size + 2) * step))
-                or (by_k and max(by_k) * step >= h
-                    and (k_first * step <= h or k_first <= k_until - g.size + 2))):
+        covered = h is not None and (
+            (since is not None and h < until and since <= max(h, (k_until - g.size + 2) * step))
+            or (by_k and max(by_k) * step >= h
+                and (k_first * step <= h or k_first <= k_until - g.size + 2)))
+        if unknown:                          # the gap is from what this answer left unknown
+            t_u = min(unknown) * step
+            self.holes[grid] = t_u if h is None or covered else min(h, t_u)
+        elif covered:
             self.holes[grid] = None          # the exchange's own data now covers the gap
         # the price is the newest close known: a downloaded bar newer than it takes over, also after
         # live data (a sleep or an outage over an ETF's close left the pre-outage price all night and
         # weekend: nothing after the close corrects it). Only a bar the grid took (before `until`)
         # counts: one still open would date the price in the future, and live prices older than that
-        # would be dropped as out of order. For an ETF, its session's.
+        # would be dropped as out of order. For an ETF, its session's. Not for a computed series once
+        # it has a price: the next tick computes it from its inputs again (the dollar from FX legs a
+        # sleep left stale), and what was carried from it would differ from the price by their move.
         if k_last is not None:
             t_last = (k_last + 1) * step
-            if k_last >= k_from:
-                if self.price != self.price or self.ts is None or t_last > self.ts:
-                    old = self.price
-                    self.price, self.ts = by_k[k_last], t_last
-                    if old == old and old != self.price:
-                        self._recarry(old, until)
-            elif self.price != self.price:           # no bar inside the grid: at least the last close
+            if self.price != self.price:             # (also with no bar inside the grid: the last close)
                 self.price, self.ts = by_k[k_last], t_last
+            elif k_last >= k_from and not self.computed and (self.ts is None or t_last > self.ts):
+                old = self.price
+                self.price, self.ts = by_k[k_last], t_last
+                if old != self.price:
+                    self._recarry(old, t_last)
         return n
 
     def _recarry(self, old: float, after: float) -> None:
-        """Steps the roll carried a replaced price into, after a download's end: the new one."""
+        """A replaced price, in the steps carried from it, from the end of the close that replaced it
+        (`after`) on: the new close. Nothing traded after that close (the newest the download has;
+        the old price is older), so a step from there holding the old price, not live, carried it: the
+        roll (each tick), or a seed's carry from the grid's own steps. From the download's end only,
+        a sleep over a close that woke over a day later kept the old price in every 1-minute step
+        (its download is one day long: no session bar), and TODAY and 1H read the move to the close.
+        Live steps are left: their feed covered them."""
         for g in (self.g1, self.g5):
             if g.last_k is not None:
                 for k in range(int(after // g.step), g.last_k + 1):
@@ -422,6 +488,8 @@ class Instrument:
 
 class Derived(Instrument):
     """An instrument computed from other instruments (written at each step close)."""
+
+    computed = True
 
     def __init__(self, key: str, inputs: list[Instrument], hours: str = "24/7", label: str | None = None):
         super().__init__(key, "computed", key, hours, label=label)

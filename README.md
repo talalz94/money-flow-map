@@ -45,9 +45,11 @@ Ctrl+C or by closing the window.
 dashboard tab (or app) disconnects**, and also 5 minutes after a start if nobody opens it. A page
 refresh is fine; the 5 minutes are there for that. Stopping is clean: the feeds stop, the port is
 freed, the history cache is saved, open dashboard tabs and apps are told the service is going away,
-and the process exits, 1-2 s after Ctrl+C with a tab or an app connected (the port is free
-during the save, so `start.bat` works again at once). Closing the window saves the cache first, then
-Windows ends the process (within a second; Windows allows about 5). The log says why ("no dashboard
+and the process exits, within 2 s of Ctrl+C with a tab or an app connected (the port is free
+during the save, so `start.bat` works again at once; a second Ctrl+C meanwhile waits for the save).
+Closing the window saves the cache first, then Windows ends the process (about a second after the
+close; Windows allows about 4.5 s, so on a busy PC a longer save is cut short: see section 9).
+Logging off or shutting Windows down ends it without that last save. The log says why ("no dashboard
 tab or app connected for 5 minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
 entry, service or watchdog. Start it again with `start.bat` when you want it.
 
@@ -685,7 +687,7 @@ The large-cap screen costs no measurable CPU (one bulk request every 5 minutes, 
   - parsing RSS (9 feeds every 3 min);
   - DefiLlama's 0.6 MB stablecoin list (hourly);
   - re-estimating σ (once a minute);
-  - saving the history cache (every 30 min).
+  - saving the history cache (every 10 min).
 - **Load at the US open:** about 180 messages/s across all feeds. Binance BTC/ETH trades alone
   were ~90/s. `trade_stream = false` under `[connectors.binance_spot]` drops them in exchange for
   BTC/ETH prices up to ~2 s old.
@@ -798,16 +800,33 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     down. The save is the stop's slow part: about a second, 4-13 s on a busy PC. It takes half the time
     or less now (no rounding of every value, a slice of each ring buffer, `orjson` when installed).
   - Measured with the real `serve()` (33 instruments) and a tab or an SSE app connected: the save
-    starts at once and the process ends 0.8-1.6 s after Ctrl+C. Before, the save waited for the
+    starts at once and the process ends 0.5-1.6 s after Ctrl+C. Before, the save waited for the
     open streams (41 s for a tab, 122 s for an SSE app, the process lingering as long), and a second
     Ctrl+C meanwhile, or Ctrl+Break then Ctrl+C, ended it with nothing saved.
+  - **A second Ctrl+C during the save** is noted ("still saving the history cache...") and the stop
+    goes on; once the save is done Ctrl+C acts again. It used to cut the save short (11-27 of 33
+    files written in this round's runs, the server's shutdown skipped).
   - **Closing the console window:** Windows ends the process about 5 s after the window closes,
     whatever runs. The process was gone within 0.03 s with nothing saved: the C runtime's handler
     for that event returns at once. A handler of its own now starts the stop and holds the process
-    until the cache is saved, first on this path: saved in 0.3-0.9 s, then Windows ends the process
+    until the cache is saved, first on this path: saved in 0.4-1.0 s, then Windows ends the process
     (its exit code is then 0xC000013A). Tested by closing the console window (WM_CLOSE, what its X
-    button sends), through `start.bat` too. Logging off or shutting Windows down was not tested.
-- **History** is saved to `data/cache/` every 30 minutes, after each download and on exit. The files
+    button sends), through `start.bat` too, and during a stop already under way (after Ctrl+C,
+    Ctrl+Break or the auto-stop: that save used to be skipped).
+  - **The console is written from a thread of its own.** A console window with a text selection (a
+    click in it with QuickEdit on, Windows' default, or Edit > Mark) holds every write to it until the
+    selection ends: a log line written meanwhile froze the whole service (the API did not answer),
+    and a window closed in that state saved nothing. The service now runs on, and the lines appear
+    once the selection ends. The log file still says when a window close started the stop ("the
+    console window is closing: saving the history cache first...").
+  - **The limit:** Windows ends the process about 4.5 s after the close, saved or not. On a busy PC
+    the save can take longer (the review measured 7-8 s with the PC loaded); it writes the files the
+    next start reads first, and those it does not reach keep their last save (every 10 minutes): the
+    next start downloads the rest. Each file is written whole or not at all.
+  - **Logging off or shutting Windows down** is not covered: Windows does not call the handler in
+    this process then (`user32.dll` is loaded by its imports), so those end it without the final
+    save, as before. The cache then holds the last periodic save.
+- **History** is saved to `data/cache/` every 10 minutes, after each download and on exit. The files
   are written in a worker thread, from the list of instruments taken on the event loop (which picks
   and drops stocks meanwhile: reading its live list from the thread failed), one save at a time. An
   error in a housekeeping round is logged and the next round runs (one failed save had ended wake
@@ -1353,8 +1372,8 @@ and now:
 |---|---|---|
 | **A download with no bar for any ETF** (a Saturday or Thanksgiving cache, a start at 7:30 or 2:00 before IEX's first print) | every ETF's TODAY unknown all day (10 of 10), HYG and IEF "warming up", the risk meter without its credit input | TODAY within 0.004 percentage points of the oracle for all 10 |
 | **A sleep or an outage over an ETF's close** (SPY 600 until 15:30, closed at 606) | price 600 all night and weekend; Monday 10:30 TODAY and 1H +1.0% (true 0%) | price 606 after the back-fill; Monday 0.0% |
-| **Stopping with a dashboard tab or an SSE app open** (Ctrl+C) | the save started after 41 s (tab) or 122 s (SSE), the process lingering as long; a second Ctrl+C meanwhile, or Ctrl+Break then Ctrl+C: nothing saved | saved at once (33 of 33 files, also after a second Ctrl+C), the process gone after 0.8-1.6 s |
-| **Closing the console window** | the process gone within 0.03 s, nothing saved | the cache saved first (0.3-0.9 s), then Windows ends the process; also through `start.bat` |
+| **Stopping with a dashboard tab or an SSE app open** (Ctrl+C) | the save started after 41 s (tab) or 122 s (SSE), the process lingering as long; a second Ctrl+C meanwhile, or Ctrl+Break then Ctrl+C: nothing saved | saved at once (33 of 33 files, also after a second Ctrl+C that comes once the save is done; one during the save still cut it short: fixed in the twelfth round), the process gone after 0.8-1.6 s |
+| **Closing the console window** | the process gone within 0.03 s, nothing saved | the cache saved first (0.3-0.9 s on a quiet PC), then Windows ends the process; also through `start.bat` (a save over about 4.5 s is cut short: see the twelfth round) |
 | **The first 5 minutes of a session** (an ETF at 9:30-9:35) | TODAY σ 0, z missing ("warming up"); 1W +0.56% (true -0.006%) | σ 0.66%, z shown (at 9:30:05 in the test); 1W -0.025% |
 | **A start between the open and a thin ETF's first trade** (9:40, first trade 9:45) | a gap kept for each such ETF, a second download and "no exchange data" for each (10 of 10) | no gap, one download |
 | **A save refused while another process reads the file** (a copy started at once, 30 trials) | 2 save errors, 2 temporary files left for good | 0 errors (retried), none left; a killed save's file is removed at the next start |
@@ -1372,6 +1391,41 @@ and now:
   round changed the code) and this round's. Three of this round's were caught at first only by a
   webhook test that fails under load (the price rewritten in live steps or before the download's
   end, the close handler not waiting): their own tests now catch them.
+
+**Twelfth round (26 Nov 2026): a review of the eleventh round.** Checked on the review's reproductions
+and harnesses (offline; the real `serve()` in a console window of its own where it says so), on the
+code before this round (10246f7) and now:
+
+| | Before | Now |
+|---|---|---|
+| **A sleep over an ETF's close that wakes a day or more later** (SPY 600 until 15:30, closed at 606; awake Monday 8:00, Saturday 17:30, or Friday 8:00 after Thanksgiving) | price 606, but every 1-minute step held 600: TODAY and 1H +1.0% while the market was shut (true 0), TODAY +1.0% all through the next session | 0.0% at every read, and after a restart; in the review's random lifecycles the five multi-day outages went from 900-1,320 wrong 1-minute steps each to 0 (89 in one, the same 89 as before; 90 long-sleep runs: none worse) |
+| **The computed dollar after a weekend wake** (FX legs stale since Friday 15:00, ICE 0.3% higher at 17:00, awake Saturday 18:00) | TODAY and 1H -0.30% while FX was shut (true 0) | 0.0% |
+| **An answer with no bar for an ETF that did trade** (SPY, a 30-minute outage while awake) | the 30 minutes written as the 9:59 price, flagged live; the hole cleared for good, also in the cache | left unknown (30 of 30), given up as "no exchange data", downloaded again at the next start |
+| **A window closed as a stop begins** (during the feeds' stop, after Ctrl+Break or Ctrl+C) | 0 of 33 files saved | 33 of 33 (saved within a second) |
+| **A start whose first downloads fail past the first 5-minute roll** (Monday 7:30, network up at 7:33:30 or 7:36) | the weekend left empty (521 steps), TODAY unknown for 10 of 10 ETFs all Monday, the same after a restart, 1W unknown the next Saturday | none empty, TODAY and 1W known; a format-4 cache with an empty weekend: 521 empty steps to 0 on loading |
+| **1H in a session's first minute an hour on** (10:30:00-10:31, an ETF that opened 1% up and stayed) | +1.000% (the night's gap) | 0.000% (at 10:30:00 exactly +1.000%: before the first print) |
+| **A second Ctrl+C during the final save** | 27 of 33 files (a tab open, the second 0.5 s after the first); 11 of 33 with real key presses during a 2.6 s save; the server's shutdown skipped (the tab got 1006) | 33 of 33, the shutdown complete (1001) |
+| **A window closed while the console has a text selection** (Edit > Mark) | nothing saved, the process ended 4.5 s after the close; with the service logging meanwhile, the API did not answer | 33 of 33 saved 0.4-0.7 s after the close; the API answered in 0.1-0.2 s |
+| **A window closed during a slow save** (7 s, as on a busy PC) | 19 of 33 files, 13 of them among the 25 the next start reads | 19 of 33, all among those 25; the rest at most 10 minutes old (was 30) |
+
+- **Also:** logging off or shutting Windows down is not covered (Windows does not call the
+  handler in this process: `user32.dll` is loaded), now said in the code and in section 9.
+  Loading the cache fills empty shut hours in any format (10 full ETF caches: 144 to 164 ms). A
+  test that runs `main()` no longer leaves the selector event loop policy set for every later test:
+  the webhook test's two deliveries then arrived the other way round whenever it ran after that file
+  (put down to load in the last two rounds).
+- **Not changed:** a final save cut short by Windows on a busy PC (section 9: the files the next
+  start reads go first, and the cache is saved every 10 minutes). A save of only what changed
+  would not help: the roll writes every instrument's new step each minute. The computed dollar's
+  TODAY after a wake between Friday 17:00 and Saturday 17:00 still compares the legs' stale price
+  with ICE's close at the roll (-0.30% for a wake on Saturday at 1:00 in the review's case), as before.
+- **Tests: 238 pass.** The new ones cover each item above.
+- **Mutation check: 129 of 130 changes are caught:** the eleventh round's (rewritten where this
+  round changed the code) and this round's. The one left is equivalent now: without a key, seeding
+  Yahoo's 5-minute bars only up to their last one leaves nothing empty, as the first roll after the
+  start carries the same close over the same shut hours (with that carry off too, the test catches
+  it). Two older ones (an empty answer not seeded, an older cache's empty night not filled) were
+  caught at first only by that webhook test: new test cases catch them.
 
 ---
 

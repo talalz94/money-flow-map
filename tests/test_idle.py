@@ -80,6 +80,9 @@ def test_config_and_flags(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "serve", fake_serve)
     monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    # main() sets the selector event loop policy on Windows: for this process, every later test's loop
+    # too (the webhook test's two deliveries then arrived the other way round whenever this file ran first)
+    monkeypatch.setattr(asyncio, "set_event_loop_policy", lambda policy: None)
     for argv, want in ((["run"], 5), (["run", "--stay-running"], 0), (["run", "--idle-minutes", "2"], 2)):
         cli.main(argv)
         assert seen["idle"] == want, argv
@@ -275,9 +278,9 @@ def test_closing_the_console_window_saves_the_cache_first(tmp_path, keys, monkey
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a Windows console handler")
 def test_the_console_handler_takes_the_close_events_and_leaves_ctrl_c_to_python():
-    """The handler serve() registers: for a closing window (and logoff, shutdown) it sets the stop and
-    waits until the cache is saved, then tells Windows it is done; Ctrl+C and Ctrl+Break go on to the
-    signal handlers (False)."""
+    """The handler serve() registers: for a closing window it sets the stop and waits until the cache
+    is saved, then tells Windows it is done; Ctrl+C and Ctrl+Break go on to the signal handlers (False).
+    (Logoff and shutdown never reach it in this process: user32.dll is loaded.)"""
     import threading
 
     async def go():
@@ -296,3 +299,128 @@ def test_the_console_handler_takes_the_close_events_and_leaves_ctrl_c_to_python(
         finally:
             cli._console_handler_off(h)
     asyncio.run(go())
+
+
+# ── twelfth round: a close as the stop begins, a second Ctrl+C in the save, a held console ──────────
+def _close_hook(monkeypatch, got):
+    monkeypatch.setattr(cli, "_on_console_close",
+                        lambda loop, stop, closing, saved: got.update(loop=loop, stop=stop, closing=closing, saved=saved))
+
+
+def test_a_window_closed_as_the_stop_begins_still_gets_the_save(tmp_path, keys, monkeypatch):
+    """A close that arrives after a stop began (Ctrl+C, Ctrl+Break, the auto-stop) but before its save:
+    serve() read the closing flag again as "saved first already" and skipped the save, while the
+    console handler held the process for it (0 of 33 files)."""
+    import signal
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0)
+    seen = _stop_probe(monkeypatch, port)
+    got: dict = {}
+    real_stop_feeds = Engine.stop_feeds
+
+    async def stop_feeds(self):
+        got["closing"].set()                                   # the window closes now (the handler's first step)
+        await real_stop_feeds(self)
+    monkeypatch.setattr(Engine, "stop_feeds", stop_feeds)
+    _close_hook(monkeypatch, got)
+
+    async def go():
+        task = asyncio.create_task(cli.serve(cfg, keys, dashboard=False, open_browser=False))
+        await asyncio.sleep(0.5)
+        signal.raise_signal(signal.SIGTERM)                    # the stop begins (as Ctrl+Break)
+        await asyncio.wait_for(task, timeout=10)
+    asyncio.run(go())
+    assert seen["saves"] == 1 and got["saved"].is_set()
+
+
+def test_a_second_ctrl_c_during_the_final_save_does_not_cut_it_short(tmp_path, keys, monkeypatch):
+    """asyncio's handler raises KeyboardInterrupt at a second Ctrl+C: inside the final save it skipped
+    the rest of it (5-16 of 33 files written) and the server's shutdown. It is noted and the stop goes
+    on; once the save is done Ctrl+C acts again (asyncio's handler is back)."""
+    import signal
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0)
+    seen = _stop_probe(monkeypatch, port)
+    written = []
+
+    def save_cache(self, insts=None):
+        seen["saves"] += 1
+        for n in range(33):
+            if n == 5:
+                signal.raise_signal(signal.SIGINT)             # the second Ctrl+C, mid-save
+            time.sleep(0.002)
+            written.append(n)
+        seen["handler_in_save"] = signal.getsignal(signal.SIGINT)
+    monkeypatch.setattr(Engine, "save_cache", save_cache)
+
+    async def start(self):                                     # the first Ctrl+C, half a second in
+        asyncio.get_running_loop().call_later(0.5, signal.raise_signal, signal.SIGINT)
+    monkeypatch.setattr(Engine, "start", start)
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler   # (each stop before gave it back)
+    with pytest.raises(KeyboardInterrupt):                     # as after any Ctrl+C (main() prints "stopped.")
+        asyncio.run(asyncio.wait_for(cli.serve(cfg, keys, dashboard=False, open_browser=False), timeout=20))
+    assert written == list(range(33)) and seen["saves"] == 1 and "cleanup_at" in seen
+    assert seen["handler_in_save"] is not signal.default_int_handler
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+def test_closing_the_window_while_the_console_is_held_still_saves(tmp_path, keys, monkeypatch, caplog):
+    """A console window with a text selection (a click in it with QuickEdit on, or Edit > Mark) holds
+    every write to it until the selection ends. The stop wrote "stopping..." to it before the save: the
+    write never returned, nothing was saved, and Windows ended the process 4.5 s after the close.
+    Console output goes through a thread of its own, and on this path the save comes first."""
+    import logging
+    import threading
+    caplog.set_level(logging.INFO, logger="moneyflow")
+    released = threading.Event()
+
+    class HeldConsole:
+        def __init__(self):
+            self.text = []
+
+        def write(self, s):
+            released.wait(20)                                  # the selection, until it ends
+            self.text.append(s)
+
+        def flush(self):
+            pass
+    console = HeldConsole()
+    writer = cli.ConsoleWriter()
+    monkeypatch.setattr(cli, "_console", writer)
+    monkeypatch.setattr(sys, "stdout", console)                # the banner (say) goes there too
+    handler = cli._ConsoleHandler(writer, console)
+    order = []
+
+    class Order(logging.Handler):
+        def emit(self, record):
+            order.append((time.monotonic(), record.getMessage()))
+    rec = Order()
+    log = logging.getLogger("moneyflow")
+    log.addHandler(handler)
+    log.addHandler(rec)
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0)
+    seen = _stop_probe(monkeypatch, port)
+    got: dict = {}
+    _close_hook(monkeypatch, got)
+
+    async def go():
+        task = asyncio.create_task(cli.serve(cfg, keys, dashboard=False, open_browser=False))
+        await asyncio.sleep(0.5)
+        got["closing"].set()                                   # what the handler does on CTRL_CLOSE_EVENT
+        got["loop"].call_soon_threadsafe(got["stop"].set)
+        got["saved_in_time"] = await asyncio.get_running_loop().run_in_executor(None, got["saved"].wait, 5)
+        await asyncio.wait_for(task, timeout=10)
+    try:
+        asyncio.run(go())
+        held = list(console.text)
+    finally:
+        released.set()
+        log.removeHandler(handler)
+        log.removeHandler(rec)
+        writer.close()
+    assert got["saved_in_time"] and seen["saves"] == 1 and not held
+    stopping = [t for t, m in order if m.startswith("stopping")]
+    assert stopping and seen["save_at"] < stopping[0]          # saved before anything was written of the stop
+    text = "".join(console.text)                               # all there once the selection ends
+    assert "Money Flow Map is running" in text and "stopping..." in text

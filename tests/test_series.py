@@ -376,8 +376,58 @@ def test_a_newer_download_replaces_a_stale_live_price_and_what_the_roll_carried_
     k_pre, k_live = int(ny_ts(2026, 11, 20, 9, 0) // G1_STEP), int((wake + 120) // G1_STEP)
     inst.g1.put(k_pre, 600.0, False)                               # the morning carried 600 as well: real
     inst.g1.put(k_live, 600.0, True)                               # a live step at 600 is data too
+    k_mid, k_other = int((close + 900) // G1_STEP), int((close + 1200) // G1_STEP)
+    inst.g1.put(k_other, 599.0, False)                             # another value: not carried from 600
+    assert inst.g1.get(k_mid) == 600.0
     inst.seed("g5", [(t0 + 300 * i, 600.0 + 0.5 * i) for i in range(12)], wake + 30, since=t0)
     assert inst.price == 605.5 and inst.ts == close
     assert inst.g1.get(k1) == 605.5 and inst.g5.get(int((wake - 300) // G5_STEP)) == 605.5
-    assert inst.g1.get(k_pre) == 600.0 and inst.g1.get(k_live) == 600.0   # only what the roll carried after the download
+    # from the new close's end on, before the download's end too (the 1-day download of a wake days
+    # later has no session bar: it keeps what the grid holds); only what was carried from the old price
+    assert inst.g1.get(k_mid) == 605.5 and inst.g1.get(k_other) == 599.0
+    assert inst.g1.get(k_pre) == 600.0 and inst.g1.get(k_live) == 600.0
     assert inst.holes["g5"] is None
+
+
+def test_an_answer_with_no_bar_over_a_long_open_stretch_leaves_it_unknown():
+    """IEX has bars only for minutes that traded, but an answer with no session bar at all is "no trade"
+    only over shut hours and a short stretch of an open market (a start a few minutes after the open,
+    before a thin ETF's first print). Over a longer one it is more likely the venue's own gap (a 30-
+    minute outage of SPY was written as its 9:59 price, flagged live, the hole cleared for good): what
+    has no value there stays unknown, and so do the shut hours after it (their close is unknown too);
+    the hole is from there. With a session bar in the answer, a quiet stretch is a thin ETF's."""
+    sat = ny_ts(2026, 11, 21, 12, 0)
+    for grid, step in (("g5", G5_STEP), ("g1", G1_STEP)):
+        for start, carried in ((ny_ts(2026, 11, 23, 9, 44), True), (ny_ts(2026, 11, 23, 9, 50), False)):
+            inst = Instrument("x:UUP", "x", "UUP", "us_regular")
+            g = getattr(inst, grid)
+            k = int(sat // step)
+            for j in range(k - 100, k):
+                g.put(j, 27.0, False)                              # the cache: Friday's close, to Saturday noon
+            opened = ny_ts(2026, 11, 23, 9, 30)
+            inst._hole(grid, opened)
+            inst.seed(grid, [], start, since=sat - 600)
+            weekend = range(max(k, int(start // step) - g.size + 1), int(opened // step))   # (as far as it holds)
+            session = range(int(opened // step), int(start // step))
+            assert all(g.get(j) == 27.0 for j in weekend), (grid, start)
+            assert all((g.get(j) == 27.0) is carried and not (g.is_live(j) and not carried) for j in session)
+            assert inst.holes[grid] == (None if carried else opened), (grid, start)
+    # an outage over Friday's close: nothing from 15:00 on (the weekend would carry the 14:55 price)
+    fri, mon = ny_ts(2026, 11, 20, 15, 0), ny_ts(2026, 11, 23, 8, 0)
+    for closes, carried in (([], False), ([(fri - 300, 27.5)], True)):
+        inst = Instrument("x:SPY", "x", "SPY", "us_regular")
+        for j in range(int(fri // G5_STEP) - 50, int(fri // G5_STEP)):
+            inst.g5.put(j, 27.5, True)
+        inst.seed("g5", closes, mon, since=fri - 600)
+        after = range(int(fri // G5_STEP), int(mon // G5_STEP))
+        assert all((inst.g5.get(j) == 27.5) is carried for j in after)
+        assert inst.holes["g5"] == (None if carried else fri)
+    # an older stretch with no value (a gap given up before): unknown only up to the grid's next value
+    inst = Instrument("x:SPY", "x", "SPY", "us_regular")
+    gap, close = range(int(fri // G5_STEP) - 12, int(fri // G5_STEP) - 6), int(ny_ts(2026, 11, 20, 16, 0) // G5_STEP)
+    for j in range(int(fri // G5_STEP) - 50, close):
+        inst.g5.put(j, NaN if j in gap else 27.5, j not in gap)
+    sat = ny_ts(2026, 11, 21, 12, 0)
+    inst.seed("g5", [], sat, since=fri - 4200)
+    assert all(inst.g5.get(j) != inst.g5.get(j) for j in gap) and inst.holes["g5"] == gap[0] * G5_STEP
+    assert all(inst.g5.get(j) == 27.5 for j in range(close, int(sat // G5_STEP)))   # the night carried

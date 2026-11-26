@@ -62,7 +62,7 @@ def window_for(tf: str, now: float) -> Window:
 def price_at(inst: Instrument, ts: float, now: float) -> float:
     """The instrument's price as of `ts` (close of the last step ending at or before `ts`)."""
     if now - ts <= 23.5 * 3600:
-        v = inst.g1.asof(ts, max_back=10)
+        v = close_at(inst.g1, inst.hours, ts, 10)
         if isnum(v):
             return v
     return close_at(inst.g5, inst.hours, ts, 6)
@@ -72,8 +72,9 @@ def close_at(g, hours: str, t: float, max_back: int) -> float:
     """g.asof(t), except inside the first step of a session (its market shut in the step before):
     that step's own close. The step before holds the shut market's last close, so a read from it
     left the opening move out: an ETF's TODAY σ read 0 for the first 5 minutes of every session (each
-    past day's move from the roll to the same minute was 0), and its 1W change reached back to the
-    week-old close before that day's opening gap."""
+    past day's move from the roll to the same minute was 0), its 1W change reached back to the
+    week-old close before that day's opening gap, and from 10:30:00 to 10:31 its 1H change took in
+    the night's gap (the first 1-minute step)."""
     k = int(t // g.step)
     if t % g.step and clock.market_open(hours, t) and not clock.market_open(hours, k * g.step - 1):
         v = g.get(k)

@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import contextlib
 import logging
 import logging.handlers
+import queue
 import sys
+import threading
 import webbrowser
 
 from . import __version__, config as cfgmod
@@ -24,7 +28,66 @@ def load_keys(cfg: dict) -> KeyStore:
     return KeyStore().load(files, base=Path(cfg["_project_dir"]))
 
 
+class ConsoleWriter:
+    """Console output from a thread of its own. A console window with a text selection (a click in it
+    with QuickEdit on, Windows' default, or Edit > Mark) holds every write to it until the selection
+    ends: a log line written from the event loop froze the whole service meanwhile, and a window
+    closed in that state saved nothing (the stop's first log line never returned)."""
+
+    def __init__(self):
+        self._q: queue.SimpleQueue = queue.SimpleQueue()    # put() never blocks, not even in a signal handler
+        self._t = threading.Thread(target=self._run, name="console", daemon=True)
+        self._t.start()
+
+    def write(self, stream, text: str) -> None:
+        self._q.put((stream, text))
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            stream, text = item
+            try:
+                stream.write(text)
+                stream.flush()
+            except Exception:  # noqa: BLE001 - a closed or broken console: nothing to show it on
+                pass
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Let what is queued reach the console (for at most `timeout`: it can be held)."""
+        self._q.put(None)
+        self._t.join(timeout)
+
+
+class _ConsoleHandler(logging.Handler):
+    """A log handler writing through the ConsoleWriter (formatted here, written there)."""
+
+    def __init__(self, writer: ConsoleWriter, stream):
+        super().__init__()
+        self.writer, self.stream = writer, stream
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.writer.write(self.stream, self.format(record) + "\n")
+        except Exception:  # noqa: BLE001
+            self.handleError(record)
+
+
+_console: ConsoleWriter | None = None
+
+
+def say(text: str, stream=None) -> None:
+    """Print a line to the console, through the ConsoleWriter once logging is set up."""
+    stream = stream or sys.stdout
+    if _console is None:
+        print(text, file=stream, flush=True)
+    else:
+        _console.write(stream, text + "\n")
+
+
 def setup_logging(cfg: dict, keys: KeyStore, level: str | None = None) -> None:
+    global _console
     lvl = getattr(logging, (level or cfg.get("general", {}).get("log_level", "INFO")).upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(lvl)
@@ -32,7 +95,10 @@ def setup_logging(cfg: dict, keys: KeyStore, level: str | None = None) -> None:
         root.removeHandler(h)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S")
     red = RedactingFilter(keys)
-    sh = logging.StreamHandler(sys.stderr)
+    if _console is None:
+        _console = ConsoleWriter()
+        atexit.register(_console.close)
+    sh = _ConsoleHandler(_console, sys.stderr)
     sh.setFormatter(fmt)
     sh.addFilter(red)
     root.addHandler(sh)
@@ -72,9 +138,9 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
     auto = (f"stops by itself {idle.grace / 60:g} min after the last dashboard tab or app disconnects "
             f"(or if never opened)" if idle.grace else "keeps running until stopped (auto-stop off)")
     log.info("auto-stop: %s", auto)
-    print(f"\n  Money Flow Map is running.\n  API:        {url}api\n"
-          f"  Dashboard:  {url if dashboard else '(off: started with --no-dashboard)'}\n"
-          f"  Stop:       Ctrl+C, or it {auto}\n", flush=True)
+    say(f"\n  Money Flow Map is running.\n  API:        {url}api\n"
+        f"  Dashboard:  {url if dashboard else '(off: started with --no-dashboard)'}\n"
+        f"  Stop:       Ctrl+C, or it {auto}\n")
     if open_browser and dashboard:
         webbrowser.open(url)
     stop = asyncio.Event()
@@ -84,7 +150,6 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         loop.call_soon_threadsafe(stop.set)
 
     import signal
-    import threading
     previous = {}
     for name in ("SIGBREAK", "SIGTERM"):          # Ctrl+Break; kill
         if hasattr(signal, name):
@@ -103,7 +168,7 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
             if idle.should_stop():
                 why = idle.reason()
                 log.info("auto-stop: %s", why)
-                print(f"\n  Money Flow Map: {why}\n", flush=True)
+                say(f"\n  Money Flow Map: {why}\n")
                 stop.set()
 
     watcher = asyncio.create_task(watch_idle(), name="idle") if idle.grace else None
@@ -112,16 +177,23 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
     finally:
         if watcher is not None:
             watcher.cancel()
-        log.info("stopping (saving the history cache)...")
-        if closing.is_set():
-            # the console window is closing (or Windows logs off or shuts down): the process ends about
-            # 5 s later whatever runs, so the cache is saved first
-            engine.save_cache_logged()
+        with _ctrl_c_noted():
+            # the console window is closing: Windows ends the process about 4.5 s after the close
+            # whatever runs, so the cache is saved first. The flag is read once: a close during the
+            # steps below waits for the save below (read again there, it skipped that save).
+            saved_first = closing.is_set()
+            if saved_first:
+                # (a log line reaches the console through its own thread: it cannot hold the save, and
+                # the log file shows the close even if Windows ends the process during the save)
+                log.info("the console window is closing: saving the history cache first...")
+                engine.save_cache_logged(saved)
+            log.info("stopping..." if saved_first else "stopping (saving the history cache)...")
+            await engine.stop_feeds()
+            await site.stop()           # the port is free: start.bat can open a new copy at once
+            if not saved_first:
+                engine.save_cache_logged(saved)    # not held up by open streams
             saved.set()
-        await engine.stop_feeds()
-        await site.stop()               # the port is free: start.bat can open a new copy at once
-        await engine.stop(save=not closing.is_set())   # the save, not held up by open streams
-        saved.set()
+        await engine.stop(save=False)   # (saved above)
         await runner.cleanup()          # closes the dashboards' streams and waits for their handlers
         if console is not None:
             _console_handler_off(console)
@@ -133,12 +205,38 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         log.info("stopped")
 
 
+@contextlib.contextmanager
+def _ctrl_c_noted():
+    """A Ctrl+C while the stop saves the cache is noted, not acted on: asyncio's handler raised
+    KeyboardInterrupt inside the save at a second Ctrl+C, and 5-16 of 33 files were written. (Only
+    the main thread can set it: elsewhere nothing changes.)"""
+    import signal
+
+    def note(*_):
+        if _console is not None:        # a queue: never blocks, safe inside a signal handler
+            _console.write(sys.stderr, "  still saving the history cache...\n")
+    try:
+        prev = signal.signal(signal.SIGINT, note)
+    except (ValueError, OSError):
+        prev = None
+    try:
+        yield
+    finally:
+        if prev is not None:
+            try:
+                signal.signal(signal.SIGINT, prev)
+            except (ValueError, OSError, TypeError):
+                pass
+
+
 def _on_console_close(loop, stop: asyncio.Event, closing, saved):
-    """Windows ends a console process about 5 s after its window is closed (and at logoff or shutdown)
-    whatever its Python handlers do: the C runtime's handler for that event returns at once, so the
-    process was gone within 60 ms, its cache unsaved. This handler starts the graceful stop instead and
-    holds the process until the cache is saved (first, on this path). Called from a thread of the
-    system's; returned to keep a reference to it (None if it could not be set)."""
+    """Windows ends a console process about 5 s after its window is closed whatever its Python
+    handlers do: the C runtime's handler for that event returns at once, so the process was gone
+    within 60 ms, its cache unsaved. This handler starts the graceful stop instead and holds the
+    process until the cache is saved (first, on this path). Windows does not call it at logoff or
+    shutdown in this process (user32.dll is loaded by its imports): those still end it unsaved, as
+    before (5 and 6 are taken should they ever come). Called from a thread of the system's; returned
+    to keep a reference to it (None if it could not be set)."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -311,7 +409,7 @@ def main(argv=None) -> int:
     try:
         asyncio.run(serve(cfg, keys, dashboard, open_browser))
     except KeyboardInterrupt:
-        print("stopped.")
+        say("stopped.")
     return 0
 
 
