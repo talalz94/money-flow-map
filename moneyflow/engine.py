@@ -677,16 +677,18 @@ class Engine:
                 st["done"] += len(alp_insts)
                 return
             try:
-                since5 = min(start_of(i) for i in alp_insts)
+                since5, since1 = min(start_of(i) for i in alp_insts), now - 86400 + 60
                 b5 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "5Min", since5, None, conn.cfg.get("feed", "iex"))
-                b1 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "1Min", now - 86400 + 60, None, conn.cfg.get("feed", "iex"))
+                b1 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "1Min", since1, None, conn.cfg.get("feed", "iex"))
                 for i in alp_insts:
+                    # IEX has bars only for minutes that traded (`since`: none from there to the first
+                    # bar is no gap)
                     rows = b5.get(i.symbol, [])
                     if rows:
-                        i.seed("g5", [(t, c) for t, c, _ in rows], now, [(t, q, math.nan) for t, _, q in rows])
+                        i.seed("g5", [(t, c) for t, c, _ in rows], now, [(t, q, math.nan) for t, _, q in rows], since=since5)
                     rows1 = b1.get(i.symbol, [])
                     if rows1:
-                        i.seed("g1", [(t, c) for t, c, _ in rows1], now)
+                        i.seed("g1", [(t, c) for t, c, _ in rows1], now, since=since1)
                     st["ok"].append(i.key)
             except Exception as e:  # noqa: BLE001
                 st["errors"].append(self.keys.redact(f"alpaca: {e}")[:200])
@@ -1517,14 +1519,23 @@ class Engine:
         finally:
             self._backfill_wake = None
 
-    async def stop(self) -> None:
+    async def stop_feeds(self) -> None:
+        """Cancel every task: the streams close and downloads stop (the first half of stop())."""
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+    async def stop(self) -> None:
+        """Stop the feeds, then save the history cache. The save takes the time (1 s, several on a busy
+        PC): the CLI frees the port in between, so a new copy can start at once."""
+        await self.stop_feeds()
+        t = time.monotonic()
         try:
             self.save_cache()
         except Exception:  # noqa: BLE001
             log.exception("final cache save failed")
+        else:
+            log.info("history cache saved in %.1f s", time.monotonic() - t)
         if self.ctx.session is not None:
             await self.ctx.session.close()

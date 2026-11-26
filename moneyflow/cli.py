@@ -110,8 +110,9 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         if watcher is not None:
             watcher.cancel()
         log.info("stopping (saving the history cache)...")
+        await engine.stop_feeds()
+        await runner.cleanup()          # the port is free while the cache is saved: start.bat works at once
         await engine.stop()
-        await runner.cleanup()
         for name, handler in previous.items():
             try:
                 signal.signal(getattr(signal, name), handler)

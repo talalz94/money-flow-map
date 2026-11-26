@@ -43,9 +43,10 @@ Ctrl+C or by closing the window.
 
 **It does not keep running in the background.** It stops by itself **5 minutes after the last
 dashboard tab (or app) disconnects**, and also 5 minutes after a start if nobody opens it. A page
-refresh is fine; the 5 minutes are there for that. Stopping is clean: the feeds stop, the history
-cache is saved, the port is freed and the process exits. The log says why ("no dashboard tab or app
-connected for 5 minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
+refresh is fine; the 5 minutes are there for that. Stopping is clean: the feeds stop, the port is
+freed, the history cache is saved and the process exits (the port is free during the save, so
+`start.bat` works again at once). The log says why ("no dashboard tab or app connected for 5
+minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
 entry, service or watchdog. Start it again with `start.bat` when you want it.
 
 - An app using the API keeps it alive: an open WebSocket/SSE stream, or any request (or webhook
@@ -741,15 +742,28 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     second or more).
   - The time the app was off counts as a gap too, from the first moment its market was open (an
     ETF whose market stayed shut has nothing to download), in the 1-minute grid as well (a cache
-    older than the day that grid holds leaves it empty). If the first download at a start fails,
+    older than the day that grid holds leaves it empty; from its first open minute there too: at a
+    closed one, a Sunday or 2:00, the download never covered it and every such start fetched each
+    ETF again for nothing). If the first download at a start fails,
     the retry still fetches it, and meanwhile the cache's last close is not carried as data (it
     stood in as TODAY's start price for a whole session, and after 30-48 hours off TODAY read +44%
     and 1H +94%).
   - Until the first live price, an instrument's price is the newest close known: the cache's last
-    data (not the close carried after it), or a newer downloaded bar. For an ETF that is the
-    session's close: pre- and post-market bars are kept aside, as live prints are. Without a key,
-    an ETF's Yahoo history is carried on through the hours its market was shut since its last bar
-    (not over open ones: a delayed feed's minutes are unknown).
+    data (not the close carried after it), or a newer downloaded bar. Without a key, an ETF's Yahoo
+    history is carried on through the hours its market was shut since its last bar (not over open
+    ones: a delayed feed's minutes are unknown).
+  - **An ETF's history is its regular session**, as its live series is: Alpaca's IEX bars include
+    pre- and post-market prints, which are kept aside (the latest as `ext_price`, like a live one)
+    while the session's close is carried over those hours. Stored as closes, Friday evening's
+    prints were carried all weekend and became Monday's TODAY reference (0.46% off in this PC's
+    cache, with the price on the session). A cache written before this (format version 2 or older)
+    is rewritten when loaded: each step outside the session takes the session's close (unknown
+    before the first session step a grid holds; there a price is read from the 5-minute grid).
+  - IEX has bars only for minutes that traded, so no bar between where a download began and its
+    first bar means no trade: the last close is carried there, and no gap is left. A thin ETF's
+    first trade after 9:30 left one (fetched again, then given up as "no exchange data"), and a
+    cache saved on a Saturday left the weekend empty until Monday's first bar (TODAY unknown all
+    Monday).
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once.
@@ -771,11 +785,17 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - Any websocket refused with 429 waits at least 2 minutes before retrying instead of hammering, and its status says why.
   - **Run one copy at a time;** other apps should read this service's API rather than open their own Finnhub or Alpaca streams.
 - **Closing the window or Ctrl+C / Ctrl+Break:** a graceful stop that saves the history cache. Tested: exit code 0 in 1.2 s, cache written.
+  - The feeds stop first, then the port is freed, then the cache is saved and the log says how long
+    that took. The save is the stop's only slow part: about a second, but 4-13 s on a busy PC, and
+    the port was held meanwhile (`start.bat` right after an auto-stop found it busy). It also takes
+    half the time or less now (no rounding of every value, a slice of each ring buffer, `orjson`
+    when installed).
 - **History** is saved to `data/cache/` every 30 minutes, after each download and on exit. The files
   are written in a worker thread, from the list of instruments taken on the event loop (which picks
   and drops stocks meanwhile: reading its live list from the thread failed), one save at a time. An
   error in a housekeeping round is logged and the next round runs (one failed save had ended wake
-  detection, back-fills and saves for the rest of the run).
+  detection, back-fills and saves for the rest of the run). Each process writes its own temporary
+  files: a copy started while another still saves (the port is freed first) cannot write into its.
 - **Tests:** `tests/test_reconnect.py` checks:
   - reconnection after server drops, after silence and after a `kick()`;
   - poller back-off;
@@ -802,7 +822,13 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     given up; the minutes after a failed start unknown, also after more than a day off; the first
     live price waking the back-fill; the downloaded close as the price (an ETF from Alpaca and from
     Yahoo, the dollar, a perpetual), never a bar still open or a pre/post-market one; the cache's
-    price dated at its last data; Yahoo's history carried over shut hours only.
+    price dated at its last data; Yahoo's history carried over shut hours only;
+  - an ETF's pre- and post-market bars kept aside (TODAY, 1H and 1W unchanged on an unchanged ETF,
+    also with a cache saved on a Saturday), an older cache rewritten to its session closes, a thin
+    ETF's late first trade covering its gap; the 1-minute gap from its first open minute and no
+    back-fill after the start-up download; without a key, TODAY's start all weekend; one wake of
+    the back-fill per recovery, not per live price; housekeeping's save in a worker thread; the
+    port freed before the final save, and two processes saving the same file at once.
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -1267,6 +1293,31 @@ before this round (fe74248) and now:
   give-up rule for a newer gap of the same instrument.
 - **Mutation check: 53 of 53 changes are caught:** the eighth round's 36, the review's three
   and this round's 14.
+
+**Tenth round (26 Nov 2026): a review of the ninth round.** Checked on the review's reproductions
+(offline), on the code before this round (a9b7c3e) and now:
+
+| | Before | Now |
+|---|---|---|
+| **An ETF's TODAY after a weekend, with an Alpaca key** (IEX bars include pre- and post-market prints; an unchanged ETF at Monday 10:00) | −0.50%: the reference was Friday evening's last print, carried over the weekend (1H too, in the first hour). This PC's cache: Monday's reference 693.89 against a 690.68 close | 0.00%: the session's close, carried over those hours. Older caches are rewritten on loading |
+| **The review's before/after harness** (23 scenarios, 204 ETF readings against the ideal) | 111 off, most by the 1% its extended-hours prints are off | 25 off, all after a failed download, a sleep or without live ETF data (each the same as before or closer by those 1%). The perpetual's readings are unchanged |
+| **A cache saved on a Saturday**, started on Monday | TODAY unknown all Monday: the weekend was left empty until Monday's first bar | 0.00% |
+| **The 1-minute gap after more than a day off** (Wednesday 2:00 after Monday noon, a Sunday, Monday before the open, a thin ETF's first trade at 9:45) | at a closed minute or before the first trade, never covered by the download: a back-fill fetched all 10 ETFs again and logged "no exchange data … left empty" for each | from the first open minute (none on a Sunday or before the open), covered by the start-up download: no back-fill |
+| **Stopping** | 8-13 s on a busy PC in the review's runs (17 s in this round's, right after the PC woke from a long sleep), with the port held: `start.bat` right after an auto-stop found it busy. All of it was the final cache save | the port is freed before the save, which takes a third to a half of the time (the same values) |
+| **Live, with keys, from copies of this PC's cache** (Thanksgiving: TODAY since Wednesday 17:00) | SPY TODAY and 1H +0.009%, from a post-market print; right after the start a back-fill fetched all 10 ETFs again, "no exchange data" for each | SPY 0.000%, no back-fill; after the session the cache holds only its 716.735 close. Port free at "stopping", process gone 1.0 s later |
+
+- **Also:** without a key, Yahoo's last bar of a day is the 16:00 closing print; it is kept aside too
+  (it made TODAY +0.001% on a closed day).
+- **Tests: 211 pass.** The new ones cover each item above and the review's two changes the suite
+  let through: the 5-minute half of the keyless carry over shut hours (read on a weekend at 16:45),
+  and only the first live price waking the back-fill. They also cover three more changes its
+  mutation run let through: the 1-minute half of that carry, housekeeping's save in a worker thread,
+  and where the 1-minute gap starts.
+- **Mutation check: 76 of 76 changes are caught:** the ninth round's (rewritten where this
+  round changed the code), the review's two and its three other survivors, and this round's. Three
+  of this round's got through at first and now have tests: a pre- or post-market bar older than the
+  grid taken as the close to carry, the carry from the grid's own close, and the 5-minute download
+  without where it began. The tests had cached one ETF, so the shared download started 35 days back.
 
 ---
 

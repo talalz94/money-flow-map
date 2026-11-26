@@ -318,27 +318,56 @@ class Instrument:
 
     # ── history ─────────────────────────────────────────────────────────────────────────────
     def seed(self, grid: str, closes: list[tuple[float, float]], until: float,
-             volumes: list[tuple[float, float, float]] | None = None) -> int:
+             volumes: list[tuple[float, float, float]] | None = None, since: float | None = None) -> int:
         """Load history: `closes` = [(step_start_ts, close)], sorted. Fills from the first close up to
-        `until` with carry-forward; the live flag follows the market-hours profile."""
+        `until` with carry-forward; the live flag follows the market-hours profile. `since`: where a
+        download from a venue with bars only for steps that traded (IEX) began: no bar between there
+        and its first one means no trade (the last close carried), not a gap to fetch again."""
         g = self.g1 if grid == "g1" else self.g5
         if not closes:
             return 0
         step = g.step
         k_until = int(until // step)
-        k_first = max(int(closes[0][0] // step), k_until - g.size)
+        k0 = int(closes[0][0] // step)
+        k_first = max(k0, k_until - g.size)
+        # from where the download began: a cache saved on a Saturday left the weekend empty until
+        # Monday's first bar (TODAY unknown all Monday)
+        k_from = k_first if since is None else max(min(k_first, -int(-since // step)), k_until - g.size)
         by_k = {int(t // step): c for t, c in closes if isnum(c) and c > 0}
-        last = NaN
-        for k in range(int(closes[0][0] // step), k_first):     # warm the carry value
+        # An ETF's grids hold its regular session, as its live series does: a pre- or post-market bar
+        # (IEX, thin) is kept aside, and the session's last close is carried over those hours. Taken
+        # as closes, Friday evening's prints were carried all weekend and became Monday's TODAY
+        # reference (0.46% off a price that stays on the session).
+        session = self.hours == "us_regular"
+        last, k_last = NaN, None
+        for k in range(k_from - 1, k0 - 1, -1):            # the carry value: the newest close before
+            if k in by_k and (not session or clock.market_open(self.hours, (k + 1) * step - 1)):
+                last, k_last = by_k[k], k
+                break
+        if (session or since is not None) and last != last and g.last_k is not None:
+            # or the grid's own (that session's close, carried): the first bars can be the morning's
+            # pre-market ones, or come hours after the download's start
+            last = g.asof(k_from * step, max_back=g.size)
+        if session and last != last and grid == "g1":
+            last = self.g5.asof(k_from * step, max_back=12)   # an empty 1-day grid: the 5-minute one's
+        n, k_ext = 0, None
+        for k in range(k_from, k_until):
+            open_ = clock.market_open(self.hours, (k + 1) * step - 1)
             if k in by_k:
-                last = by_k[k]
-        n = 0
-        for k in range(k_first, k_until):
-            if k in by_k:
-                last = by_k[k]
+                if open_ or not session:
+                    last, k_last = by_k[k], k
+                else:
+                    k_ext = k
+            elif k < k_first:
+                v = g.get(k)
+                if v == v:                           # up to the first bar the cache's own steps stay
+                    last = v
+                    continue
             if last == last:
-                g.put(k, last, clock.market_open(self.hours, (k + 1) * step - 1))
+                g.put(k, last, open_)
                 n += 1
+        if k_ext is not None and (k_ext + 1) * step > (self.extra.get("ext_ts") or 0):
+            self.extra["ext_price"], self.extra["ext_ts"] = by_k[k_ext], (k_ext + 1) * step
         if grid == "g5" and volumes and self.v5 is not None:
             for t, q, tb in volumes:
                 k = int(t // step)
@@ -346,26 +375,24 @@ class Instrument:
                     self.v5.put(k, q, tb)
         h = self.holes.get(grid)
         # covered: the data starts at the gap, or at the oldest step the grid holds (anything older
-        # falls out of it anyway: a 1-day grid's first minute is never downloaded again)
-        if h is not None and by_k and max(by_k) * step >= h and (k_first * step <= h or k_first <= k_until - g.size + 2):
+        # falls out of it anyway: a 1-day grid's first minute is never downloaded again), or the
+        # download began there (`since`: a thin ETF's first trade after 9:30 is no gap)
+        if h is not None and by_k and max(by_k) * step >= h and (
+                k_first * step <= h or k_first <= k_until - g.size + 2
+                or (since is not None and since <= max(h, (k_until - g.size + 2) * step))):
             self.holes[grid] = None          # the exchange's own data now covers the gap
         # no live price yet this session: the price is the newest close known, so a downloaded bar
         # newer than what the cache gave takes over (Friday's session downloaded on a Saturday stayed
         # behind the cache's Thursday close all weekend: TODAY read -2%). Only a bar the grid took
         # (before `until`) counts: one still open would date the price in the future, and live
-        # prices older than that would be dropped as out of order. For an ETF, as for live prints,
-        # pre- and post-market bars are kept aside: its newest bar in the regular session.
-        if not self._live_seen:
-            for k in range(k_until - 1, k_first - 1, -1):
-                if k in by_k and (self.hours != "us_regular"
-                                  or clock.market_open("us_regular", (k + 1) * step - 1)):
-                    t_last = (k + 1) * step
-                    if self.price != self.price or self.ts is None or t_last > self.ts:
-                        self.price, self.ts = by_k[k], t_last
-                    break
-            else:
-                if self.price != self.price and last == last:   # no such bar: at least the last close
-                    self.price, self.ts = last, closes[-1][0] + step
+        # prices older than that would be dropped as out of order. For an ETF, its session's.
+        if not self._live_seen and k_last is not None:
+            t_last = (k_last + 1) * step
+            if k_last >= k_from:
+                if self.price != self.price or self.ts is None or t_last > self.ts:
+                    self.price, self.ts = by_k[k_last], t_last
+            elif self.price != self.price:           # no bar inside the grid: at least the last close
+                self.price, self.ts = by_k[k_last], t_last
         return n
 
     # ── summaries ───────────────────────────────────────────────────────────────────────────

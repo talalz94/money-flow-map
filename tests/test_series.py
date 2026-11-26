@@ -280,3 +280,55 @@ def test_a_seed_with_no_bar_inside_the_grid_still_gives_a_missing_price_the_last
     inst = Instrument("x:A", "x", "A", "24/7")
     inst.seed("g1", [(old + 60 * i, 40.0 + i) for i in range(10)], t0)
     assert inst.price == 49.0 and inst.ts == old + 600
+
+
+def test_an_etfs_pre_and_post_market_bars_are_kept_aside_and_its_session_close_carried():
+    """An ETF's grids hold its regular session, as its live series does: a download's pre- and
+    post-market bars (IEX, thin) are kept aside and the session's close is carried over those hours.
+    Taken as closes, Friday evening's prints were carried all weekend: Monday's TODAY reference was an
+    after-hours print (0.46% off in the real cache), while the price stayed on the session."""
+    from moneyflow import stats
+    inst = Instrument("x:SPY", "x", "SPY", "us_regular")
+    close, sat, mon = ny_ts(2026, 11, 20, 16, 0), ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 23, 9, 0)
+    rows = [(close - 3600 + 300 * i, 690.0 + i) for i in range(12)]           # the last hour: 701 at 15:55
+    rows += [(close + 300 * i, 693.89) for i in range(48)]                    # post-market prints, 16:00-20:00
+    inst.seed("g5", rows, sat)
+    shut = range(int(close // G5_STEP), int(sat // G5_STEP))
+    assert all(inst.g5.get(k) == 701.0 and not inst.g5.is_live(k) for k in shut)
+    assert inst.price == 701.0 and inst.ts == close
+    assert inst.extra["ext_price"] == 693.89 and inst.extra["ext_ts"] == ny_ts(2026, 11, 20, 20, 0)
+    # Monday 9:00: downloaded from the cache's end (Saturday), only the morning's pre-market prints came
+    pre = [(ny_ts(2026, 11, 23, 4, 0) + 300 * i, 707.0) for i in range(60)]
+    inst.seed("g5", pre, mon, since=sat - 600)
+    assert all(inst.g5.get(k) == 701.0 for k in range(int(close // G5_STEP), int(mon // G5_STEP)))
+    assert stats.price_at(inst, ny_ts(2026, 11, 22, 17, 0), mon) == 701.0    # TODAY's start: Friday's close
+    assert inst.price == 701.0 and inst.extra["ext_price"] == 707.0
+    inst.seed("g1", [(ny_ts(2026, 11, 23, 8, 0) + 60 * i, 707.5) for i in range(60)], mon)
+    assert inst.g1.get(int(ny_ts(2026, 11, 23, 8, 30) // G1_STEP)) == 701.0   # an empty 1-minute grid: from the 5-minute one
+    # Yahoo's last point of a day is a 16:00 closing print: by Saturday afternoon older than the 1-day
+    # grid, still not the close carried into it
+    qqq, sat_pm = Instrument("x:QQQ", "x", "QQQ", "us_regular"), ny_ts(2026, 11, 21, 16, 45)
+    qqq.seed("g1", [(close - 120, 600.0), (close - 60, 601.0), (close, 600.5)], sat_pm)
+    assert qqq.g1.get(int(sat_pm // G1_STEP) - 1) == 601.0 and qqq.price == 601.0 and qqq.ts == close
+
+
+def test_a_thin_etfs_first_trade_after_a_gap_still_covers_it():
+    """IEX has bars only for minutes that traded, so a thin ETF's first bar can come minutes after the
+    open. Downloaded from before the gap (`since`), the minutes up to it had no trade (the cache's last
+    close, carried), not a gap fetched again and given up ("no exchange data"); the cache's own steps
+    after `since` stay."""
+    inst = Instrument("x:UUP", "x", "UUP", "us_regular")
+    t9, t930, t10 = ny_ts(2026, 11, 23, 9, 0), ny_ts(2026, 11, 23, 9, 30), ny_ts(2026, 11, 23, 10, 0)
+    inst.g1.put(int(t9 // G1_STEP) - 1, 27.0, False)                        # the cache ends at 9:00
+    inst._hole("g1", t930)                                                   # the time off: from the open
+    inst.seed("g1", [(t930 + 900, 27.1), (t930 + 1200, 27.2)], t10, since=t9 - 600)
+    assert inst.holes["g1"] is None
+    k = int((t930 + 300) // G1_STEP)
+    assert inst.g1.get(k) == 27.0 and inst.g1.is_live(k)                    # open, no trade yet: the close
+    assert inst.g1.get(int((t930 + 900) // G1_STEP)) == 27.1 and inst.g1.get(int(t9 // G1_STEP) - 1) == 27.0
+    # a gap older than the 1-day grid: covered by a download from the grid's first minute, though the
+    # first bar came hours later (at 9:45, after a night without trades)
+    inst._hole("g1", t9 - 2 * 86400)
+    t11 = ny_ts(2026, 11, 23, 11, 0)
+    inst.seed("g1", [(t930 + 900, 27.1), (t930 + 1200, 27.2)], t11, since=t11 - 86400 + 60)
+    assert inst.holes["g1"] is None

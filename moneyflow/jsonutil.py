@@ -34,5 +34,12 @@ def dumps(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
+def dumps_compact(obj) -> str:
+    """Compact JSON of data that holds no NaN or inf (not checked: no pass over every value)."""
+    if _orjson is not None:
+        return _orjson.dumps(obj).decode()
+    return json.dumps(obj, separators=(",", ":"))
+
+
 def dumps_pretty(obj) -> str:
     return json.dumps(_clean(obj), indent=2, ensure_ascii=False)
