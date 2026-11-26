@@ -438,38 +438,32 @@ def test_poller_backs_off_on_errors_and_recovers():
 
 
 def test_gap_after_sleep_is_redownloaded_not_left_flat(cfg, keys, monkeypatch, tmp_path):
-    """After a sleep the 1-second tick carries the last pre-sleep price across the gap. The refill
-    must re-download from the moment the PC went to sleep and overwrite that flat stretch."""
+    """After a sleep the 1-second tick used to carry the last pre-sleep price across the gap. Through
+    the production path (housekeeping sees the wall clock jump, on_resume starts the back-fill), the
+    gap is downloaded again from the moment the PC went to sleep: the exchange's prices, not flat."""
     from moneyflow.connectors import binance as bn
     from moneyflow.series import G5_STEP
 
-    now = 1795528800.0                                    # 2026-11-24 13:20 UTC, on a 5-minute boundary
-    eng = Engine(cfg, keys, clock.Clock(fixed=now))
-    eng.cache_dir = tmp_path
+    t0 = 1795528800.0                                     # 2026-11-24 13:20 UTC, on a 5-minute boundary
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
     inst = eng.instruments["binance_spot:BTCUSDT"]
-    sleep_at = now - 3600
-    k0 = int((now - 86400) // G5_STEP)
-    inst.seed("g5", [(k * G5_STEP, 100.0) for k in range(k0, int(now // G5_STEP))], now)   # flat = stale gap
-
-    async def fake_klines(session, market, symbol, interval, start_ms, end_ms, price="last"):
-        step = 300 if interval == "5m" else 60
-        t = (start_ms // 1000 // step) * step
-        rows = []
-        while t + step <= end_ms / 1000:
-            rows.append((t, 110.0 if t >= sleep_at else 100.0, 1.0, 0.5))
-            t += step
-        return rows
-
-    monkeypatch.setattr(bn, "fetch_klines", fake_klines)
-    eng.connectors = {}
-    eng.cfg = dict(cfg, connectors=dict(cfg["connectors"], yahoo={"enabled": False}))
+    k0 = int((t0 - 86400) // G5_STEP)
+    inst.seed("g5", [(k * G5_STEP, 100.0) for k in range(k0, int(t0 // G5_STEP))], t0)
+    _tick(eng, clk, t0, t0 + 300, feed=lambda t: inst.on_price(100.0, t, t))     # awake, live
+    sleep_at = t0 + 300
+    clk.set_fixed(sleep_at + 3600)                        # an hour asleep
+    eng.tick()                                            # the first tick after waking
+    klines, _ = _exchange(lambda t: 110.0 if t > sleep_at else 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
 
     async def go():
-        await eng.seed_history(incremental=True, since=sleep_at)
+        assert await eng._housekeep_once(3600.0) is True  # the wall clock jumped: the PC slept
+        await asyncio.wait_for(eng._backfill_task, timeout=5)
     asyncio.run(go())
     k_mid = int((sleep_at + 1800) // G5_STEP)
-    assert inst.g5.get(k_mid) == 110.0                    # the gap now holds the real (downloaded) prices
-    assert inst.g5.get(int((sleep_at - 3 * 3600) // G5_STEP)) == 100.0
+    assert inst.g5.get(k_mid) == 110.0 and inst.g5.is_live(k_mid)   # the real (downloaded) prices
+    assert inst.g5.get(int((t0 - 3 * 3600) // G5_STEP)) == 100.0    # before the sleep: untouched
+    assert eng.backfill_state["state"] == "done" and eng.backfill_state["reason"] == "wake"
 
 
 def test_rate_limit_waits_and_restart_reuses_the_disk_cache(tmp_path):
@@ -546,9 +540,11 @@ def _gap_engine(cfg, keys, t0, tmp_path):
 def _exchange(truth, fail):
     """Binance's klines of `truth(t)` (the close at the step's end); `fail()` says when DNS is down."""
     calls = []
+    starts: dict = {}
 
     async def klines(session, market, symbol, interval, start_ms, end_ms, price="last"):
         calls.append(symbol)
+        starts.setdefault((symbol, interval), []).append(start_ms / 1000)
         if fail():
             raise OSError(11001, "getaddrinfo failed")
         step = 300 if interval == "5m" else 60
@@ -558,6 +554,7 @@ def _exchange(truth, fail):
             rows.append((t, truth(t + step), 1.0, 0.5))
             t += step
         return rows
+    klines.starts = starts
     return klines, calls
 
 
@@ -722,3 +719,298 @@ def test_a_quiet_market_on_a_live_feed_is_covered_by_the_feeds_heartbeat(cfg, ke
         eng.tick()
     ks = range(int(t0 // G1_STEP), int((t0 + 840) // G1_STEP))
     assert all(btc.g1.get(k) == 100.0 and btc.g1.is_live(k) for k in ks) and btc.holes == {"g1": None, "g5": None}
+
+
+
+# ── the back-fill, round 8: the dollar, a failed first download, long sleeps, the event loop ─────
+def _tick(eng, clk, t0, t1, step=10.0, feed=None):
+    t = t0
+    while t <= t1:
+        clk.set_fixed(t)
+        if feed:
+            feed(t)
+        eng.tick()
+        t += step
+
+
+def test_the_dollar_is_back_filled_from_ice_when_its_fx_legs_have_a_gap(cfg, keys, monkeypatch, tmp_path, caplog):
+    """The dollar is computed from six FX legs with no history of their own; its history is ICE's DXY.
+    A sleep over 16:25-17:00 New York left the legs' steps empty, and the back-fill (downloading only
+    what has holes) never asked ICE: TODAY had no start price till the next roll, ~20 h later. ICE's
+    bars over the legs' gap fill it: back-filled, not given up as "no exchange data"."""
+    import logging
+    caplog.set_level(logging.INFO, logger="moneyflow.engine")
+    from conftest import ny_ts
+    from moneyflow import stats
+    from moneyflow.connectors import pollers
+    t0 = ny_ts(2026, 11, 24, 16, 15)
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+    usd = eng.series["usd"].inst
+    legs = list(usd.inputs)
+    _tick(eng, clk, t0, t0 + 600, feed=lambda t: [leg.on_price(1.0 + i / 10, t, t) for i, leg in enumerate(legs)])
+    wake = ny_ts(2026, 11, 24, 17, 30)
+    clk.set_fixed(wake)
+    eng.tick()
+    roll = ny_ts(2026, 11, 24, 17, 0)
+    assert all(leg.holes["g5"] is not None for leg in legs)
+    ice = lambda t: 100.0 + (t - t0) / 86400                  # noqa: E731
+    before = stats.price_at(usd, roll, wake)                  # TODAY's start: none, or the stale 16:25 value
+    assert before != ice(roll)
+
+    async def chart(session, symbol, interval, rng):
+        assert symbol == "DX-Y.NYB"
+        step = 300 if interval == "5m" else 60
+        span = 60 * 86400 if rng == "60d" else 86400
+        k0, k1 = int((wake - span) // step), int((wake - 900) // step)       # ICE: 10-15 minutes late
+        return [(k * step, ice((k + 1) * step)) for k in range(k0, k1)]
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["state"] == "done" and all(leg.holes == {"g1": None, "g5": None} for leg in legs)
+    assert stats.price_at(usd, roll, wake) == ice(roll)                                 # TODAY starts again
+    assert "back-filled" in caplog.text and "no exchange data" not in caplog.text
+
+
+def test_a_failed_first_download_keeps_the_time_off_as_a_hole_not_the_cached_price(cfg, keys, monkeypatch, tmp_path):
+    """The app was off for 6 hours; at the start the first download fails (DNS down for a minute).
+    The time it was off stays a hole, so the retry fetches it (it fetched only the minutes since the
+    start, and the cache's last close stood in as TODAY's start price for the whole session); and
+    the steps after the start are unknown, not that old close carried as data."""
+    from moneyflow import history
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    now = 1795528800.0
+    closed = now - 6 * 3600
+    truth = lambda t: 100.0 + (t - now) / 3600              # noqa: E731
+    old, _ = _gap_engine(cfg, keys, closed, tmp_path)
+    b0 = old.instruments["binance_spot:BTCUSDT"]
+    k_c = int(closed // G5_STEP)
+    b0.seed("g5", [(k * G5_STEP, truth((k + 1) * G5_STEP)) for k in range(k_c - 2000, k_c)], closed)
+    history.save(tmp_path, b0)
+    eng, clk = _gap_engine(cfg, keys, now, tmp_path)
+    klines, _ = _exchange(truth, fail=lambda: eng.seed_state.get("retry", 0) == 0)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())                        # the first download: DNS down
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    assert btc.holes["g5"] == closed
+    _tick(eng, clk, now, now + 900)                        # 15 minutes, no live data yet
+    k_now = int(now // G5_STEP)
+    assert all(btc.g5.get(k) != btc.g5.get(k) for k in range(k_now, k_now + 2))        # not the cached close
+    eng.seed_state["retry"] = 1
+    asyncio.run(eng.seed_history(incremental=True))        # the retry, the network back
+    gap = range(k_c + 1, k_now + 2)
+    assert all(btc.g5.get(k) == truth((k + 1) * G5_STEP) for k in gap) and btc.holes["g5"] is None
+
+
+def test_the_time_off_is_a_gap_only_from_when_the_market_was_open(cfg, keys, tmp_path):
+    """An ETF's cache written on a Saturday. Started on Sunday nothing is missing: the market stayed
+    shut (no download, no "no exchange data" give-up). Started on Monday at 10:00 the gap begins at
+    Monday's open, 09:30 New York."""
+    from conftest import ny_ts
+    from moneyflow import history
+    from moneyflow.series import G5_STEP
+    sat = ny_ts(2026, 11, 21, 15, 0)
+    old, _ = _gap_engine(cfg, keys, sat, tmp_path)
+    etf = old.instruments["alpaca:SPY"]
+    k_s = int(sat // G5_STEP)
+    etf.seed("g5", [(k * G5_STEP, 600.0) for k in range(k_s - 2000, k_s)], sat)
+    history.save(tmp_path, etf)
+    for when, hole in ((ny_ts(2026, 11, 22, 12, 0), None), (ny_ts(2026, 11, 23, 10, 0), ny_ts(2026, 11, 23, 9, 30))):
+        eng, _ = _gap_engine(cfg, keys, when, tmp_path)
+        inst = eng.instruments["alpaca:SPY"]
+        history.load(tmp_path, inst, when)
+        assert inst.holes["g5"] == hole, clock.iso(when)
+
+
+def test_after_a_long_sleep_each_instrument_downloads_from_its_own_gap_not_35_days(cfg, keys, monkeypatch, tmp_path):
+    """After a sleep of over 4 hours the newest 50 steps are all empty: the start of the download is
+    the newest value anywhere (not 35 days ago), and each instrument starts from its own gap."""
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc, eth = eng.instruments["binance_spot:BTCUSDT"], eng.instruments["binance_spot:ETHUSDT"]
+    truth = lambda t: 100.0 + (t - t0) / 3600               # noqa: E731
+    _tick(eng, clk, t0, t0 + 600, feed=lambda t: (btc.on_price(truth(t), t, t), eth.on_price(truth(t), t, t)))
+    _tick(eng, clk, t0 + 610, t0 + 3 * 3600, feed=lambda t: btc.on_price(truth(t), t, t))   # ETH's feed dies
+    clk.set_fixed(t0 + 3 * 3600 + 5 * 3600)                # then 5 hours asleep
+    eng.tick()
+    holes = eng.holes()
+    klines, _ = _exchange(truth, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng._backfill("wake"))
+    st = klines.starts
+    assert st[("BTCUSDT", "5m")][0] == holes["binance_spot:BTCUSDT"] - 600            # its own gap...
+    assert st[("ETHUSDT", "5m")][0] == holes["binance_spot:ETHUSDT"] - 600            # ...not the earliest
+    assert st[("ETHUSDT", "5m")][0] > t0 - 3600                                        # nor 35 days
+
+
+def test_a_backfill_that_downloads_nothing_does_not_stall_the_loop(cfg, keys, monkeypatch, tmp_path):
+    """With DNS down after a wake every attempt fails at once; each used to save every cache file and
+    rebuild 35 days of the derived series on the event loop (4-8 s of frozen ticks and pushes). Now a
+    failed attempt does neither, and a good one rebuilds only what its downloads feed, each from
+    its own inputs' gap (not from another instrument's older one)."""
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    _tick(eng, clk, t0, t0 + 300, feed=lambda t: btc.on_price(100.0, t, t))
+    clk.set_fixed(t0 + 3600)
+    eng.tick()
+    saves, rebuilds = [], []
+    eng.save_cache = lambda: saves.append(1)
+    for d in eng.derived:
+        d.rebuild = lambda until, since=None, d=d: rebuilds.append((type(d).__name__, since))
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: eng.backfill_state.get("attempt", 0) <= 2)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    hole = min(h for h in btc.holes.values() if h is not None)
+    eng.instruments["binance_fut:UVXYUSDT"].holes["g5"] = t0 - 10 * 86400    # an old gap, in no computed series
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["attempts"] == 3 and saves == [1]                         # only the good one
+    users = {type(d).__name__ for d in eng.derived if btc in d.inputs}
+    assert {n for n, _ in rebuilds} == users and all(s is not None and t0 - 3600 < s <= hole for _, s in rebuilds)
+
+
+def test_a_backfill_rebuilds_the_computed_series_over_the_gap(cfg, keys, monkeypatch, tmp_path):
+    """The coins slept with the PC; once their gap is back-filled, the stablecoin share computed from
+    them is rebuilt over the gap (the rebuild must start where the downloads did: taken after them,
+    with the holes gone and the newest value recent, it covered only the last minutes)."""
+    from conftest import filled_engine_at
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP, isnum
+    t0 = 1795528800.0
+    eng = filled_engine_at(cfg, keys, t0)
+    clk = eng.clock
+    eng.cache_dir, eng.connectors = tmp_path, {}
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": False}))
+    eng.BACKFILL_SETTLE, eng.BACKFILL_FIRST, eng.BACKFILL_MAX = 0.0, 0.01, 0.02
+    coins = [i for i in eng.instruments.values() if i.source == "binance_spot"]
+    truth = lambda t: 50.0 * (1 + (t - t0) / 86400)          # noqa: E731
+    _tick(eng, clk, t0, t0 + 600, feed=lambda t: [c.on_price(truth(t), t, t) for c in coins])
+    wake = t0 + 600 + 3600
+    clk.set_fixed(wake)
+    eng.tick()
+    klines, _ = _exchange(truth, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["state"] == "done"
+    share = next(d for d in eng.derived if type(d).__name__ == "StablecoinShare")
+    gap = range(int((t0 + 900) // G5_STEP), int((wake - 300) // G5_STEP))
+    want = [share.value_step("g5", k) for k in gap]
+    assert all(isnum(v) for v in want) and len(set(want)) > 1
+    assert [share.g5.get(k) for k in gap] == want
+
+
+def test_a_wake_and_housekeeping_are_what_start_the_backfill(cfg, keys, tmp_path):
+    """The production entry points: a wall-clock jump (the PC slept) starts the back-fill; awake,
+    housekeeping finds the holes an outage left and starts it too."""
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    started = []
+    eng.want_backfill = started.append
+
+    async def go():
+        assert await eng._housekeep_once(600.0) is True          # the PC slept 10 minutes
+        assert await eng._housekeep_once(5.0) is False           # awake, nothing missing
+        eng.instruments["binance_spot:BTCUSDT"].holes["g5"] = 1795528800.0 - 600
+        await eng._housekeep_once(5.0)
+    asyncio.run(go())
+    assert started == ["wake", "network outage"] and eng.resumes == 1
+
+
+def test_a_gap_that_appears_during_a_download_is_fetched_next_not_given_up(cfg, keys, monkeypatch, tmp_path):
+    """A hole registered while a download is in flight was never asked for: it is not "no exchange
+    data", it is the next attempt's job."""
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    btc, eth = eng.instruments["binance_spot:BTCUSDT"], eng.instruments["binance_spot:ETHUSDT"]
+    btc.holes["g5"] = t0 - 3600
+    klines, calls = _exchange(lambda t: 100.0, fail=lambda: False)
+
+    async def during(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        if symbol == "BTCUSDT" and eth.holes["g5"] is None and "ETHUSDT" not in calls:
+            eth.holes["g5"] = t0 - 1800                      # ETH's feed just dropped
+        return await klines(session, market, symbol, interval, start_ms, end_ms, price)
+    monkeypatch.setattr(bn, "fetch_klines", during)
+    asyncio.run(eng._backfill("wake"))
+    assert "ETHUSDT" in calls and eng.holes() == {} and eng.backfill_state["attempts"] == 2
+
+
+def test_feeds_coming_back_during_a_download_cut_the_back_off_short(cfg, keys, monkeypatch, tmp_path):
+    """A "feeds are back" that arrives while an attempt is downloading is kept: the retry follows
+    at once instead of after the full back-off (up to 15 minutes)."""
+    import time
+    from moneyflow.connectors import binance as bn
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    eng.BACKFILL_FIRST = eng.BACKFILL_MAX = 60.0
+    eng.instruments["binance_spot:BTCUSDT"].holes["g5"] = 1795528800.0 - 3600
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: eng.backfill_state.get("attempt", 0) == 1)
+
+    async def during(*a, **k):
+        if eng.backfill_state.get("attempt") == 1:
+            eng.want_backfill("the feeds are back")          # the websockets reconnected meanwhile
+        return await klines(*a, **k)
+    monkeypatch.setattr(bn, "fetch_klines", during)
+
+    async def go():                                         # as in production: one back-fill task
+        eng.want_backfill("wake")
+        await asyncio.wait_for(eng._backfill_task, timeout=20)
+    t = time.monotonic()
+    asyncio.run(go())
+    assert time.monotonic() - t < 10 and eng.backfill_state["attempts"] == 2
+
+
+def test_a_kick_while_a_connector_is_busy_is_not_lost():
+    """A kick that arrives while the connector works (a scan in flight at the 17:00 roll) still ends
+    its next sleep at once; the sleep after that is a normal one."""
+    import time
+    p = Probe(ctx_for(None), "ws://unused")
+
+    async def go():
+        p.kick()                                             # during "work"
+        t = time.monotonic()
+        await p.sleep(5)
+        first = time.monotonic() - t
+        t = time.monotonic()
+        await p.sleep(0.2)
+        return first, time.monotonic() - t
+    first, second = asyncio.run(go())
+    assert first < 0.5 and second >= 0.19
+
+
+def test_an_fx_or_rest_fed_market_is_covered_by_its_own_feeds_heartbeat(cfg, keys, tmp_path):
+    """US ETFs come from Alpaca's stream or, when that is refused, its REST poller: either one's
+    activity covers a quiet ETF (FEEDS), so it gets no hole."""
+    from conftest import ny_ts
+    t0 = ny_ts(2026, 11, 24, 11, 0)
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    health = types.SimpleNamespace(last_msg=None, last_ok=None)
+    eng.connectors = {"alpaca_rest": types.SimpleNamespace(health=health)}
+    etf = next(i for i in eng.instruments.values() if i.source == "alpaca")
+    etf.on_price(90.0, t0, t0)
+
+    def poll(t):
+        health.last_ok = t                                   # the REST poller answered (no new trade)
+    _tick(eng, clk, t0, t0 + 900, feed=poll)
+    assert etf.holes == {"g1": None, "g5": None}
+
+
+
+def test_keyless_etfs_download_60_days_when_a_gap_is_older_than_the_5_day_range(cfg, keys, monkeypatch, tmp_path):
+    """Without an Alpaca key the ETFs' history comes from Yahoo: 5 days for a recent cache, 60 when a
+    gap in it is older than that."""
+    from moneyflow.connectors import pollers
+    now = 1795528800.0
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path)
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+    etf = next(i for i in eng.instruments.values() if i.source == "alpaca")
+    k = int(now // 300)
+    etf.seed("g5", [(j * 300, 90.0) for j in range(k - 3000, k)], now)    # a recent cache...
+    etf.holes["g5"] = now - 10 * 86400                                    # ...with a 10-day-old gap
+    asked = []
+
+    async def chart(session, symbol, interval, rng):
+        asked.append((symbol, interval, rng))
+        return []
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    asyncio.run(eng.seed_history(incremental=True, only={etf.key}, state={}))
+    assert (etf.symbol, "5m", "60d") in asked

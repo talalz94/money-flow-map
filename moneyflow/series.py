@@ -245,11 +245,16 @@ class Instrument:
         # it is back-filled from the exchange. Carried as live, the 25 Nov night (Bitcoin flat for
         # 26 steps) made σ too low and every Binance series differ from the exchange.
         seen = self._seen_ts
+        # before any live data, a step after an unfilled hole would only carry the CACHE's last close
+        # (the app was off, the first download failed): unknown too, not that old price
+        h1, h5 = self.holes["g1"], self.holes["g5"]
         start = max(self._k1, k1_now - G1_SIZE)
         for k in range(start, k1_now):
             t0 = k * G1_STEP
             open_ = clock.market_open(self.hours, t0 + G1_STEP - 1)
-            if traded and open_ and not (seen >= t0):
+            if open_ and not traded and h1 is not None and t0 >= h1:
+                self.g1.put(k, NaN, False)
+            elif traded and open_ and not (seen >= t0):
                 self.g1.put(k, NaN, False)
                 self._hole("g1", t0)
                 self._gap_open = True
@@ -262,12 +267,14 @@ class Instrument:
             for k in range(max(self._k5, k5_now - G5_SIZE), k5_now):
                 t0 = k * G5_STEP
                 open_ = clock.market_open(self.hours, t0 + G5_STEP - 1)
-                covered = not (traded and open_ and not (seen >= t0))
+                stale = open_ and not traded and h5 is not None and t0 >= h5
+                covered = not stale and not (traded and open_ and not (seen >= t0))
                 if covered:
                     self.g5.put(k, p, traded and open_)
                 else:
                     self.g5.put(k, NaN, False)
-                    self._hole("g5", t0)
+                    if not stale:
+                        self._hole("g5", t0)
                 if self.v5 is not None:
                     self._close_volume(k, covered)
             self._k5 = k5_now
@@ -399,15 +406,18 @@ class Derived(Instrument):
             rts = [i.recv_ts for i in self.inputs if i.recv_ts is not None]
             self.recv_ts = max(rts) if rts else now
 
-    def rebuild(self, until: float) -> None:
-        """Recompute both grids from the inputs' grids (after history was seeded). The 35-day 5-minute
-        grid goes first: series that chain from step to step (Stitched) anchor the 1-day 1-minute
-        grid on it, so the two grids agree."""
+    def rebuild(self, until: float, since: float | None = None) -> None:
+        """Recompute both grids from the inputs' grids (after history was seeded), from `since` if given
+        (a back-fill: only what it refilled; the whole 35 days took seconds of the event loop). The
+        5-minute grid goes first: series that chain from step to step (Stitched) anchor the 1-day
+        1-minute grid on it, so the two grids agree."""
         for gname, g in (("g5", self.g5), ("g1", self.g1)):
             firsts = [getattr(i, gname).first_k() for i in self.inputs if getattr(i, gname).last_k is not None]
             if not firsts:
                 continue
             k0 = max(min(firsts), int(until // g.step) - g.size)
+            if since is not None:
+                k0 = max(k0, int(since // g.step) - 1)
             for k in range(k0, int(until // g.step)):
                 v = self.value_step(gname, k)
                 if isnum(v):

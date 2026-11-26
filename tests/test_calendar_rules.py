@@ -193,3 +193,66 @@ def test_screen_volume_baselines_are_trading_days_by_midpoint():
     want = vol(roll + 1) / _median([vol(r + 1) for r in rolls])   # one session's hours share a volume
     assert st["rvol"] == pytest.approx(want, rel=1e-9)
     assert done > H
+
+
+
+# ── off the whole hour, TODAY's volume baseline, TODAY's live filter ──────────────────────────────
+def test_the_midpoint_rule_holds_between_whole_hours_too():
+    """At 17:20 Monday the hour 16:20-17:20 is mostly the closing session's: Sunday's (weekend) does
+    not count and Friday's does, as at 17:00 (one second before the end is not the midpoint)."""
+    mon = ny_ts(2026, 11, 23, 17, 20)
+    days = {dt.datetime.fromtimestamp(t, clock.NY).date() for t in stats.comparable_ends(mon, "us_equity", 20, span=3600)}
+    assert dt.date(2026, 11, 20) in days and dt.date(2026, 11, 22) not in days
+
+
+HEAVY_WEEKEND = lambda t: 1000.0 + session(t).toordinal() % 1000 if trades(t) else 1e6   # noqa: E731
+
+
+def test_node_today_volume_baseline_is_the_previous_trading_sessions():
+    """TODAY's volume against the same span since 17:00 on previous TRADING sessions: each roll is
+    judged by the session it starts (Sunday 17:00 starts Monday's), not the one it ends."""
+    inst = node(TUE_10, steady(0.001), vol=HEAVY_WEEKEND)
+    w = stats.window_for("today", TUE_10)
+    steps = int((TUE_10 - w.start) // G5_STEP)
+    base, n = [], 0
+    while len(base) < 20:
+        n += 1
+        r0 = clock.roll_n_days_before(clock.day_roll(TUE_10), n)
+        if trades(r0 + 1):
+            base.append(sum(HEAVY_WEEKEND(r0 + (i + 0.5) * G5_STEP) for i in range(steps)))
+    q = sum(HEAVY_WEEKEND(w.start + (i + 0.5) * G5_STEP) for i in range(steps))
+    assert stats.volume_read(inst, w, TUE_10)["rvol"] == pytest.approx(q / sorted(base)[len(base) // 2], rel=1e-9)
+
+
+def lopsided_weekend(t: float) -> float:
+    """Weekend volume heavy on Sunday afternoon and light from Friday evening: Sunday's 16:45 hour
+    lands above every weekday's and Friday's below, so taking in the wrong one moves the median."""
+    if trades(t):
+        return 1000.0 + session(t).toordinal() % 1000
+    return 1e6 if dt.datetime.fromtimestamp(t, clock.NY).weekday() == 6 else 1.0
+
+
+def test_node_hour_volume_baseline_by_the_hours_midpoint_off_the_hour():
+    """At 17:45 the hour 16:45-17:45 is mostly the NEW session's: Sunday's counts (it is Monday's
+    session from 17:00) and Friday's does not (Saturday's), judged by its midpoint, not by its start."""
+    t = ny_ts(2026, 11, 23, 17, 45)
+    inst = node(t, steady(0.001), vol=lopsided_weekend)
+    w = stats.window_for("1h", t)
+    base, n = [], 0
+    while len(base) < 20:
+        n += 1
+        t0 = clock.same_clock_before(w.start, n)
+        if trades(t0 + 1800):
+            base.append(sum(lopsided_weekend(t0 + (i + 0.5) * G5_STEP) for i in range(12)))
+    q = sum(lopsided_weekend(w.start + (i + 0.5) * G5_STEP) for i in range(12))
+    assert stats.volume_read(inst, w, t)["rvol"] == pytest.approx(q / sorted(base)[len(base) // 2], rel=1e-9)
+
+
+def test_today_sigma_skips_days_its_market_was_shut_for_the_whole_window():
+    """At 08:00 an ETF has not traded since 16:00: every same-clock TODAY window was shut, so there is
+    no sample (twenty zero moves would make σ 0); σ comes from the fallback instead."""
+    t = ny_ts(2026, 11, 24, 8, 0)
+    rate = lambda u: 0.002 if trades(u) and clock.market_open("us_regular", u) else 0.0   # noqa: E731
+    inst = node(t, rate, hours="us_regular")
+    s, n, method = stats.sigma_today(inst, t)
+    assert method != "same-clock" and s > 0

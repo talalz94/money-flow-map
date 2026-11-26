@@ -63,6 +63,10 @@ def test_opt_out_never_stops():
 
 
 def test_config_and_flags(tmp_path, monkeypatch):
+    """Defaults only: this PC's git-ignored moneyflow.local.toml and key files are not read."""
+    from moneyflow.keys import KeyStore
+    monkeypatch.setattr(cfgmod, "USER_FILES", ())
+    monkeypatch.setattr(cli, "load_keys", lambda cfg: KeyStore())
     assert cfgmod.load(paths=[])["server"]["idle_shutdown_minutes"] == 5          # auto-stop is the default
     bad = tmp_path / "bad.toml"
     bad.write_text("[server]\nidle_shutdown_minutes = -1\n", encoding="utf-8")

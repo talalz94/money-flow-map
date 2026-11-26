@@ -211,3 +211,31 @@ def test_a_computed_series_is_not_live_while_its_inputs_were_down():
     assert st.g1.is_live(k_live) and prox.g1.is_live(k_live)             # TLT closed, the proxy live
     assert not prox.g1.is_live(k_down) and not st.g1.is_live(k_down)     # the proxy down: carried, not live
     assert st.g1.get(k_down) == st.g1.get(k_down)                         # (still a value: the chain's last)
+
+
+
+def test_a_computed_series_counts_as_trading_only_where_all_its_inputs_do():
+    """By default a computed step is live only if every input's step is (one input carried from its
+    history, not trading: the computed step is not either)."""
+    from moneyflow.series import Derived
+
+    class Avg(Derived):
+        def value_live(self, now):
+            return (self.inputs[0].price + self.inputs[1].price) / 2
+
+        def value_step(self, grid, k):
+            a, b = (getattr(i, grid).get(k) for i in self.inputs)
+            return (a + b) / 2
+
+    a, b = Instrument("x:A", "x", "A", "24/7"), Instrument("x:B", "x", "B", "24/7")
+    t0 = ny_ts(2026, 11, 24, 10, 0)
+    b.seed("g1", [(t0 - 3600 + 60 * i, 50.0) for i in range(60)], t0)      # history only, never live
+    d = Avg("avg", [a, b])
+    for s in range(0, 601, 10):
+        a.on_price(100.0, t0 + s, t0 + s)
+        a.feed_alive(t0 + s)
+        a.roll(t0 + s)
+        b.roll(t0 + s)
+        d.refresh(t0 + s)
+    k = int((t0 + 300) // G1_STEP)
+    assert d.g1.get(k) == 75.0 and a.g1.is_live(k) and not b.g1.is_live(k) and not d.g1.is_live(k)

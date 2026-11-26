@@ -346,6 +346,7 @@ class StockScanner(PollConnector):
         self.missing: list[str] = []          # configured tickers without a perpetual
         self._seed_retry_at = 0.0             # after a failed 5-minute seed, wait before asking again
         self._seed_backoff = self.interval
+        self.soon = False                     # screen again in a few seconds (a scan begun before 17:00)
 
     def available(self):
         if not self.cfg.get("enabled", True) or int(self.cfg.get("slots", 1)) <= 0:
@@ -450,5 +451,8 @@ class StockScanner(PollConnector):
         self.engine.on_stock_screen(self.book, now, missing=self.missing)
 
     def next_interval(self) -> float:
+        if self.soon:
+            self.soon = False
+            return 5.0
         # until the first screen has run (history still loading), look again soon
         return self.interval if self.book.last else 20.0

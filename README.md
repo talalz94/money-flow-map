@@ -316,7 +316,14 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
 - **At 17:00 New York** TODAY starts again: the old session's TODAY pick is cleared (its move is
   gone) and the screen runs again at once.
 - **A pick whose history fails to download** (no network) is retried after 30 s, doubling to
-  15 min, for as long as it is picked, instead of showing "loading" for good.
+  15 min (at once when a feed recovers), for as long as it is picked, instead of "loading" for good.
+- **A stock dropped lately whose live feed is still kept** (2 h) is ranked on the map's own
+  numbers again when it is among the five best: on hourly bars alone a borderline one went in and
+  out of the slot at every screen with unchanged prices.
+- **After a wake**, a shown pick whose history still has the sleep's gap is held, not dropped on
+  hourly bars alone, until its back-fill is done; then it is judged again on the map's numbers.
+- **A scan that began before 17:00 New York** and ended after it does not bring back the old
+  session's TODAY pick; the screen runs again within seconds.
 - **Seen live on 25 Nov 2026 (pre-market, with the first σ estimator):**
   - TODAY: **DELL**, −9.2% since 17:00 New York on 4.1× its usual volume (screen −2.9σ, map −3.3σ),
     after a 12.4% fall in Tuesday's session (Alpaca), an arrow into bonds, the dollar and stablecoins;
@@ -705,7 +712,7 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 - **Dropped or silent feeds.**
   - Every websocket reconnects with exponential back-off and jitter: 1 s doubling to 60 s, reset after a healthy minute.
   - A feed that goes silent beyond its idle limit counts as dead. That catches half-open TCP connections after Wi-Fi loss.
-    - The limit is 45 s for Binance, 2 min for FX and 10 min for IEX while their market is open.
+    - The limit is 45 s for Binance futures and 60 s for Binance spot. For FX it is 2 min and for IEX 10 min while their market is open.
     - It is an hour while their market is closed: silence is normal then.
   - aiohttp heartbeat pings check the peer.
 - **Sleep or hibernation.**
@@ -719,13 +726,28 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     traded, which made σ too low and the history differ from the exchange (the 25 Nov night).
     Computed series (the dollar, bonds, the stablecoin share) are live only where their inputs are.
   - A **back-fill** downloads the empty steps. After a failure (DNS down after waking, no network)
-    it retries after 30 s, doubling to 15 min, and at once when a feed delivers again. It stops only
-    when nothing is missing, when the gap is older than the history, or when the exchange has no
-    data there either. It runs in the background: it never holds up the auto-stop, and it stops
-    with the app. Its state is under `/api/health` (`backfill`).
+    it retries after 30 s, doubling to 15 min, and 10 s after a feed delivers again (time for the
+    feeds to settle; also when that happens during a download). It stops only when nothing is
+    missing, when the gap is older than the history, or when the exchange has no data there either
+    (a gap that appeared during a download was not asked for, so it is the next attempt's). It runs
+    in the background: it never holds up the auto-stop, and it stops with the app. Its state is
+    under `/api/health` (`backfill`).
+  - It downloads only the instruments with gaps, each from its own gap (after a sleep of many
+    hours, from its newest value, not 35 days back). The dollar's six FX legs have no history of
+    their own, so a gap in them re-downloads the dollar from ICE's DXY (Yahoo). An attempt that got
+    nothing does no more work; one that did rebuilds only the computed series it fed, each from its
+    inputs' gap, and writes the cache off the event loop (each attempt used to stall the app for a
+    second or more).
+  - The time the app was off counts as a gap too, from the first moment its market was open (an
+    ETF whose market stayed shut has nothing to download). If the first download at a start fails,
+    the retry still fetches it, and meanwhile the cache's last close is not carried as data (it
+    stood in as TODAY's start price for a whole session).
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once.
+  - A picked stock whose history failed to download, and a kick a connector got while busy, are
+    not left to their back-off either: a recovered feed retries the stock at once, and the kick
+    ends the connector's next wait.
   - With no dashboard open, it stops by itself within 5 minutes of the PC waking (auto-stop,
     section 1). An open dashboard reconnects within that time and keeps it running.
 - **Pollers** back off on errors (10 s doubling to 15 min) and recover by themselves.
@@ -746,15 +768,23 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - reconnection after server drops, after silence and after a `kick()`;
   - poller back-off;
   - the resume path;
-  - that the sleep gap is re-downloaded, not left flat. That bug was caught here: the 1-second tick had already filled the gap with the pre-sleep price;
+  - that the sleep gap is re-downloaded, not left flat, through the production path (housekeeping
+    sees the wall clock jump and the wake starts the back-fill). That bug was caught here: the
+    1-second tick had already filled the gap with the pre-sleep price;
   - a wake with DNS failing for the first two tries: the gap ends filled with the exchange's prices,
     and no step is left carried as live (it was empty, not live, meanwhile);
   - an outage while awake, back-filled once the feed is back; a recovered feed waking the back-off
     once, not every 5 s; a gap the exchange has no data for given up, not retried forever;
-  - a quiet market on a live feed staying live (the heartbeat), and a computed series not live
-    while its input was down;
+  - a quiet market on a live feed staying live (the heartbeat); and (`tests/test_series.py`) a
+    computed series not live while an input was down (the bonds, and any computed series);
   - an old cache with a flat night flagged live, downloaded again; and (`tests/test_idle.py`) the
-    auto-stop firing on time while a back-fill keeps failing.
+    auto-stop firing on time while a back-fill keeps failing;
+  - the dollar re-downloaded from ICE when its FX legs have a gap (TODAY starts again); a failed
+    first download keeping the time off as a gap (none for an ETF over a weekend); a long sleep
+    downloaded from each instrument's own gap; an attempt that got nothing neither saving nor
+    rebuilding; the wake and housekeeping entry points; a gap found mid-download fetched next; a
+    recovery during a download, or a kick while busy, not lost; an ETF covered by its REST
+    poller's heartbeat.
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -763,7 +793,7 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 |---|---|
 | On resume | The log says `wall clock jumped 151s (sleep/hibernate?): resyncing and reconnecting`. The clock is re-synced by NTP and every stream reconnects. |
 | 2 s later | Nodes honestly show **STALE**, with data ages of 126-133 s. |
-| 20 s later | `history gap since 15:07:21Z refilled`. |
+| 20 s later | The gap's history was downloaded (the log line then read `history gap since 15:07:21Z refilled`; it now reads `history gap since ... back-filled (wake, attempt 1)`). |
 | 40 s later | Every stream has reconnected (2 connects each) and all 11 nodes are **LIVE** with data ages of 0.1-5 s. |
 
 The same test was repeated **in place on the running service** after the verification fixes.
@@ -1164,6 +1194,39 @@ caught by them all.
 - **Mutation check: 40 of 40 changes are caught.** They include the seven the review found
   surviving, the review's list for the fifth round, the conditions of "eased", this round's seven
   and the two back-fill flaws above.
+
+**Eighth round (26 Nov 2026): a review of the sixth and seventh rounds.** Each finding was checked
+again on the review's own reproductions (offline: fake exchanges and a simulated clock), on the code
+before this round (fe74248) and now:
+
+| | Before | Now |
+|---|---|---|
+| **The dollar after a night's sleep over 17:00 New York** (a regression of the seventh round: the back-fill downloaded only what had gaps, and the dollar's six FX legs have no history of their own) | 93 of 93 five-minute steps of the sleep empty; TODAY "warming up" for 19 hours, until the next roll | 2 of 93 empty (ICE's own 10-minute delay); TODAY live from waking, as when everything was downloaded again |
+| **A start with the network down for 45 s**, 9 hours after the cache was written | 520 of 539 one-minute steps since the cache stayed empty; TODAY and 1H "warming up" on every node | none empty; every window live at the exchange's prices |
+| The same with the network down for 25 minutes and Bitcoin up 3% overnight | for 10 minutes Bitcoin's 1H read +2.45%, z 11.2, flagged live (the real move: +0.08%) | every read equal to the exchange's |
+| **A 6-hour sleep** with five stocks loaded | the back-fill asked for 35 days: 288 futures requests (weight 1,440), 328,302 bars, one pause at Binance's half budget | 36 requests (weight 180), 9,060 bars, no pause |
+| **One failed back-fill attempt** (DNS down) | the event loop stalled 1.4-1.6 s on the review's reproduction, 0.9 s on a copy of this PC's cache (every cache file written, 35 days of computed series rebuilt) | under 50 ms: nothing came, so nothing is saved or rebuilt. A good attempt writes the cache off the loop and rebuilds each computed series only from its own inputs' gap (35 days of 13 instruments from an old-format cache: 0.27 s instead of 0.93 s) |
+| **A borderline stock picked lately** (1H: z −2.41 on the map, −2.65 on hourly bars) | the 1H slot alternated between the stock and empty at every screen, prices unchanged | empty at every screen: ranked on the map's numbers |
+
+- **Smaller fixes:**
+  - a gap that appears during a download is fetched by the next attempt (it was given up as "no
+    exchange data");
+  - a feed that recovers during a download still cuts the back-off short, and a picked stock whose
+    download failed is retried when a feed recovers (it waited up to 15 minutes);
+  - after a wake, the shown pick is held while its history still has the sleep's gap (it was
+    dropped for good);
+  - a scan begun before 17:00 New York that ended after it no longer brings back the old session's
+    TODAY pick, and a kick a connector gets while busy is kept (the roll's re-screen waited a full
+    interval);
+  - section 9 matches the code again: the log wording, the 10 s settle, Binance spot's 60 s idle
+    limit, which file tests what.
+- **Tests: 177 pass.** The new ones cover each finding above. The old sleep test now runs through
+  the production path (housekeeping sees the clock jump, the wake starts the back-fill), and
+  `test_config_and_flags` reads the defaults only, not this PC's git-ignored settings and key files.
+- **Mutation check: 36 of 36 changes are caught.** They include the review's survivors
+  (the midpoint rule off the whole hour, the volume baselines, "eased" released by a move the other
+  way, the seed back-off, the retry of a dropped pick, the wake and housekeeping entry points) and
+  this round's changes.
 
 ---
 

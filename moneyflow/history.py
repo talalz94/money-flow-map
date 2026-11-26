@@ -89,13 +89,15 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
         if last == last and not (inst.price == inst.price):
             inst.price = last
             inst.ts = (inst.g5.last_k + 1) * inst.g5.step
-    mark_holes(inst, untrusted=d.get("v") != VERSION)
+    mark_holes(inst, untrusted=d.get("v") != VERSION, now=now)
     return inst.g5.last_k
 
 
-def mark_holes(inst: Instrument, untrusted: bool = False) -> None:
+def mark_holes(inst: Instrument, untrusted: bool = False, now: float | None = None) -> None:
     """Register what a loaded cache lacks, so the history download fills it: steps of an open market
-    with no value (a past sleep or outage) and, from a version-1 cache, its whole range."""
+    with no value (a past sleep or outage), the time from the cache's last value to now (the app was
+    off: should the first download fail, a retry must still fetch it, not just the minutes since the
+    start), and, from a version-1 cache, its whole range."""
     for name in ("g1", "g5"):
         g = getattr(inst, name)
         if g.last_k is None:
@@ -110,14 +112,22 @@ def mark_holes(inst: Instrument, untrusted: bool = False) -> None:
             if g.get(k) != g.get(k) and clock.market_open(inst.hours, (k + 1) * g.step - 1):
                 inst._hole(name, k * g.step)
                 break
+        last = next((k for k in range(g.last_k, first - 1, -1) if g.get(k) == g.get(k)), None)
+        if now is not None and last is not None:
+            # from the first closed step its market was open in (none if it stayed shut, e.g. an ETF
+            # over a weekend: no download, no "no exchange data" give-up)
+            for k in range(last + 1, min(int(now // g.step), last + 1 + g.size)):
+                if clock.market_open(inst.hours, (k + 1) * g.step - 1):
+                    inst._hole(name, k * g.step)
+                    break
 
 
-def last_good_ts(inst: Instrument) -> float | None:
-    """End time of the newest step with a value, in the 5-minute grid."""
+def last_good_ts(inst: Instrument, max_back: int = 50) -> float | None:
+    """End time of the newest step with a value, in the 5-minute grid, looking back `max_back` steps."""
     g = inst.g5
     if g.last_k is None:
         return None
-    for k in range(g.last_k, g.last_k - 50, -1):
+    for k in range(g.last_k, max(g.last_k - max_back, g.last_k - g.size), -1):
         v = g.get(k)
         if v == v and not math.isinf(v):
             return (k + 1) * g.step

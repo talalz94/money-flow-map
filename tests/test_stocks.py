@@ -531,6 +531,7 @@ def test_eased_needs_both_a_smaller_move_and_z_under_the_rule_and_lets_go_when_t
     assert eased(-rs, z(rs) + 0.1) is True                        # turned around: eased, whatever its size
     assert eased(0.7 * rs, z(0.7 * rs) + 0.1) is True             # (latched)
     assert eased(0.9 * rs, z(0.9 * rs) - 0.1, new_screen=False) is True    # 0.9 back: still eased
+    assert eased(-1.05 * rs, z(1.05 * rs) - 0.1, new_screen=False) is True  # a rally the OTHER way: still
     assert eased(1.05 * rs, z(1.05 * rs) - 0.1, new_screen=False) is False  # fully back and over the rule
 
 
@@ -583,3 +584,115 @@ def test_only_the_shown_picks_with_complete_history_are_ranked_on_the_map(cfg, k
     assert set(eng._node_reads("today", NOW)) == {"NVDAUSDT"}        # kept for 2 h, not shown: not re-read
     eng._stocks["NVDAUSDT"]["inst"].holes["g5"] = NOW - 3600        # a sleep's gap, not back-filled yet
     assert eng._node_reads("today", NOW) == {}
+
+
+
+# ── round 8: kept picks on the map's numbers, a pick held through a back-fill, the roll race, retries ──
+def test_a_kept_pick_near_the_top_is_ranked_on_the_maps_numbers_again(cfg, keys):
+    """A stock picked lately and still on the map (kept for 2 h) is ranked on the map's own numbers
+    when it is among the best: on hourly bars alone a borderline one went in and out of the slot at
+    every screen with unchanged prices."""
+    eng = engine_with_pick(cfg, keys)
+    eng.stock_screen = {tf: {"picks": [], "top": [], "screened": 2} for tf in ("1h", "today", "1w")}   # not shown now
+    eng.on_stock_screen(_book({"NVDAUSDT": (-3.0, 3000.0), "AAPLUSDT": (-0.5, 1000.0)}), NOW)
+    for tf in ("1h", "today", "1w"):
+        row = next(r for r in eng.stock_screen[tf]["top"] if r["symbol"] == "NVDAUSDT")
+        assert row.get("exact"), tf
+
+
+def test_a_shown_pick_waiting_for_its_backfill_is_held_not_dropped(cfg, keys):
+    """After a wake the shown pick's grid still has the sleep's gap: the screen cannot rank it on the
+    map, and on hourly bars alone it was dropped (for good: once off the slot it was not re-read).
+    It is held until its history is back, then judged again."""
+    eng = engine_with_pick(cfg, keys)
+    eng.stock_cfg = dict(eng.stock_cfg, z_min=2.0, score_min=2.5)
+    quiet = _book({"NVDAUSDT": (0.0, 1000.0), "AAPLUSDT": (-0.5, 1000.0)})     # nothing qualifies by the bars
+    eng._stocks["NVDAUSDT"]["inst"].holes["g5"] = NOW - 3600                    # the back-fill is pending
+    eng.on_stock_screen(quiet, NOW)
+    assert [p["symbol"] for p in eng.stock_screen["today"]["picks"]] == ["NVDAUSDT"]
+    assert eng.stock_screen["today"]["picks"][0]["held"]
+    eng._stocks["NVDAUSDT"]["inst"].holes["g5"] = None                          # back-filled
+    eng.on_stock_screen(quiet, NOW)
+    assert all(p["symbol"] != "NVDAUSDT" or not p.get("held") for p in eng.stock_screen["today"]["picks"])
+
+
+def test_a_scan_that_began_before_the_roll_does_not_bring_back_the_old_session(cfg, keys):
+    """A scan started at 16:59 that ends after 17:00 must not re-install the old session's TODAY pick,
+    and a re-screen follows within seconds."""
+    import types
+    eng = engine_with_pick(cfg, keys)
+    kicked = []
+    scanner = types.SimpleNamespace(kick=lambda: kicked.append(1), soon=False)
+    eng.connectors["stocks"] = scanner
+    eng.clock.set_fixed(ny_ts(2026, 11, 24, 17, 0) + 20)       # now: just after the roll
+    eng.on_stock_screen(_book({"NVDAUSDT": (-3.0, 3000.0), "AAPLUSDT": (-0.5, 1000.0)}), NOW)   # begun at 10:30
+    assert eng.stock_screen["today"]["picks"] == [] and eng.stock_screen["today"]["rolled"]
+    assert scanner.soon and kicked == [1]
+    assert eng.stock_screen["1h"]["picks"]                                     # the other windows stand
+
+
+def test_a_failed_pick_is_retried_as_soon_as_the_feeds_are_back_and_stops_once_dropped(cfg, keys):
+    eng = filled_engine_at(cfg, keys, NOW)
+    eng.STOCK_RETRY_FIRST = 60.0
+    eng.connectors = {}
+    inst = eng.instrument("binance_fut", "NVDAUSDT", "24/7", True, "NVDA", "index")
+    ent = eng._stocks["NVDAUSDT"] = {"inst": inst, "ticker": "NVDA", "picked_at": NOW, "owned": True, "ready": False}
+    tries = []
+
+    async def history(i, since5, since1, now):
+        tries.append(1)
+        if len(tries) < 2:
+            raise OSError(11001, "getaddrinfo failed")
+    eng._binance_history = history
+
+    async def go():
+        task = asyncio.create_task(eng._start_stock("NVDAUSDT"))
+        await asyncio.sleep(0.1)
+        eng.instruments["binance_spot:BTCUSDT"].recovered = True     # a feed delivers again...
+        eng.check_holes()                                    # ...housekeeping sees it: no 60 s wait
+        await asyncio.wait_for(task, timeout=2)
+    asyncio.run(go())
+    assert ent["ready"] and len(tries) == 2
+    # a pick dropped while it is retrying: the retries stop
+    eng.STOCK_RETRY_FIRST = 0.01
+    ent2 = eng._stocks["AAPLUSDT"] = {"inst": eng.instrument("binance_fut", "AAPLUSDT", "24/7", True, "AAPL", "index"),
+                                      "ticker": "AAPL", "picked_at": NOW, "owned": True, "ready": False}
+
+    async def never(i, since5, since1, now):
+        tries.append(2)
+        if len(tries) > 6:
+            eng._stocks.pop("AAPLUSDT", None)                # dropped from the screen
+        raise OSError(11001, "getaddrinfo failed")
+    eng._binance_history = never
+    asyncio.run(asyncio.wait_for(eng._start_stock("AAPLUSDT"), timeout=5))
+    assert not ent2["ready"] and "AAPLUSDT" not in eng._stocks
+
+
+def test_a_picked_stocks_cached_gap_is_downloaded_from_the_gap(cfg, keys, tmp_path):
+    from moneyflow import history
+    eng = filled_engine_at(cfg, keys, NOW)
+    eng.cache_dir = tmp_path
+    eng.connectors = {}
+    inst = eng.instrument("binance_fut", "NVDAUSDT", "24/7", True, "NVDA", "index")
+    k_now = int(NOW // G5_STEP)
+    inst.seed("g5", [(k * G5_STEP, 100.0) for k in range(k_now - 2000, k_now)], NOW)
+    hole = (k_now - 500) * G5_STEP
+    inst.g5.put(k_now - 500, float("nan"), False)            # a past outage, in the cache
+    history.save(tmp_path, inst)
+    fresh = eng.instruments.pop("binance_fut:NVDAUSDT")
+    fresh = eng.instrument("binance_fut", "NVDAUSDT", "24/7", True, "NVDA", "index")
+    eng._stocks["NVDAUSDT"] = {"inst": fresh, "ticker": "NVDA", "picked_at": NOW, "owned": True, "ready": False}
+    asked = []
+
+    async def history_(i, since5, since1, now):
+        asked.append(since5)
+    eng._binance_history = history_
+    asyncio.run(eng._start_stock("NVDAUSDT"))
+    assert asked == [hole - 600]
+
+
+def test_the_seed_back_off_starts_over_after_a_success(monkeypatch):
+    sc, calls = _scanner(monkeypatch, fail_first=2)
+    start = ny_ts(2026, 11, 25, 9, 2) + 10
+    _polls(sc, start, 4)                                     # fail, fail, then it works
+    assert sc._seed_backoff == sc.interval

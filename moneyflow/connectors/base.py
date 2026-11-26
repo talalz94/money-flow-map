@@ -116,12 +116,13 @@ class Connector:
         self.log.warning("%s", msg[:300])
 
     async def sleep(self, seconds: float) -> None:
-        """Interruptible sleep: kick() ends it early."""
-        self._wake.clear()
+        """Interruptible sleep: kick() ends it early, also a kick that came while the connector was
+        busy (a poll in flight at the 17:00 roll lost the roll's re-screen kick)."""
         try:
             await asyncio.wait_for(self._wake.wait(), timeout=max(0.0, seconds))
         except asyncio.TimeoutError:
             pass
+        self._wake.clear()
 
     def kick(self) -> None:
         self._wake.set()
