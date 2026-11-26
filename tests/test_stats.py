@@ -261,3 +261,22 @@ def test_an_hour_belongs_to_the_session_of_its_midpoint():
     assert _dt.date(2026, 11, 20) in days and _dt.date(2026, 11, 22) not in days     # Fri in, Sun out
     by_end = {_dt.datetime.fromtimestamp(t, clock.NY).date() for t in stats.comparable_ends(mon, "us_equity", 20)}
     assert _dt.date(2026, 11, 22) in by_end and _dt.date(2026, 11, 20) not in by_end
+
+
+def test_the_first_five_minutes_of_a_session_read_the_opening_step():
+    """At 9:32 each past day's same-clock move and the 1W start fall inside the session's first
+    5-minute step. The step before holds the shut market's close, so reading it left the opening move
+    out: an ETF's TODAY σ was exactly 0 (z missing, the risk meter without its credit input) and 1W
+    reached back past the week-old opening gap. They read the opening step's own close."""
+    hyg = Instrument("a:HYG", "a", "HYG", "us_regular")
+    now = ny_ts(2026, 11, 23, 9, 32)
+    t, rows, day0 = int((now - 35 * 86400) // 300) * 300, [], ny_ts(2026, 10, 1)
+    while t + 300 <= now:
+        if clock.market_open("us_regular", t + 299):
+            rows.append((t, 80.0 + 0.3 * (int((t - day0) // 86400) % 5)))   # each session at a new level
+        t += 300
+    hyg.seed("g5", rows, now, since=now - 35 * 86400)
+    sig, n, how = stats.sigma_today(hyg, now)
+    assert how == "same-clock" and n >= 8 and sig > 0
+    week = now - 7 * 86400
+    assert stats.price_at(hyg, week, now) == hyg.g5.get(int(week // 300)) != hyg.g5.get(int(week // 300) - 1)

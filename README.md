@@ -44,9 +44,11 @@ Ctrl+C or by closing the window.
 **It does not keep running in the background.** It stops by itself **5 minutes after the last
 dashboard tab (or app) disconnects**, and also 5 minutes after a start if nobody opens it. A page
 refresh is fine; the 5 minutes are there for that. Stopping is clean: the feeds stop, the port is
-freed, the history cache is saved and the process exits (the port is free during the save, so
-`start.bat` works again at once). The log says why ("no dashboard tab or app connected for 5
-minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
+freed, the history cache is saved, open dashboard tabs and apps are told the service is going away,
+and the process exits, 1-2 s after Ctrl+C with a tab or an app connected (the port is free
+during the save, so `start.bat` works again at once). Closing the window saves the cache first, then
+Windows ends the process (within a second; Windows allows about 5). The log says why ("no dashboard
+tab or app connected for 5 minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
 entry, service or watchdog. Start it again with `start.bat` when you want it.
 
 - An app using the API keeps it alive: an open WebSocket/SSE stream, or any request (or webhook
@@ -144,7 +146,7 @@ of window, on the days its market trades**:
 | Window | σ estimated from |
 |---|---|
 | 1H | **Same clock hour**: RMS of the 60-minute moves ending within 30 minutes of this clock time on each of the previous 20 trading days (10 days for crypto), grouped by day. The pre-market hour is judged against past pre-market hours, the opening hour against past opening hours. An hour belongs to the session of its midpoint: at 17:00 the hour 16:00-17:00 is Friday's closing hour, not Saturday's. Only hours when the market was open count. Fallback (fewer than 30 such moves, e.g. a recent listing): every 60-minute move of the last 10 days. |
-| TODAY | **Same-clock σ**: RMS, over the previous 20 trading days (30 days for crypto), of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. Fallback (fewer than 8 such days, e.g. a recent listing): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
+| TODAY | **Same-clock σ**: RMS, over the previous 20 trading days (30 days for crypto), of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. In the first 5 minutes of a session, a past day's move is read from that day's opening 5-minute step (the step before it holds the previous close: σ read 0 and z was missing until 9:35, for every ETF); 1W's start the same way. Fallback (fewer than 8 such days, e.g. a recent listing): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
 | 1W | RMS of the daily (roll-to-roll) moves on the trading days of the last 30 days, × √k, where k is the number of trading sessions in the window: 5 in a normal week, 4 in Thanksgiving week (z would otherwise be 11% too small), 7 for crypto. Sessions cut by the window's ends count by the share of their 24 hours inside. |
 
 - **Trading days only.** Each series has a `calendar`:
@@ -748,10 +750,13 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     the retry still fetches it, and meanwhile the cache's last close is not carried as data (it
     stood in as TODAY's start price for a whole session, and after 30-48 hours off TODAY read +44%
     and 1H +94%).
-  - Until the first live price, an instrument's price is the newest close known: the cache's last
-    data (not the close carried after it), or a newer downloaded bar. Without a key, an ETF's Yahoo
-    history is carried on through the hours its market was shut since its last bar (not over open
-    ones: a delayed feed's minutes are unknown).
+  - An instrument's price is the newest it knows: the cache's last data (not the close carried after
+    it), a live price, or a downloaded bar newer than either. A sleep or an outage over an ETF's
+    close used to leave the pre-outage price (live data had come, and after the close nothing else
+    corrects it): the back-fill wrote the close into the history, the roll carried the old price over
+    the night and weekend, and Monday's TODAY read +1.0% on an unchanged ETF. Without a key, an ETF's
+    Yahoo history is carried on through the hours its market was shut since its last bar (not over
+    open ones: a delayed feed's minutes are unknown).
   - **An ETF's history is its regular session**, as its live series is: Alpaca's IEX bars include
     pre- and post-market prints, which are kept aside (the latest as `ext_price`, like a live one)
     while the session's close is carried over those hours. Stored as closes, Friday evening's
@@ -760,10 +765,13 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     is rewritten when loaded: each step outside the session takes the session's close (unknown
     before the first session step a grid holds; there a price is read from the 5-minute grid).
   - IEX has bars only for minutes that traded, so no bar between where a download began and its
-    first bar means no trade: the last close is carried there, and no gap is left. A thin ETF's
-    first trade after 9:30 left one (fetched again, then given up as "no exchange data"), and a
-    cache saved on a Saturday left the weekend empty until Monday's first bar (TODAY unknown all
-    Monday).
+    first bar means no trade: the last close is carried there, and no gap is left. The same holds
+    for an answer with no bar at all for an ETF (a weekend, a holiday, a start before its first
+    print). A thin ETF's first trade after 9:30 left a gap (fetched again, then given up as "no
+    exchange data"), also with the start before that trade; a cache saved on a Saturday left the
+    weekend empty until Monday's first bar, and with no bar at all since, the time off stayed empty
+    (every ETF's TODAY unknown all day). A cache written before this (format version 3 or older) can
+    hold such an empty night or weekend: filled with the session's close when loaded.
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once.
@@ -785,17 +793,29 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - Any websocket refused with 429 waits at least 2 minutes before retrying instead of hammering, and its status says why.
   - **Run one copy at a time;** other apps should read this service's API rather than open their own Finnhub or Alpaca streams.
 - **Closing the window or Ctrl+C / Ctrl+Break:** a graceful stop that saves the history cache. Tested: exit code 0 in 1.2 s, cache written.
-  - The feeds stop first, then the port is freed, then the cache is saved and the log says how long
-    that took. The save is the stop's only slow part: about a second, but 4-13 s on a busy PC, and
-    the port was held meanwhile (`start.bat` right after an auto-stop found it busy). It also takes
-    half the time or less now (no rounding of every value, a slice of each ring buffer, `orjson`
-    when installed).
+  - The feeds stop first, then the port is freed, then the cache is saved (the log says how long it
+    took), and then open dashboard tabs and SSE apps are closed ("going away") and the server shuts
+    down. The save is the stop's slow part: about a second, 4-13 s on a busy PC. It takes half the time
+    or less now (no rounding of every value, a slice of each ring buffer, `orjson` when installed).
+  - Measured with the real `serve()` (33 instruments) and a tab or an SSE app connected: the save
+    starts at once and the process ends 0.8-1.6 s after Ctrl+C. Before, the save waited for the
+    open streams (41 s for a tab, 122 s for an SSE app, the process lingering as long), and a second
+    Ctrl+C meanwhile, or Ctrl+Break then Ctrl+C, ended it with nothing saved.
+  - **Closing the console window:** Windows ends the process about 5 s after the window closes,
+    whatever runs. The process was gone within 0.03 s with nothing saved: the C runtime's handler
+    for that event returns at once. A handler of its own now starts the stop and holds the process
+    until the cache is saved, first on this path: saved in 0.3-0.9 s, then Windows ends the process
+    (its exit code is then 0xC000013A). Tested by closing the console window (WM_CLOSE, what its X
+    button sends), through `start.bat` too. Logging off or shutting Windows down was not tested.
 - **History** is saved to `data/cache/` every 30 minutes, after each download and on exit. The files
   are written in a worker thread, from the list of instruments taken on the event loop (which picks
   and drops stocks meanwhile: reading its live list from the thread failed), one save at a time. An
   error in a housekeeping round is logged and the next round runs (one failed save had ended wake
   detection, back-fills and saves for the rest of the run). Each process writes its own temporary
   files: a copy started while another still saves (the port is freed first) cannot write into its.
+  Windows refuses to replace a file another process has open (a copy loading the cache at its start):
+  the replace is retried for up to 0.75 s, then its temporary file is removed. A temporary file no
+  save writes any more (its process ended, or ten minutes old) is removed at the next start.
 - **Tests:** `tests/test_reconnect.py` checks:
   - reconnection after server drops, after silence and after a `kick()`;
   - poller back-off;
@@ -828,7 +848,14 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     ETF's late first trade covering its gap; the 1-minute gap from its first open minute and no
     back-fill after the start-up download; without a key, TODAY's start all weekend; one wake of
     the back-fill per recovery, not per live price; housekeeping's save in a worker thread; the
-    port freed before the final save, and two processes saving the same file at once.
+    port freed before the final save, and two processes saving the same file at once;
+  - a download with no bar at all carrying the close (a Saturday cache, a start before a thin ETF's
+    first trade), an older cache's empty night filled, a format-1 cache rewritten like a format-2 one;
+    a sleep over the close: the back-fill's newer close replacing the stale live price and what the
+    roll carried of it; the first five minutes of a session; a refused replace retried and stale
+    temporary files removed; and (`tests/test_idle.py`) the stop with a tab and an SSE app connected
+    (the port free during the save, the save first and at once, the streams told to go away) and
+    the console-close handler saving first.
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -858,8 +885,7 @@ down for 2.5 minutes after waking:
 A real network cut needs admin rights and would cut your own connection, so the DNS outage was
 simulated inside the test copy. The websocket drops it causes are covered by the drop and silence
 tests and by the Finnhub relay test (section 10).
-Closing the console window uses the same graceful-stop handler as Ctrl+Break, which was tested;
-closing the window itself was not.
+Closing the console window was tested too (above): the cache is saved first.
 
 ---
 
@@ -1301,7 +1327,7 @@ before this round (fe74248) and now:
 |---|---|---|
 | **An ETF's TODAY after a weekend, with an Alpaca key** (IEX bars include pre- and post-market prints; an unchanged ETF at Monday 10:00) | −0.50%: the reference was Friday evening's last print, carried over the weekend (1H too, in the first hour). This PC's cache: Monday's reference 693.89 against a 690.68 close | 0.00%: the session's close, carried over those hours. Older caches are rewritten on loading |
 | **The review's before/after harness** (23 scenarios, 204 ETF readings against the ideal) | 111 off, most by the 1% its extended-hours prints are off | 25 off, all after a failed download, a sleep or without live ETF data (each the same as before or closer by those 1%). The perpetual's readings are unchanged |
-| **A cache saved on a Saturday**, started on Monday | TODAY unknown all Monday: the weekend was left empty until Monday's first bar | 0.00% |
+| **A cache saved on a Saturday**, started on Monday with a pre-market bar in the download | TODAY unknown all Monday: the weekend was left empty until Monday's first bar | 0.00% (with no bar at all in the download, still unknown: fixed in the eleventh round) |
 | **The 1-minute gap after more than a day off** (Wednesday 2:00 after Monday noon, a Sunday, Monday before the open, a thin ETF's first trade at 9:45) | at a closed minute or before the first trade, never covered by the download: a back-fill fetched all 10 ETFs again and logged "no exchange data … left empty" for each | from the first open minute (none on a Sunday or before the open), covered by the start-up download: no back-fill |
 | **Stopping** | 8-13 s on a busy PC in the review's runs (17 s in this round's, right after the PC woke from a long sleep), with the port held: `start.bat` right after an auto-stop found it busy. All of it was the final cache save | the port is freed before the save, which takes a third to a half of the time (the same values) |
 | **Live, with keys, from copies of this PC's cache** (Thanksgiving: TODAY since Wednesday 17:00) | SPY TODAY and 1H +0.009%, from a post-market print; right after the start a back-fill fetched all 10 ETFs again, "no exchange data" for each | SPY 0.000%, no back-fill; after the session the cache holds only its 716.735 close. Port free at "stopping", process gone 1.0 s later |
@@ -1318,6 +1344,34 @@ before this round (fe74248) and now:
   of this round's got through at first and now have tests: a pre- or post-market bar older than the
   grid taken as the close to carry, the carry from the grid's own close, and the 5-minute download
   without where it began. The tests had cached one ETF, so the shared download started 35 days back.
+
+**Eleventh round (26 Nov 2026): a review of the tenth round.** Checked on the review's reproductions
+and harnesses (offline, the real `serve()` where it says so), on the code before this round (ce3a174)
+and now:
+
+| | Before | Now |
+|---|---|---|
+| **A download with no bar for any ETF** (a Saturday or Thanksgiving cache, a start at 7:30 or 2:00 before IEX's first print) | every ETF's TODAY unknown all day (10 of 10), HYG and IEF "warming up", the risk meter without its credit input | TODAY within 0.004 percentage points of the oracle for all 10 |
+| **A sleep or an outage over an ETF's close** (SPY 600 until 15:30, closed at 606) | price 600 all night and weekend; Monday 10:30 TODAY and 1H +1.0% (true 0%) | price 606 after the back-fill; Monday 0.0% |
+| **Stopping with a dashboard tab or an SSE app open** (Ctrl+C) | the save started after 41 s (tab) or 122 s (SSE), the process lingering as long; a second Ctrl+C meanwhile, or Ctrl+Break then Ctrl+C: nothing saved | saved at once (33 of 33 files, also after a second Ctrl+C), the process gone after 0.8-1.6 s |
+| **Closing the console window** | the process gone within 0.03 s, nothing saved | the cache saved first (0.3-0.9 s), then Windows ends the process; also through `start.bat` |
+| **The first 5 minutes of a session** (an ETF at 9:30-9:35) | TODAY σ 0, z missing ("warming up"); 1W +0.56% (true -0.006%) | σ 0.66%, z shown (at 9:30:05 in the test); 1W -0.025% |
+| **A start between the open and a thin ETF's first trade** (9:40, first trade 9:45) | a gap kept for each such ETF, a second download and "no exchange data" for each (10 of 10) | no gap, one download |
+| **A save refused while another process reads the file** (a copy started at once, 30 trials) | 2 save errors, 2 temporary files left for good | 0 errors (retried), none left; a killed save's file is removed at the next start |
+
+- **Also:** a format-1 cache is now tested like a format-2 one, and the stop's test checks what the
+  stop does (the port bound from inside the save; the save before the server's shutdown, with a tab
+  and an SSE app connected), not the order of three lines of its source.
+- **Not changed:** an outage that begins before the open (9:20-9:50 in the review's harness) is not
+  taken for a gap: until an ETF's first print of the session its steps count as carried, not missing,
+  so that session's first minutes keep the previous close and no back-fill runs (as before). A
+  1-minute history that begins inside a session's 5-minute step can miss that step's first minutes
+  (low, left as it was).
+- **Tests: 223 pass.** The new ones cover each item above.
+- **Mutation check: 104 of 104 changes are caught:** the tenth round's (rewritten where this
+  round changed the code) and this round's. Three of this round's were caught at first only by a
+  webhook test that fails under load (the price rewritten in live steps or before the download's
+  end, the close handler not waiting): their own tests now catch them.
 
 ---
 

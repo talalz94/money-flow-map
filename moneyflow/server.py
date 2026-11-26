@@ -100,6 +100,16 @@ class Hub:
                     q.get_nowait()
             q.put_nowait(payload(tf))
 
+    async def close_streams(self) -> None:
+        """At a stop: end the SSE streams and close the dashboards' WebSockets (going away). Left open,
+        the server's shutdown waited for them: a tab until its heartbeat gave up (15-45 s), an SSE app
+        about 2 minutes."""
+        for q in list(self.sse_clients):
+            q.put_nowait(None)
+        wss = [ws for ws in list(self.ws_clients) if not ws.closed]
+        await asyncio.gather(*(asyncio.wait_for(ws.close(code=aiohttp.WSCloseCode.GOING_AWAY, message=b"stopping"), 2)
+                               for ws in wss), return_exceptions=True)
+
 
 class Webhooks:
     """POSTs JSON events to configured URLs: regime_change, strongest_flow_change, extreme_move, snapshot."""
@@ -230,6 +240,10 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
     app[ENGINE_KEY] = engine
     hub = Hub(engine, float(scfg.get("push_interval_s", 1.0)), cfg.get("webhooks", {}))
     app[HUB_KEY] = hub
+
+    async def close_streams(app_):
+        await hub.close_streams()
+    app.on_shutdown.append(close_streams)
     hub.webhooks.idle = idle
     app[IDLE_KEY] = idle
 
@@ -385,10 +399,13 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
             while True:
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=15)
-                    await resp.write(f"event: snapshot\ndata: {msg}\n\n".encode())
                 except asyncio.TimeoutError:
                     await resp.write(b": keep-alive\n\n")
-        except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                    continue
+                if msg is None:                    # the service is stopping
+                    break
+                await resp.write(f"event: snapshot\ndata: {msg}\n\n".encode())
+        except (ConnectionResetError, RuntimeError):
             pass
         finally:
             hub.sse_clients.pop(q, None)

@@ -65,7 +65,21 @@ def price_at(inst: Instrument, ts: float, now: float) -> float:
         v = inst.g1.asof(ts, max_back=10)
         if isnum(v):
             return v
-    return inst.g5.asof(ts, max_back=6)
+    return close_at(inst.g5, inst.hours, ts, 6)
+
+
+def close_at(g, hours: str, t: float, max_back: int) -> float:
+    """g.asof(t), except inside the first step of a session (its market shut in the step before):
+    that step's own close. The step before holds the shut market's last close, so a read from it
+    left the opening move out: an ETF's TODAY σ read 0 for the first 5 minutes of every session (each
+    past day's move from the roll to the same minute was 0), and its 1W change reached back to the
+    week-old close before that day's opening gap."""
+    k = int(t // g.step)
+    if t % g.step and clock.market_open(hours, t) and not clock.market_open(hours, k * g.step - 1):
+        v = g.get(k)
+        if isnum(v):
+            return v
+    return g.asof(t, max_back=max_back)
 
 
 def traded_in_window(inst: Instrument, w: Window, now: float) -> bool:
@@ -282,8 +296,8 @@ def sigma_daily(inst: Instrument, now: float, min_n: int = 10) -> tuple[float, i
 def sigma_today(inst: Instrument, now: float, days: int | None = None, min_n: int = 8) -> tuple[float, int, str]:
     g = inst.g5
     cal = getattr(inst, "calendar", "all")
-    rs = same_clock_today_returns(lambda t: g.asof(t, max_back=24), now, cal, days or SAME_CLOCK_DAYS.get(cal, 20),
-                                  live=lambda a, b: _any_live(g, a, b))
+    rs = same_clock_today_returns(lambda t: close_at(g, inst.hours, t, 24), now, cal,
+                                  days or SAME_CLOCK_DAYS.get(cal, 20), live=lambda a, b: _any_live(g, a, b))
     if len(rs) >= min_n:
         return robust_rms(rs), len(rs), "same-clock"
     # fallback: realized variance of 5-minute returns, scaled to the elapsed part of the day

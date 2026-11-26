@@ -322,13 +322,14 @@ class Instrument:
         """Load history: `closes` = [(step_start_ts, close)], sorted. Fills from the first close up to
         `until` with carry-forward; the live flag follows the market-hours profile. `since`: where a
         download from a venue with bars only for steps that traded (IEX) began: no bar between there
-        and its first one means no trade (the last close carried), not a gap to fetch again."""
+        and its first one means no trade (the last close carried), not a gap to fetch again; that
+        holds for an answer with no bar at all too (a weekend, a holiday, before an ETF's first print)."""
         g = self.g1 if grid == "g1" else self.g5
-        if not closes:
+        if not closes and since is None:
             return 0
         step = g.step
         k_until = int(until // step)
-        k0 = int(closes[0][0] // step)
+        k0 = int(closes[0][0] // step) if closes else k_until
         k_first = max(k0, k_until - g.size)
         # from where the download began: a cache saved on a Saturday left the weekend empty until
         # Monday's first bar (TODAY unknown all Monday)
@@ -374,26 +375,39 @@ class Instrument:
                 if k < k_until:
                     self.v5.put(k, q, tb)
         h = self.holes.get(grid)
-        # covered: the data starts at the gap, or at the oldest step the grid holds (anything older
-        # falls out of it anyway: a 1-day grid's first minute is never downloaded again), or the
-        # download began there (`since`: a thin ETF's first trade after 9:30 is no gap)
-        if h is not None and by_k and max(by_k) * step >= h and (
-                k_first * step <= h or k_first <= k_until - g.size + 2
-                or (since is not None and since <= max(h, (k_until - g.size + 2) * step))):
+        # covered: the download began at or before the gap (`since`: whatever IEX has no bar for did
+        # not trade, so a thin ETF's first trade after the start, or none at all, is no gap) and ends
+        # after its start; or the data starts at the gap, or at the oldest step the grid holds
+        # (anything older falls out of it anyway: a 1-day grid's first minute is never downloaded again)
+        if h is not None and (
+                (since is not None and h < until and since <= max(h, (k_until - g.size + 2) * step))
+                or (by_k and max(by_k) * step >= h
+                    and (k_first * step <= h or k_first <= k_until - g.size + 2))):
             self.holes[grid] = None          # the exchange's own data now covers the gap
-        # no live price yet this session: the price is the newest close known, so a downloaded bar
-        # newer than what the cache gave takes over (Friday's session downloaded on a Saturday stayed
-        # behind the cache's Thursday close all weekend: TODAY read -2%). Only a bar the grid took
-        # (before `until`) counts: one still open would date the price in the future, and live
-        # prices older than that would be dropped as out of order. For an ETF, its session's.
-        if not self._live_seen and k_last is not None:
+        # the price is the newest close known: a downloaded bar newer than it takes over, also after
+        # live data (a sleep or an outage over an ETF's close left the pre-outage price all night and
+        # weekend: nothing after the close corrects it). Only a bar the grid took (before `until`)
+        # counts: one still open would date the price in the future, and live prices older than that
+        # would be dropped as out of order. For an ETF, its session's.
+        if k_last is not None:
             t_last = (k_last + 1) * step
             if k_last >= k_from:
                 if self.price != self.price or self.ts is None or t_last > self.ts:
+                    old = self.price
                     self.price, self.ts = by_k[k_last], t_last
+                    if old == old and old != self.price:
+                        self._recarry(old, until)
             elif self.price != self.price:           # no bar inside the grid: at least the last close
                 self.price, self.ts = by_k[k_last], t_last
         return n
+
+    def _recarry(self, old: float, after: float) -> None:
+        """Steps the roll carried a replaced price into, after a download's end: the new one."""
+        for g in (self.g1, self.g5):
+            if g.last_k is not None:
+                for k in range(int(after // g.step), g.last_k + 1):
+                    if g.get(k) == old and not g.is_live(k):
+                        g.put(k, self.price, False)
 
     # ── summaries ───────────────────────────────────────────────────────────────────────────
     def latency_ms(self) -> float | None:

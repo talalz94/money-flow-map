@@ -690,7 +690,7 @@ def test_an_old_cache_with_a_flat_live_night_is_downloaded_again(cfg, keys, monk
     b2 = eng.instruments["binance_spot:BTCUSDT"]
     assert all(b2.g5.get(k) == truth((k + 1) * G5_STEP) for k in flat)                # the real prices now
     assert b2.holes == {"g1": None, "g5": None}
-    assert json.loads(f.read_text())["v"] == history.VERSION == 3
+    assert json.loads(f.read_text())["v"] == history.VERSION == 4
     # a version-2 cache with empty steps (a past outage): marked, and filled at the next start
     k_hole = k_now - 100
     b2.g5.put(k_hole, float("nan"), False)
@@ -1388,12 +1388,14 @@ def _iex_bars(clk, close, thin=False):
     return bars
 
 
-@pytest.mark.parametrize("saved", [(2026, 11, 20, 16, 30), (2026, 11, 21, 12, 0)])
-def test_an_etfs_extended_hours_bars_leave_today_on_the_session_close(saved, cfg, keys, monkeypatch, tmp_path):
+@pytest.mark.parametrize("saved,thin", [((2026, 11, 20, 16, 30), False), ((2026, 11, 21, 12, 0), False),
+                                        ((2026, 11, 21, 12, 0), True)])
+def test_an_etfs_extended_hours_bars_leave_today_on_the_session_close(saved, thin, cfg, keys, monkeypatch, tmp_path):
     """Alpaca's IEX bars include pre- and post-market prints. Started on a Monday at 9:00 with a cache
     from Friday's close, the download put Friday evening's prints in the grids as closes: an unchanged
     ETF read TODAY -0.5% and 1H -0.5% at 10:00. With a cache from Saturday (the app ran over the
-    weekend) the weekend was left empty until Monday's first bar: TODAY unknown all day."""
+    weekend) the weekend was left empty until Monday's first bar: TODAY unknown all day; with no bar
+    at all since (`thin`: no print before 9:45), even after the first fix."""
     from conftest import ny_ts
     from moneyflow import history, stats
     from moneyflow.connectors import alpaca as alp
@@ -1409,23 +1411,26 @@ def test_an_etfs_extended_hours_bars_leave_today_on_the_session_close(saved, cfg
         history.save(tmp_path, etf)
     eng, clk = _gap_engine(cfg, keys, now, tmp_path)
     eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={})
-    monkeypatch.setattr(alp, "fetch_bars", _iex_bars(clk, close))
+    monkeypatch.setattr(alp, "fetch_bars", _iex_bars(clk, close, thin))
     klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
     monkeypatch.setattr(bn, "fetch_klines", klines)
     asyncio.run(eng.seed_history())
     inst = eng.instruments["alpaca:TLT"]
-    assert inst.price == close and inst.extra["ext_price"] == close * 1.005 and inst.holes == {"g1": None, "g5": None}
+    assert inst.price == close and inst.holes == {"g1": None, "g5": None}
+    assert inst.extra.get("ext_price") == (None if thin else close * 1.005)
     t1 = ny_ts(2026, 11, 23, 10, 0)
     _tick(eng, clk, now, t1, feed=lambda t: inst.on_price(close, t, t) if clock.market_open("us_regular", t) else None)
     for tf in ("today", "1h", "1w"):
         assert stats.window_return(inst, stats.window_for(tf, t1), t1)[1] == 0.0
 
 
-def test_an_etf_cache_from_before_version_3_is_rewritten_to_its_session_closes(cfg, keys, tmp_path):
-    """Older caches hold an ETF's pre- and post-market prints as closes (the real one: Friday's,
-    up to 693.89, carried over the weekend against a 690.68 close). Loaded, every step outside the
-    session takes the session's close, so TODAY starts from it; before the first session step a
-    grid holds, they are unknown."""
+@pytest.mark.parametrize("version", [1, 2])
+def test_an_etf_cache_from_before_version_3_is_rewritten_to_its_session_closes(version, cfg, keys, tmp_path):
+    """Older caches hold an ETF's pre- and post-market prints as closes (the real one, version 1:
+    Friday's, up to 693.89, carried over the weekend against a 690.68 close). Loaded, every step outside
+    the session takes the session's close, so TODAY starts from it; before the first session step a
+    grid holds, they are unknown. A version-1 cache is downloaded again too; with its 1-minute grid not
+    rewritten, that download carried the old print over Sunday (TODAY -0.46% on Monday)."""
     import json
     from conftest import ny_ts
     from moneyflow import history, stats
@@ -1440,7 +1445,7 @@ def test_an_etf_cache_from_before_version_3_is_rewritten_to_its_session_closes(c
     history.save(tmp_path, spy)
     f = tmp_path / "alpaca_SPY.json"
     d = json.loads(f.read_text())
-    d["v"] = 2                                                  # written before this version
+    d["v"] = version                                            # written before this version
     f.write_text(json.dumps(d))
     eng, _ = _gap_engine(cfg, keys, now, tmp_path)
     inst = eng.instruments["alpaca:SPY"]
@@ -1451,7 +1456,37 @@ def test_an_etf_cache_from_before_version_3_is_rewritten_to_its_session_closes(c
     k_pre = int(ny_ts(2026, 11, 20, 8, 0) // G1_STEP)           # before the 1-minute grid's first session step
     assert inst.g1.get(k_pre) != inst.g1.get(k_pre)
     assert inst.price == 690.68 and inst.ts == close
-    assert inst.holes == {"g1": None, "g5": None}              # rewritten, not downloaded again
+    if version == 2:
+        assert inst.holes == {"g1": None, "g5": None}          # rewritten, not downloaded again
+
+
+@pytest.mark.parametrize("version,filled", [(3, True), (4, False)])
+def test_an_etf_cache_from_before_version_4_has_its_empty_night_filled(version, filled, cfg, keys, tmp_path):
+    """A download with no bar for an ETF (a weekend, a holiday, before its first print) carried nothing
+    before version 4, so a cache can hold an empty night or weekend: TODAY's start (17:00) and 1W read
+    nothing there. Loaded, those steps take the session's close (once: a version-4 cache has none)."""
+    import json
+    from conftest import ny_ts
+    from moneyflow import history, stats
+    from moneyflow.series import G5_STEP
+    close, saved, now = ny_ts(2026, 11, 20, 16, 0), ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 21, 13, 0)
+    old, _ = _gap_engine(cfg, keys, saved, tmp_path)
+    spy = old.instruments["alpaca:SPY"]
+    empty = range(int(ny_ts(2026, 11, 20, 16, 30) // G5_STEP), int(saved // G5_STEP) - 1)
+    for k in range(int(saved // G5_STEP) - 2000, int(saved // G5_STEP)):
+        session = clock.market_open("us_regular", (k + 1) * G5_STEP - 1)
+        spy.g5.put(k, float("nan") if k in empty else 690.68, session)
+    history.save(tmp_path, spy)
+    f = tmp_path / "alpaca_SPY.json"
+    d = json.loads(f.read_text())
+    d["v"] = version
+    f.write_text(json.dumps(d))
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path)
+    inst = eng.instruments["alpaca:SPY"]
+    history.load(tmp_path, inst, now)
+    assert all((inst.g5.get(k) == 690.68) is filled for k in empty)
+    ref = stats.price_at(inst, ny_ts(2026, 11, 20, 20, 0), now + 7 * 86400)    # a week later's 1W start
+    assert (ref == 690.68) is filled
 
 
 def test_two_processes_saving_the_same_cache_file_do_not_share_a_temporary_file(tmp_path, monkeypatch):
@@ -1519,13 +1554,15 @@ def test_an_empty_minute_grid_takes_the_time_off_from_its_first_open_minute(save
 
 
 @pytest.mark.parametrize("saved,now,thin", [((2026, 11, 23, 12, 0), (2026, 11, 25, 2, 0), False),
-                                            ((2026, 11, 20, 12, 0), (2026, 11, 23, 11, 0), True)])
+                                            ((2026, 11, 20, 12, 0), (2026, 11, 23, 11, 0), True),
+                                            ((2026, 11, 20, 12, 0), (2026, 11, 23, 9, 40), True)])
 def test_an_etfs_time_off_downloaded_at_the_start_is_not_fetched_again(saved, now, thin, cfg, keys, monkeypatch,
                                                                         tmp_path, caplog):
     """The start-up download covers an ETF's time off, so no back-fill follows. One did after every
     start after more than a day off (each ETF downloaded again, "no exchange data for the gap ...;
     left empty" logged for each), when the gap began at a closed minute, or (`thin`) before a thin
-    ETF's first trade of the day: IEX has bars only for minutes that traded."""
+    ETF's first trade of the day, also with the start before it (9:40: no bar yet at all): IEX has bars
+    only for minutes that traded."""
     import logging
     from conftest import ny_ts
     from moneyflow import history
@@ -1651,11 +1688,83 @@ def test_housekeeping_writes_the_cache_in_a_worker_thread(cfg, keys, monkeypatch
     assert rec["keys"] and threading.get_ident() not in rec["threads"]
 
 
-def test_the_cli_frees_the_port_before_the_final_save():
-    """At a stop the history cache is saved (a second, more on a busy PC): the feeds stop first, then
-    the port is freed, then the save runs, so start.bat right after an auto-stop finds the port free."""
-    import inspect
-    from moneyflow import cli
-    src = inspect.getsource(cli.serve)
-    src = src[src.index("stopping (saving the history cache)"):]           # the stop, not the busy-port exit
-    assert src.index("engine.stop_feeds()") < src.index("runner.cleanup()") < src.index("await engine.stop()")
+def test_a_refused_replace_is_retried_and_stale_temporary_files_are_removed(cfg, keys, tmp_path, monkeypatch):
+    """Windows refuses to replace a file another process has open (a copy loading the cache at its
+    start): the replace is tried again shortly, and if it stays refused its temporary file is removed.
+    A temporary file no save writes any more (its process ended, or ten minutes old) is removed at the
+    next start; each one used to stay for good."""
+    import os
+    import time
+    from pathlib import Path
+    from moneyflow import history
+    from moneyflow.series import Instrument
+    inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")
+    inst.g5.put(5985096, 600.0, True)
+    real, refusals = Path.replace, [2]
+
+    def replace(self, target):
+        if refusals[0] > 0:
+            refusals[0] -= 1
+            raise PermissionError(13, "the file is open in another process")
+        return real(self, target)
+    monkeypatch.setattr(Path, "replace", replace)
+    assert history.save(tmp_path, inst) and (tmp_path / "alpaca_SPY.json").exists() and refusals == [0]
+    refusals[0] = 99
+    with pytest.raises(PermissionError):
+        history.save(tmp_path, inst)
+    assert not list(tmp_path.glob("*.tmp"))
+    monkeypatch.setattr(Path, "replace", real)
+    import subprocess
+    import sys
+    ended = subprocess.Popen([sys.executable, "-c", "pass"])
+    ended.wait()                                               # a copy killed in its save: its process is gone
+    old = tmp_path / f"binance_spot_BTCUSDT.{os.getpid()}.tmp"
+    dead = tmp_path / f"binance_spot_SOLUSDT.{ended.pid}.tmp"
+    busy = tmp_path / f"binance_spot_ETHUSDT.{os.getpid()}.tmp"
+    for f in (old, dead, busy):
+        f.write_text("{}")
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: True)
+    from moneyflow.connectors import binance as bn
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())                            # a start
+    assert not old.exists() and not dead.exists() and busy.exists()   # a live process may still write that one
+
+
+def test_a_backfill_over_an_etfs_close_corrects_the_price_the_night_carries(cfg, keys, monkeypatch, tmp_path):
+    """SPY traded at 600 until 15:30, then the PC slept until 16:30; the session closed at 606. The
+    back-fill wrote the close into the grid but left the price at 600 (live data had come, and after
+    the close nothing else corrects it), and the roll carried 600 over the night and the weekend:
+    Monday's TODAY read +1.0% instead of 0%, HYG and IEF alike (the risk meter's credit input -8.9)."""
+    from conftest import ny_ts
+    from moneyflow.connectors import alpaca as alp
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    t0, sleep, wake = ny_ts(2026, 11, 20, 9, 30), ny_ts(2026, 11, 20, 15, 30), ny_ts(2026, 11, 20, 16, 30)
+    truth = lambda t: 600.0 if t <= sleep else 600.0 + 6.0 * min(1.0, (t - sleep) / 1800)   # noqa: E731
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={})
+
+    async def bars(conn, symbols, tf, start, end=None, feed="iex"):
+        step = 300 if tf == "5Min" else 60
+        t, rows = -(-int(start) // step) * step, []
+        while t + step <= clk.now():
+            if clock.market_open("us_regular", t + step - 1):
+                rows.append((t, truth(t + step), 1e6))
+            t += step
+        return {sym: list(rows) for sym in symbols}
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())                            # the morning's start
+    spy = eng.instruments["alpaca:SPY"]
+    _tick(eng, clk, t0, sleep, step=30.0, feed=lambda t: spy.on_price(truth(t), t, t))
+    clk.set_fixed(wake)                                        # awake again (asleep from 15:30)
+    eng.tick()
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["state"] == "done"
+    assert spy.price == 606.0 and spy.ts == ny_ts(2026, 11, 20, 16, 0)
+    _tick(eng, clk, wake + 30, wake + 3600, step=30.0)         # the evening, carried on
+    k = int((wake + 1800) // G5_STEP)
+    assert spy.g5.get(k) == 606.0 and spy.g1.get(int((wake + 1800) // 60)) == 606.0

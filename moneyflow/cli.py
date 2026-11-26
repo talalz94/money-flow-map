@@ -84,13 +84,16 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         loop.call_soon_threadsafe(stop.set)
 
     import signal
+    import threading
     previous = {}
-    for name in ("SIGBREAK", "SIGTERM"):          # Ctrl+Break / closing the console window; kill
+    for name in ("SIGBREAK", "SIGTERM"):          # Ctrl+Break; kill
         if hasattr(signal, name):
             try:
                 previous[name] = signal.signal(getattr(signal, name), _graceful)
             except (ValueError, OSError):
                 pass
+    closing, saved = threading.Event(), threading.Event()
+    console = _on_console_close(loop, stop, closing, saved) if sys.platform == "win32" else None
 
     async def watch_idle():
         """Not in use (no dashboard tab or app) for the grace period: stop, as if Ctrl+C was pressed."""
@@ -110,15 +113,58 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         if watcher is not None:
             watcher.cancel()
         log.info("stopping (saving the history cache)...")
+        if closing.is_set():
+            # the console window is closing (or Windows logs off or shuts down): the process ends about
+            # 5 s later whatever runs, so the cache is saved first
+            engine.save_cache_logged()
+            saved.set()
         await engine.stop_feeds()
-        await runner.cleanup()          # the port is free while the cache is saved: start.bat works at once
-        await engine.stop()
+        await site.stop()               # the port is free: start.bat can open a new copy at once
+        await engine.stop(save=not closing.is_set())   # the save, not held up by open streams
+        saved.set()
+        await runner.cleanup()          # closes the dashboards' streams and waits for their handlers
+        if console is not None:
+            _console_handler_off(console)
         for name, handler in previous.items():
             try:
                 signal.signal(getattr(signal, name), handler)
             except (ValueError, OSError, TypeError):
                 pass
         log.info("stopped")
+
+
+def _on_console_close(loop, stop: asyncio.Event, closing, saved):
+    """Windows ends a console process about 5 s after its window is closed (and at logoff or shutdown)
+    whatever its Python handlers do: the C runtime's handler for that event returns at once, so the
+    process was gone within 60 ms, its cache unsaved. This handler starts the graceful stop instead and
+    holds the process until the cache is saved (first, on this path). Called from a thread of the
+    system's; returned to keep a reference to it (None if it could not be set)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    except (ImportError, OSError, AttributeError):
+        return None
+
+    def handler(event):
+        if event not in (2, 5, 6):          # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+            return False                    # Ctrl+C, Ctrl+Break: the signal handlers
+        closing.set()
+        try:
+            loop.call_soon_threadsafe(stop.set)
+        except RuntimeError:                # the loop has ended: nothing left to save
+            return False
+        saved.wait(4.5)
+        return True
+
+    h = proto(handler)
+    return h if kernel32.SetConsoleCtrlHandler(h, True) else None
+
+
+def _console_handler_off(h) -> None:
+    import ctypes
+    ctypes.WinDLL("kernel32").SetConsoleCtrlHandler(h, False)
 
 
 def fmt_read(snap: dict) -> str:

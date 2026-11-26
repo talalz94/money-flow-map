@@ -243,9 +243,10 @@ def test_a_computed_series_counts_as_trading_only_where_all_its_inputs_do():
 
 
 def test_a_seeded_close_is_the_price_until_live_data_and_is_never_dated_ahead():
-    """Before any live price this session, a download newer than the price (the cache's close) takes
-    over. A bar still open is not used (it would date the price ahead, and live prices older than
-    that would be dropped as out of order). Once live data has come, a later download leaves it."""
+    """A download newer than the price takes over: the cache's close, or a live price from before a
+    sleep or an outage (the feed silent since). A bar still open is not used (it would date the price
+    ahead, and live prices older than that would be dropped as out of order); a download older than a
+    live price leaves it."""
     t0 = 1795528800.0                                       # on a 5-minute boundary
     inst = Instrument("x:A", "x", "A", "24/7")
     inst.price, inst.ts = 50.0, t0 - 7200                    # the cache's last close
@@ -256,8 +257,10 @@ def test_a_seeded_close_is_the_price_until_live_data_and_is_never_dated_ahead():
     assert inst.price == 90.0 and inst.ts == t0 + 60
     inst.on_price(100.0, t0 + 70, t0 + 70)                    # live, older than the open bar's end
     assert inst.price == 100.0
-    inst.seed("g5", [(t0 + 300 * i, 70.0) for i in range(3)], t0 + 900)   # a back-fill after live data
+    inst.seed("g5", [(t0 - 300, 60.0)], t0 + 900)            # a download ending before the live price
     assert inst.price == 100.0 and inst.ts == t0 + 70
+    inst.seed("g5", [(t0 + 300 * i, 70.0) for i in range(3)], t0 + 900)   # after it: the feed was silent
+    assert inst.price == 70.0 and inst.ts == t0 + 900
 
 
 
@@ -332,3 +335,49 @@ def test_a_thin_etfs_first_trade_after_a_gap_still_covers_it():
     t11 = ny_ts(2026, 11, 23, 11, 0)
     inst.seed("g1", [(t930 + 900, 27.1), (t930 + 1200, 27.2)], t11, since=t11 - 86400 + 60)
     assert inst.holes["g1"] is None
+
+
+def test_a_download_with_no_bar_still_carries_the_close_and_covers_its_gap():
+    """IEX has bars only for minutes that traded, so an answer with none at all (a weekend, a holiday,
+    a thin ETF before its first trade) still means the last close held since the download began.
+    Seeded with nothing, the time off stayed empty (TODAY unknown all day) and its gap was fetched
+    again and given up. A gap opening after the download's end is still the next download's."""
+    from moneyflow import stats
+    inst = Instrument("x:UUP", "x", "UUP", "us_regular")
+    sat, mon = ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 23, 9, 40)
+    k = int(sat // G5_STEP)
+    for j in range(k - 100, k):
+        inst.g5.put(j, 27.0, False)                                # the cache: Friday's close, to Saturday noon
+    inst._hole("g5", ny_ts(2026, 11, 23, 9, 30))                   # the time off, from Monday's open
+    assert inst.seed("g5", [], mon) == 0 and inst.g5.last_k == k - 1   # no `since`: nothing to go by
+    inst.seed("g5", [], mon, since=sat - 600)                     # an answer without a bar: no trade since
+    assert all(inst.g5.get(j) == 27.0 for j in range(k, int(mon // G5_STEP)))
+    assert inst.holes["g5"] is None and stats.price_at(inst, ny_ts(2026, 11, 22, 17, 0), mon) == 27.0
+    inst._hole("g5", mon + 300)                                    # after the download's end
+    inst.seed("g5", [], mon, since=sat - 600)
+    assert inst.holes["g5"] == mon + 300
+
+
+def test_a_newer_download_replaces_a_stale_live_price_and_what_the_roll_carried_of_it():
+    """SPY traded at 600 until the PC slept at 15:30; it woke at 16:30, after a close at 605.5. The
+    roll carried 600 on from the wake, and the back-fill's newer bars left the price alone (live data
+    had come; after the close nothing else corrects it): 600 all night and weekend. The download's
+    newer close takes over, also in the steps the roll had carried meanwhile."""
+    inst = Instrument("x:SPY", "x", "SPY", "us_regular")
+    t0, close, wake = ny_ts(2026, 11, 20, 15, 0), ny_ts(2026, 11, 20, 16, 0), ny_ts(2026, 11, 20, 16, 30)
+    for t in range(int(t0), int(t0) + 1800, 10):                   # live until 15:30
+        inst.on_price(600.0, t, t)
+        inst.roll(t)
+    for t in range(int(wake), int(wake) + 180, 10):                # awake: the old price carried on
+        inst.feed_alive(t)
+        inst.roll(t)
+    k1 = int((wake + 60) // G1_STEP)
+    assert inst.g1.get(k1) == 600.0
+    k_pre, k_live = int(ny_ts(2026, 11, 20, 9, 0) // G1_STEP), int((wake + 120) // G1_STEP)
+    inst.g1.put(k_pre, 600.0, False)                               # the morning carried 600 as well: real
+    inst.g1.put(k_live, 600.0, True)                               # a live step at 600 is data too
+    inst.seed("g5", [(t0 + 300 * i, 600.0 + 0.5 * i) for i in range(12)], wake + 30, since=t0)
+    assert inst.price == 605.5 and inst.ts == close
+    assert inst.g1.get(k1) == 605.5 and inst.g5.get(int((wake - 300) // G5_STEP)) == 605.5
+    assert inst.g1.get(k_pre) == 600.0 and inst.g1.get(k_live) == 600.0   # only what the roll carried after the download
+    assert inst.holes["g5"] is None

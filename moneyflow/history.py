@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 from pathlib import Path
 
 from . import clock, jsonutil
@@ -15,7 +16,9 @@ from .series import Instrument, NaN
 # steps), so its whole range is downloaded again once.
 # 3: an ETF's steps outside its regular session hold the session's last close. Older caches can hold
 # pre- and post-market bars there (carried over nights and weekends): they are rewritten on loading.
-VERSION = 3
+# 4: ... and none of them is empty: a download with no bar for an ETF (a weekend, a holiday, before its
+# first print) carried nothing, so older caches can hold an empty night or weekend: filled on loading.
+VERSION = 4
 
 
 def _file(dirpath: Path, inst: Instrument) -> Path:
@@ -61,7 +64,68 @@ def save(dirpath: Path, inst: Instrument) -> bool:
     # free by then) must not write into the same one
     tmp = _file(dirpath, inst).with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(jsonutil.dumps_compact(out), encoding="utf-8")
-    tmp.replace(_file(dirpath, inst))
+    for wait in (0.05, 0.1, 0.2, 0.4, None):
+        try:
+            tmp.replace(_file(dirpath, inst))
+            return True
+        except PermissionError:
+            # Windows refuses while another process has the file open (a copy loading it at its
+            # start): try again shortly, and leave no temporary file behind if it stays refused
+            if wait is None:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(wait)
+    return True
+
+
+TMP_MAX_AGE = 600.0
+
+
+def clean_tmp(dirpath: Path, max_age: float = TMP_MAX_AGE) -> int:
+    """Remove temporary files no save is writing any more (a save killed midway, or one whose replace
+    stayed refused): those of a process that has ended (the id in `<name>.<pid>.tmp`), and any ten
+    minutes old (a save writes and replaces its file within seconds; a reused process id waits that long)."""
+    n = 0
+    now = time.time()
+    try:
+        files = list(dirpath.glob("*.tmp"))
+    except OSError:
+        return 0
+    for f in files:
+        parts = f.name.rsplit(".", 2)
+        pid = int(parts[1]) if len(parts) == 3 and parts[1].isdigit() else None
+        try:
+            if now - f.stat().st_mtime > max_age or (pid is not None and not _alive(pid)):
+                f.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _alive(pid: int) -> bool:
+    """Is a process with this id running? (Unsure counts as yes.)"""
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() != 87             # ERROR_INVALID_PARAMETER: no such process
+        try:
+            code = wintypes.DWORD()
+            return not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
     return True
 
 
@@ -73,7 +137,7 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
     except (OSError, ValueError):
         return None
     version = d.get("v")
-    if version not in (1, 2, VERSION) or d.get("key") != inst.key:
+    if version not in (1, 2, 3, VERSION) or d.get("key") != inst.key:
         return None
     for name in ("g1", "g5"):
         part = d.get(name)
@@ -87,7 +151,7 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
                 continue
             g.put(k, NaN if v is None else float(v), bool(lv))
         if inst.hours == "us_regular" and version < VERSION:
-            _session_closes(g, inst.hours)
+            _session_closes(g, inst.hours, rewrite=version < 3)
     if inst.v5 is not None and d.get("v5"):
         part = d["v5"]
         k_now = int(now // inst.v5.step)
@@ -113,9 +177,10 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
     return inst.g5.last_k
 
 
-def _session_closes(g, hours: str) -> None:
+def _session_closes(g, hours: str, rewrite: bool = True) -> None:
     """Steps outside the session take the session's last close, as the live series and the download
-    write them (unknown before the grid's first session step)."""
+    write them: an empty one is filled (format 3 and older), and with `rewrite` (format 2 and older) one
+    holding a pre- or post-market print is replaced (unknown before the grid's first session step)."""
     if g.last_k is None:
         return
     carry = NaN
@@ -124,7 +189,10 @@ def _session_closes(g, hours: str) -> None:
         if clock.market_open(hours, (k + 1) * g.step - 1):
             if v == v:
                 carry = v
-        elif v == v and v != carry:
+        elif v != v:
+            if carry == carry:
+                g.put(k, carry, False)
+        elif rewrite and v != carry:
             g.put(k, carry, False)
 
 

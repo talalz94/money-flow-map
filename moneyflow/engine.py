@@ -610,6 +610,8 @@ class Engine:
                  and (only is None or i.key in only)]
         st["total"] = len(insts) + 2
         if not incremental:
+            if startup:
+                history.clean_tmp(self.cache_dir)     # a save killed midway (or refused) left it
             for i in insts:
                 history.load(self.cache_dir, i, now)
         # where each download starts, taken now: once it is in, the holes are gone and the newest
@@ -682,13 +684,13 @@ class Engine:
                 b1 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "1Min", since1, None, conn.cfg.get("feed", "iex"))
                 for i in alp_insts:
                     # IEX has bars only for minutes that traded (`since`: none from there to the first
-                    # bar is no gap)
+                    # bar is no gap), so an answer without any for a symbol is seeded too: no trade
+                    # since (a weekend, a holiday, before its first print), the last close carried.
+                    # Skipped, the time off stayed empty and TODAY unknown all day.
                     rows = b5.get(i.symbol, [])
-                    if rows:
-                        i.seed("g5", [(t, c) for t, c, _ in rows], now, [(t, q, math.nan) for t, _, q in rows], since=since5)
+                    i.seed("g5", [(t, c) for t, c, _ in rows], now, [(t, q, math.nan) for t, _, q in rows], since=since5)
                     rows1 = b1.get(i.symbol, [])
-                    if rows1:
-                        i.seed("g1", [(t, c) for t, c, _ in rows1], now, since=since1)
+                    i.seed("g1", [(t, c) for t, c, _ in rows1], now, since=since1)
                     st["ok"].append(i.key)
             except Exception as e:  # noqa: BLE001
                 st["errors"].append(self.keys.redact(f"alpaca: {e}")[:200])
@@ -1526,10 +1528,17 @@ class Engine:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-    async def stop(self) -> None:
-        """Stop the feeds, then save the history cache. The save takes the time (1 s, several on a busy
-        PC): the CLI frees the port in between, so a new copy can start at once."""
+    async def stop(self, save: bool = True) -> None:
+        """Stop the feeds, then save the history cache (unless `save` is False: done already). The save
+        takes the time (1 s, several on a busy PC): the CLI frees the port before it."""
         await self.stop_feeds()
+        if save:
+            self.save_cache_logged()
+        if self.ctx.session is not None:
+            await self.ctx.session.close()
+
+    def save_cache_logged(self) -> None:
+        """The final save, its time in the log."""
         t = time.monotonic()
         try:
             self.save_cache()
@@ -1537,5 +1546,3 @@ class Engine:
             log.exception("final cache save failed")
         else:
             log.info("history cache saved in %.1f s", time.monotonic() - t)
-        if self.ctx.session is not None:
-            await self.ctx.session.close()
