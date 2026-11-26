@@ -36,6 +36,11 @@ class ConsoleWriter:
 
     def __init__(self):
         self._q: queue.SimpleQueue = queue.SimpleQueue()    # put() never blocks, not even in a signal handler
+        for s in (sys.stdout, sys.stderr):                  # what was printed before goes out first
+            try:
+                s.flush()
+            except Exception:  # noqa: BLE001
+                pass
         self._t = threading.Thread(target=self._run, name="console", daemon=True)
         self._t.start()
 
@@ -49,13 +54,31 @@ class ConsoleWriter:
                 return
             stream, text = item
             try:
-                stream.write(text)
-                stream.flush()
+                self._put(stream, text)
             except Exception:  # noqa: BLE001 - a closed or broken console: nothing to show it on
                 pass
 
+    @staticmethod
+    def _put(stream, text: str) -> None:
+        """Through the stream's unbuffered raw file where it has one, so a write the console holds holds
+        no lock of Python's: held inside the buffer's flush, it kept sys.stderr's (or sys.stdout's), and
+        a stop under a text selection ended in 'Fatal Python error: _enter_buffered_busy' at exit (exit
+        code 0xC0000409, the stop's last lines never shown)."""
+        raw = getattr(getattr(stream, "buffer", None), "raw", None)
+        if raw is None:
+            stream.write(text)
+            stream.flush()
+            return
+        data = text.encode(getattr(stream, "encoding", None) or "utf-8", "replace")
+        while data:
+            n = raw.write(data)                  # (the console's may take part of it: the rest goes next)
+            if not n:
+                return
+            data = data[n:]
+
     def close(self, timeout: float = 2.0) -> None:
-        """Let what is queued reach the console (for at most `timeout`: it can be held)."""
+        """Let what is queued reach the console (for at most `timeout`: it can be held, and then the
+        process ends without the rest; the log file has every line)."""
         self._q.put(None)
         self._t.join(timeout)
 

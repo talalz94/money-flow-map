@@ -1777,9 +1777,11 @@ def test_a_backfill_over_an_etfs_close_corrects_the_price_the_night_carries(cfg,
 
 
 # ── twelfth round: a wake days after a close, the computed dollar, an empty answer, a failed start ──
-def _sleep_over_the_close(cfg, keys, monkeypatch, tmp_path, day, wake):
+def _sleep_over_the_close(cfg, keys, monkeypatch, tmp_path, day, wake, trade_first=False):
     """SPY at 600 until the PC sleeps at 15:30 on `day`; the session closes at 606. Awake at `wake`,
-    the back-fill runs (IEX bars: only for steps that traded). Returns (engine, clock, spy, truth)."""
+    the back-fill runs (IEX bars: only for steps that traded); `trade_first`: a live trade comes before
+    it (in a session the stream is back within seconds, the back-fill waits 10). Returns (engine,
+    clock, spy, truth)."""
     from conftest import ny_ts
     from moneyflow.connectors import alpaca as alp
     from moneyflow.connectors import binance as bn
@@ -1804,6 +1806,10 @@ def _sleep_over_the_close(cfg, keys, monkeypatch, tmp_path, day, wake):
     _tick(eng, clk, t0, sleep, step=30.0, feed=lambda t: spy.on_price(truth(t), t, t))
     clk.set_fixed(ny_ts(*wake))                                # awake again (asleep from 15:30)
     eng.tick()
+    if trade_first:
+        clk.set_fixed(ny_ts(*wake) + 2)
+        spy.on_price(truth(ny_ts(*wake)), ny_ts(*wake) + 2, ny_ts(*wake) + 2)
+        eng.tick()
     asyncio.run(eng._backfill("wake"))
     return eng, clk, spy, truth
 
@@ -2017,3 +2023,68 @@ def test_the_final_save_writes_what_the_next_start_loads_first(cfg, keys, monkey
     n = sum(s in engmod.HISTORY_SOURCES for s in order)
     assert 0 < n < len(order) and all(s in engmod.HISTORY_SOURCES for s in order[:n])
     assert eng.SAVE_EVERY == 600.0
+
+
+@pytest.mark.parametrize("start", [(2026, 11, 21, 15, 36, 1), (2026, 11, 21, 15, 39, 59), (2026, 11, 21, 15, 35, 0),
+                                   (2026, 11, 23, 9, 31, 30)])
+def test_the_first_roll_leaves_no_minute_empty_in_the_5_minute_step_under_way(start, tmp_path):
+    """The first roll after a start fills the 1-minute grid on through the minutes of the 5-minute step
+    under way when that step is shut too: it stopped at the step's start, while the roll goes on from
+    the minute of the start, so a start at 15:36 left the 15:35 minute empty for good (every ETF, in a
+    start from a real cache). Not over open minutes (9:30 at a 9:31 start: the download's)."""
+    import datetime as dt
+    from moneyflow import history
+    from moneyflow.series import G1_STEP, G5_STEP, Instrument
+    from conftest import ny_ts
+    saved = ny_ts(2026, 11, 21, 12, 0)
+    now = dt.datetime(*start, tzinfo=clock.NY).timestamp()
+    a = Instrument("alpaca:QQQ", "alpaca", "QQQ", "us_regular")
+    k = int(saved // G5_STEP)
+    for j in range(k - 300, k):
+        a.g5.put(j, 500.0, clock.market_open("us_regular", (j + 1) * G5_STEP - 1))
+    for j in range(int(saved // G1_STEP) - 300, int(saved // G1_STEP)):
+        a.g1.put(j, 500.0, False)
+    history.save(tmp_path, a)
+    b = Instrument("alpaca:QQQ", "alpaca", "QQQ", "us_regular")
+    history.load(tmp_path, b, now)
+    b.roll(now)
+    b.roll(now + 120)                                          # the roll goes on
+    k1 = int(now // G1_STEP)
+    held = range(max(int(saved // G1_STEP), k1 + 2 - 1439), k1 + 2)     # (as far back as the 1-day grid holds)
+    shut = [j for j in held if not clock.market_open("us_regular", (j + 1) * G1_STEP - 1)]
+    assert all(b.g1.get(j) == 500.0 and not b.g1.is_live(j) for j in shut)
+    opened = [j for j in range(int(saved // G1_STEP), k1) if clock.market_open("us_regular", (j + 1) * G1_STEP - 1)]
+    assert all(b.g1.get(j) != b.g1.get(j) for j in opened)     # (none but at 9:31: the 9:30 minute)
+
+
+@pytest.mark.parametrize("day,wake,later,trade_first", [
+    ((2026, 11, 20), (2026, 11, 23, 10, 0), (2026, 11, 23, 13, 0), True),    # awake Monday 10:00, a trade first
+    ((2026, 11, 20), (2026, 11, 23, 10, 0), (2026, 11, 23, 13, 0), False),   # ... the back-fill first
+    ((2026, 11, 25), (2026, 11, 27, 10, 0), (2026, 11, 27, 12, 30), True)])  # Thanksgiving: Wednesday to Friday 10:00
+def test_a_wake_in_a_session_days_after_an_etfs_close_leaves_no_old_price_in_the_minutes(
+        day, wake, later, trade_first, cfg, keys, monkeypatch, tmp_path):
+    """Awake in the next session a day or more after the close slept over: the 1-minute download (one
+    day long) begins at that session's first bar, so the minutes before it kept the pre-sleep price the
+    roll had carried over the time off, swapped price or not (a trade first: no swap; the back-fill
+    first: rewritten from today's bar on only). TODAY read +1.0% all session and 1H until 10:30 (true
+    0), and a restart the same day kept it. The 1-minute grid's shut hours take the 5-minute one's."""
+    from conftest import ny_ts
+    from moneyflow import history, stats
+    from moneyflow.series import G1_SIZE
+    eng, clk, spy, truth = _sleep_over_the_close(cfg, keys, monkeypatch, tmp_path, day, wake, trade_first)
+    w = ny_ts(*wake)
+    assert eng.backfill_state["state"] == "done" and spy.price == 606.0
+    k1 = int(w // 60)
+    shut = [k for k in range(k1 - G1_SIZE + 1, k1) if not clock.market_open("us_regular", (k + 1) * 60 - 1)]
+    assert shut and all(spy.g1.get(k) == 606.0 for k in shut)
+    for t in (w + 60, ny_ts(*later)):
+        _tick(eng, clk, clk.now() + 10, t, step=30.0,
+              feed=lambda x: spy.on_price(truth(x), x, x) if clock.market_open("us_regular", x) else None)
+        for tf in ("today", "1h"):
+            assert stats.window_return(spy, stats.window_for(tf, t), t)[1] == 0.0, (t, tf)
+    eng.save_cache()                                           # and a restart the same day reads the same
+    again = Engine(cfg, keys, clock.Clock(fixed=ny_ts(*later) + 60))
+    inst = again.instruments["alpaca:SPY"]
+    history.load(tmp_path, inst, ny_ts(*later) + 60)
+    t = ny_ts(*later) + 60
+    assert stats.price_at(inst, stats.window_for("today", t).start, t) == 606.0

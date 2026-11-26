@@ -3,6 +3,7 @@ import math
 import pytest
 
 from conftest import ny_ts
+from moneyflow import clock
 from moneyflow.series import DXY, G1_STEP, G5_STEP, Grid, Instrument, NaN, StablecoinShare, Stitched
 
 
@@ -412,22 +413,98 @@ def test_an_answer_with_no_bar_over_a_long_open_stretch_leaves_it_unknown():
             assert all(g.get(j) == 27.0 for j in weekend), (grid, start)
             assert all((g.get(j) == 27.0) is carried and not (g.is_live(j) and not carried) for j in session)
             assert inst.holes[grid] == (None if carried else opened), (grid, start)
-    # an outage over Friday's close: nothing from 15:00 on (the weekend would carry the 14:55 price)
+    # an outage over Friday's close: nothing from 15:00 on (the weekend would carry the 14:55 price);
+    # SPY's close changed every 5 minutes before it
     fri, mon = ny_ts(2026, 11, 20, 15, 0), ny_ts(2026, 11, 23, 8, 0)
+    k_fri = int(fri // G5_STEP)
     for closes, carried in (([], False), ([(fri - 300, 27.5)], True)):
         inst = Instrument("x:SPY", "x", "SPY", "us_regular")
-        for j in range(int(fri // G5_STEP) - 50, int(fri // G5_STEP)):
-            inst.g5.put(j, 27.5, True)
+        for j in range(k_fri - 50, k_fri):
+            inst.g5.put(j, 27.5 if j == k_fri - 1 else 27.0 + 0.01 * (j % 13), True)
         inst.seed("g5", closes, mon, since=fri - 600)
-        after = range(int(fri // G5_STEP), int(mon // G5_STEP))
+        after = range(k_fri, int(mon // G5_STEP))
         assert all((inst.g5.get(j) == 27.5) is carried for j in after)
         assert inst.holes["g5"] == (None if carried else fri)
     # an older stretch with no value (a gap given up before): unknown only up to the grid's next value
     inst = Instrument("x:SPY", "x", "SPY", "us_regular")
-    gap, close = range(int(fri // G5_STEP) - 12, int(fri // G5_STEP) - 6), int(ny_ts(2026, 11, 20, 16, 0) // G5_STEP)
-    for j in range(int(fri // G5_STEP) - 50, close):
-        inst.g5.put(j, NaN if j in gap else 27.5, j not in gap)
+    gap, close = range(k_fri - 12, k_fri - 6), int(ny_ts(2026, 11, 20, 16, 0) // G5_STEP)
+    for j in range(k_fri - 50, close):
+        inst.g5.put(j, NaN if j in gap else 27.5 if j == close - 1 else 27.0 + 0.01 * (j % 13), j not in gap)
     sat = ny_ts(2026, 11, 21, 12, 0)
     inst.seed("g5", [], sat, since=fri - 4200)
     assert all(inst.g5.get(j) != inst.g5.get(j) for j in gap) and inst.holes["g5"] == gap[0] * G5_STEP
     assert all(inst.g5.get(j) == 27.5 for j in range(close, int(sat // G5_STEP)))   # the night carried
+
+
+def test_a_symbol_that_often_goes_quiet_has_its_empty_answer_read_as_no_trade_for_longer():
+    """The open stretch an answer with no bar is read as "no trade" over is the symbol's own: twice the
+    longest run of unchanged 5-minute closes in its sessions, 15 minutes at least. UUP often prints
+    nothing on IEX for 50 minutes after the open, so a fixed 15 minutes left its quiet opening unknown
+    (fetched again, given up as "no exchange data", its 1H blank an hour later); SPY never goes 5. Both
+    grids measure the same stretch: one reaching the download's end runs on to it (at 9:47 the 1-minute
+    grid saw 17 minutes, the 5-minute one 15)."""
+    mon_open, fri = ny_ts(2026, 11, 23, 9, 30), ny_ts(2026, 11, 20, 16, 0)
+
+    def etf(sym, quiet_steps):
+        # 35 days to Saturday noon: each session opens quiet for `quiet_steps` steps (the last close
+        # carried), then the close changes every step; shut hours carry the session's close
+        inst = Instrument(f"x:{sym}", "x", sym, "us_regular")
+        prev, n = 27.0, 0
+        for j in range(int(fri // G5_STEP) - 35 * 288, int(ny_ts(2026, 11, 21, 12, 0) // G5_STEP)):
+            live = clock.market_open("us_regular", (j + 1) * G5_STEP - 1)
+            n = (0 if not clock.market_open("us_regular", j * G5_STEP - 1) else n + 1) if live else n
+            closing = quiet_steps and not clock.market_open("us_regular", (j + 3) * G5_STEP - 1)   # its last 2: quiet too
+            if live and n >= quiet_steps and not closing:
+                prev = 27.0 + 0.01 * (j % 13) + (0.005 if 27.0 + 0.01 * (j % 13) == prev else 0.0)
+            inst.g5.put(j, prev, live)
+        inst.price, inst.ts = prev, fri
+        return inst
+    for sym, quiet, start, carried in (("UUP", 10, ny_ts(2026, 11, 23, 10, 5), True),    # 35 minutes: within its 100
+                                       ("SPY", 0, ny_ts(2026, 11, 23, 10, 5), False),    # SPY: over 15
+                                       ("SPY", 0, ny_ts(2026, 11, 23, 9, 47), False),    # 17 minutes, both grids
+                                       ("SPY", 0, ny_ts(2026, 11, 23, 9, 44), True)):    # 14 minutes
+        inst = etf(sym, quiet)
+        assert inst.quiet_limit_s() == max(900.0, 2 * quiet * G5_STEP)   # (a run ends at the close)
+        for grid, step in (("g5", G5_STEP), ("g1", G1_STEP)):
+            g = getattr(inst, grid)
+            inst._hole(grid, mon_open)
+            inst.seed(grid, [], start, since=ny_ts(2026, 11, 20, 15, 50))
+            session = range(int(mon_open // step), int(start // step))
+            assert all((g.get(j) == g.get(j)) is carried for j in session), (sym, start, grid)
+            assert inst.holes[grid] == (None if carried else mon_open), (sym, start, grid)
+
+
+def test_a_seed_gives_the_1_minute_shut_hours_the_5_minute_close_but_not_a_computed_series():
+    """After a download the 1-minute grid's shut hours before its first bar take the 5-minute grid's
+    close (its download reaches back to the gap; the 1-minute one is a day long). A computed series
+    keeps its own: its price is computed from its inputs again at the next tick."""
+    sat, mon = ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 23, 9, 45)
+    for inst, kept in ((Instrument("x:SPY", "x", "SPY", "us_regular"), False),
+                       (DXY("dxy:usd", {n: Instrument(f"fx:{n}", "fx", n, "fx") for n in DXY.WEIGHTS}), True)):
+        hours = inst.hours
+        for j in range(int(sat // G5_STEP), int(mon // G5_STEP)):
+            inst.g5.put(j, 101.0, False)                      # the 5-minute grid: the close slept over
+        for j in range(int(mon // G1_STEP) - 1439, int(mon // G1_STEP)):
+            inst.g1.put(j, 100.0, False)                      # the 1-minute one: the pre-sleep price carried
+        first = ny_ts(2026, 11, 23, 9, 30) if hours == "us_regular" else ny_ts(2026, 11, 22, 17, 0)
+        inst.seed("g1", [(first, 101.0)], mon, since=mon - 86400 + 60)
+        shut = [j for j in range(int(mon // G1_STEP) - 1439, int(first // G1_STEP))
+                if not clock.market_open(hours, (j + 1) * G1_STEP - 1)]
+        assert shut and all(inst.g1.get(j) == (100.0 if kept else 101.0) for j in shut), inst.key
+
+
+def test_an_empty_1_minute_grid_carries_the_5_minute_close_from_an_open_start_not_an_older_one():
+    """A download that begins in a session, before its first bar, with the 1-minute grid empty there:
+    the minutes up to that bar carry the 5-minute grid's close of the hour (not the close before the
+    open the shut hours hold, an older one)."""
+    inst = Instrument("x:UUP", "x", "UUP", "us_regular")
+    fri, mon = ny_ts(2026, 11, 20, 16, 0), ny_ts(2026, 11, 23, 9, 30)
+    for j in range(int(fri // G5_STEP) - 78, int(ny_ts(2026, 11, 23, 11, 0) // G5_STEP)):
+        live = clock.market_open("us_regular", (j + 1) * G5_STEP - 1)
+        inst.g5.put(j, 27.5 if j * G5_STEP >= mon else 27.0, live)   # Friday 27.0 (carried); Monday 27.5
+    start, first, until = ny_ts(2026, 11, 23, 11, 0), ny_ts(2026, 11, 23, 11, 20), ny_ts(2026, 11, 23, 12, 0)
+    inst.seed("g1", [(first, 27.6)], until, since=start)
+    assert all(inst.g1.get(k) == 27.5 for k in range(int(start // G1_STEP), int(first // G1_STEP)))
+    shut = [k for k in range(int(until // G1_STEP) - 1439, int(mon // G1_STEP))
+            if not clock.market_open("us_regular", (k + 1) * G1_STEP - 1)]
+    assert all(inst.g1.get(k) == 27.0 for k in shut)                # the shut hours: the 5-minute grid's

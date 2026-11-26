@@ -424,3 +424,36 @@ def test_closing_the_window_while_the_console_is_held_still_saves(tmp_path, keys
     assert stopping and seen["save_at"] < stopping[0]          # saved before anything was written of the stop
     text = "".join(console.text)                               # all there once the selection ends
     assert "Money Flow Map is running" in text and "stopping..." in text
+
+
+def test_a_held_console_write_holds_no_lock_of_pythons_stdio():
+    """The console thread writes through the stream's raw file: held (a text selection in the window),
+    it holds no lock of Python's. Held inside the buffered stream's flush, it kept sys.stderr's (or
+    sys.stdout's) lock, so at exit Python could not flush them: a stop under a selection ended in
+    'Fatal Python error: _enter_buffered_busy' (exit code 0xC0000409), its last lines never shown."""
+    import io
+    import threading
+    entered, released = threading.Event(), threading.Event()
+    got = []
+
+    class HeldRaw(io.RawIOBase):
+        def writable(self):
+            return True
+
+        def write(self, b):
+            entered.set()
+            released.wait(10)                                   # the selection, until it ends
+            got.append(bytes(b[:7]))                            # (a console takes part of it at a time)
+            return min(len(b), 7)
+    stream = io.TextIOWrapper(io.BufferedWriter(HeldRaw()), encoding="utf-8")
+    writer = cli.ConsoleWriter()
+    try:
+        writer.write(stream, "history cache saved in 0.4 s\n")
+        assert entered.wait(5)                                  # the write is held
+        flushed = threading.Event()
+        threading.Thread(target=lambda: (stream.flush(), flushed.set()), daemon=True).start()
+        assert flushed.wait(1.0)                                # what Python does at exit: not held up
+    finally:
+        released.set()
+        writer.close()
+    assert b"".join(got) == "history cache saved in 0.4 s\n".encode()

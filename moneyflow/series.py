@@ -21,10 +21,11 @@ from . import clock
 NaN = float("nan")
 G1_STEP, G1_SIZE = 60, 1440
 G5_STEP, G5_SIZE = 300, 10080
-# The longest stretch of an open market an answer with no session bar for a symbol is read as "no
-# trade" over (a thin ETF before its first print, a start a few minutes after the open). Over a longer
-# one it is more likely the venue's own gap: a 200 answer without the symbol filled a 30-minute
-# outage of SPY with its 9:59 price, flagged live, and cleared the hole for good.
+# The shortest stretch of an open market an answer with no session bar for a symbol is read as "no
+# trade" over (a start a few minutes after the open). Over a longer one that is twice the longest the
+# symbol itself went without a trade lately (Instrument.quiet_limit_s: UUP's often 50 minutes after the
+# open on IEX, SPY's never 5) it is more likely the venue's own gap: a 200 answer without SPY filled a
+# 30-minute outage with its 9:59 price, flagged live, and cleared the hole for good.
 QUIET_MAX_S = 900.0
 
 
@@ -165,6 +166,7 @@ class Instrument:
         self._open_any = False              # did the open steps see a real update?
         self._vol_min: dict[int, tuple[float, float]] = {}   # minute -> (quote vol, taker-buy quote)
         self._vol_acc: dict[int, list] = {}                   # minute -> [q, tb] from trades
+        self._quiet: tuple = (None, QUIET_MAX_S)              # (day, quiet_limit_s), worked out once a day
 
     # ── live updates ────────────────────────────────────────────────────────────────────────
     def on_price(self, price: float, ev_ts: float | None, recv_ts: float, measure: bool = True) -> None:
@@ -316,8 +318,13 @@ class Instrument:
         while k < k5_now and not clock.market_open(self.hours, (k + 1) * G5_STEP - 1):
             g5.put(k, self.price, False)
             k += 1
-        # the 1-minute grid over the same shut stretch (sessions open and close on 5-minute steps)
+        # the 1-minute grid over the same shut stretch (sessions open and close on 5-minute steps), and
+        # on through the minutes of the 5-minute step under way when it is shut too: the roll goes on
+        # from this minute (a start at 15:36 left the 15:35 minute empty)
         k1_now, k1_end = int(now // G1_STEP), k * (G5_STEP // G1_STEP)
+        if k == k5_now:
+            while k1_end < k1_now and not clock.market_open(self.hours, (k1_end + 1) * G1_STEP - 1):
+                k1_end += 1
         k1v = _newest_value(g1, k1_now)
         k1 = max((kv + 1) * (G5_STEP // G1_STEP), k1_now - G1_SIZE + 1, -1 if k1v is None else k1v + 1)
         for j in range(k1, min(k1_end, k1_now)):
@@ -361,7 +368,8 @@ class Instrument:
         `until` with carry-forward; the live flag follows the market-hours profile. `since`: where a
         download from a venue with bars only for steps that traded (IEX) began: no bar between there
         and its first one means no trade (the last close carried), not a gap to fetch again; that
-        holds for an answer with no bar at all too (a weekend, a holiday, before an ETF's first print)."""
+        holds for an answer with no bar at all too (a weekend, a holiday, before an ETF's first print),
+        over shut hours and over open ones up to the symbol's own limit (quiet_limit_s)."""
         g = self.g1 if grid == "g1" else self.g5
         if not closes and since is None:
             return 0
@@ -378,22 +386,30 @@ class Instrument:
         # as closes, Friday evening's prints were carried all weekend and became Monday's TODAY
         # reference (0.46% off a price that stays on the session).
         session = self.hours == "us_regular"
-        # No session bar at all for the symbol: "no trade" holds for shut hours and for a short stretch
-        # of an open market (QUIET_MAX_S). A longer one with no value of its own is left unknown, and
-        # so is what follows it up to the grid's next value of its own (the close it would carry, also
-        # into the shut hours after it, is unknown); the hole is from the first such stretch, for the
-        # back-fill (which gives up on it if the next answer is the same).
+        # No session bar at all for the symbol: "no trade" holds for shut hours and for a stretch of an
+        # open market up to the symbol's own limit (quiet_limit_s). A longer one with no value of its
+        # own is left unknown, and so is what follows it up to the grid's next value of its own (the
+        # close it would carry, also into the shut hours after it, is unknown); the hole is from the
+        # first such stretch, for the back-fill (which gives up on it if the next answer is the same).
+        # A stretch reaching the download's end runs on to `until` when that is open: both grids then
+        # measure the same time (the 1-minute one said unknown at 16 minutes, the 5-minute one saw 15).
         unknown: set[int] = set()
         if since is not None and not any(k_from <= k < k_until and (not session or clock.market_open(
                 self.hours, (k + 1) * step - 1)) for k in by_k):
-            run = 0
-            for k in range(k_from, k_until):
-                if g.get(k) == g.get(k) or not clock.market_open(self.hours, (k + 1) * step - 1):
-                    run = 0
+            limit, start = None, None
+            for k in range(k_from, k_until + 1):
+                if k < k_until and g.get(k) != g.get(k) and clock.market_open(self.hours, (k + 1) * step - 1):
+                    start = k if start is None else start
                     continue
-                run += 1
-                if run * step > QUIET_MAX_S:
-                    unknown.add(k - run + 1)
+                if start is not None:
+                    end = k * step
+                    if k == k_until and clock.market_open(self.hours, until - 1e-6):
+                        end = until
+                    if end - start * step > QUIET_MAX_S:
+                        limit = self.quiet_limit_s() if limit is None else limit
+                        if end - start * step > limit:
+                            unknown.add(start)
+                start = None
         last, k_last = NaN, None
         for k in range(k_from - 1, k0 - 1, -1):            # the carry value: the newest close before
             if k in by_k and (not session or clock.market_open(self.hours, (k + 1) * step - 1)):
@@ -405,6 +421,17 @@ class Instrument:
             last = g.asof(k_from * step, max_back=g.size)
         if session and last != last and grid == "g1":
             last = self.g5.asof(k_from * step, max_back=12)   # an empty 1-day grid: the 5-minute one's
+        # Shut hours in the 1-minute grid as the 5-minute one has them, before this answer's first bar:
+        # its download reaches back to the gap, this one is a day long. After a wake in a session a day
+        # or more after an ETF's close the 1-minute grid kept the pre-sleep price the roll had carried
+        # over the time off, swapped price or not: TODAY read the move to the close slept over all
+        # session, and 1H till 10:30. (Not for a computed series: it keeps its own steps. After the
+        # carry above is taken: across the empty open minutes of an empty grid it would reach an
+        # older close than the 5-minute grid's.)
+        from_g5 = grid == "g1" and not self.computed
+        if from_g5:
+            for k in range(k_until - g.size + 1, min(k_from, k_first)):
+                self._shut_from_g5(k)
         n, k_ext, blocked = 0, None, False
         for k in range(k_from, k_until):
             open_ = clock.market_open(self.hours, (k + 1) * step - 1)
@@ -415,7 +442,7 @@ class Instrument:
                 else:
                     k_ext = k
             elif k < k_first:
-                v = g.get(k)
+                v = self._shut_from_g5(k, open_) if from_g5 else g.get(k)
                 if v == v:                           # up to the first bar the cache's own steps stay
                     last, blocked = v, False
                     continue
@@ -460,6 +487,45 @@ class Instrument:
                 if old != self.price:
                     self._recarry(old, t_last)
         return n
+
+    def _shut_from_g5(self, k: int, open_: bool | None = None) -> float:
+        """The 1-minute step k, set to the 5-minute grid's close when its market was shut then (seed: the
+        5-minute grid's download reaches back to the gap; a shut step is never live); its value."""
+        g = self.g1
+        v = g.get(k)
+        if open_ is None:
+            open_ = clock.market_open(self.hours, (k + 1) * G1_STEP - 1)
+        if not open_:
+            v5 = self.g5.get(k // (G5_STEP // G1_STEP))
+            if v5 == v5 and v5 != v:
+                g.put(k, v5, False)
+                return v5
+        return v
+
+    def quiet_limit_s(self) -> float:
+        """How long its open market can go without a trade before an answer with no bar for it is more
+        likely the venue's gap than no trade: twice the longest run of unchanged closes in the session
+        steps its 5-minute grid holds (35 days), QUIET_MAX_S at least. On IEX, UUP often prints nothing
+        for 50 minutes after the open; SPY's close changes every 5 minutes. A fixed 15 minutes left
+        UUP's quiet opening unknown, fetched it again and gave it up."""
+        g = self.g5
+        if g.last_k is None:
+            return QUIET_MAX_S
+        day = g.last_k // (86400 // G5_STEP)
+        if self._quiet[0] == day:
+            return self._quiet[1]
+        best = run = 0
+        prev = NaN
+        for k in range(g.first_k(), g.last_k + 1):
+            v = g.get(k)
+            if not g.is_live(k):                   # shut (the close carried) or not traded: a new run
+                run, prev = 0, v
+                continue
+            run = run + 1 if v == prev else 0
+            best = max(best, run)
+            prev = v
+        self._quiet = (day, max(QUIET_MAX_S, 2.0 * best * g.step))
+        return self._quiet[1]
 
     def _recarry(self, old: float, after: float) -> None:
         """A replaced price, in the steps carried from it, from the end of the close that replaced it

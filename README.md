@@ -769,11 +769,20 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - IEX has bars only for minutes that traded, so no bar between where a download began and its
     first bar means no trade: the last close is carried there, and no gap is left. The same holds
     for an answer with no bar at all for an ETF (a weekend, a holiday, a start before its first
-    print). A thin ETF's first trade after 9:30 left a gap (fetched again, then given up as "no
-    exchange data"), also with the start before that trade; a cache saved on a Saturday left the
-    weekend empty until Monday's first bar, and with no bar at all since, the time off stayed empty
-    (every ETF's TODAY unknown all day). A cache written before this (format version 3 or older) can
-    hold such an empty night or weekend: filled with the session's close when loaded.
+    print) over shut hours, and over open ones up to the ETF's own limit: twice the longest stretch
+    of unchanged 5-minute closes in its last 35 days of sessions, 15 minutes at least. UUP often
+    prints nothing on IEX for 50 minutes after the open, so its limit is long; SPY's close changes
+    every 5 minutes, so an answer without SPY over a 30-minute outage (the review's case) is taken for
+    the venue's gap: those minutes stay unknown and are fetched again (then given up as "no exchange
+    data"), not filled with the last price as if nothing had traded. A thin ETF's first trade after
+    9:30 left a gap (fetched again, then given up), also with the start before that trade; a cache
+    saved on a Saturday left the weekend empty until Monday's first bar, and with no bar at all
+    since, the time off stayed empty (every ETF's TODAY unknown all day). A cache can hold such an
+    empty night or weekend: filled with the session's close when loaded.
+  - A back-fill's 1-minute download is one day long; the 5-minute one reaches back to the gap. So
+    after a download the 1-minute grid's shut hours before its first bar take the 5-minute grid's
+    close: after a wake in a session a day or more after an ETF's close (a weekend, a holiday) they
+    kept the pre-sleep price, and TODAY read the move to the close slept over all session.
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once.
@@ -817,8 +826,10 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     click in it with QuickEdit on, Windows' default, or Edit > Mark) holds every write to it until the
     selection ends: a log line written meanwhile froze the whole service (the API did not answer),
     and a window closed in that state saved nothing. The service now runs on, and the lines appear
-    once the selection ends. The log file still says when a window close started the stop ("the
-    console window is closing: saving the history cache first...").
+    once the selection ends. At a stop under a selection the process waits up to 2 s for them and
+    then ends normally (the log file has every line); it used to end in "Fatal Python error" once the
+    selection ended. The log file also says when a window close started the stop ("the console
+    window is closing: saving the history cache first...").
   - **The limit:** Windows ends the process about 4.5 s after the close, saved or not. On a busy PC
     the save can take longer (the review measured 7-8 s with the PC loaded); it writes the files the
     next start reads first, and those it does not reach keep their last save (every 10 minutes): the
@@ -1398,7 +1409,7 @@ code before this round (10246f7) and now:
 
 | | Before | Now |
 |---|---|---|
-| **A sleep over an ETF's close that wakes a day or more later** (SPY 600 until 15:30, closed at 606; awake Monday 8:00, Saturday 17:30, or Friday 8:00 after Thanksgiving) | price 606, but every 1-minute step held 600: TODAY and 1H +1.0% while the market was shut (true 0), TODAY +1.0% all through the next session | 0.0% at every read, and after a restart; in the review's random lifecycles the five multi-day outages went from 900-1,320 wrong 1-minute steps each to 0 (89 in one, the same 89 as before; 90 long-sleep runs: none worse) |
+| **A sleep over an ETF's close that wakes a day or more later** (SPY 600 until 15:30, closed at 606; awake Monday 8:00, Saturday 17:30, or Friday 8:00 after Thanksgiving) | price 606, but every 1-minute step held 600: TODAY and 1H +1.0% while the market was shut (true 0), TODAY +1.0% all through the next session | 0.0% at every read, and after a restart, for these wakes before the next open (a wake during the next session still read +1.0%: fixed in the thirteenth round); in the review's random lifecycles the five multi-day outages went from 900-1,320 wrong 1-minute steps each to 0 (89 in one, the same 89 as before; 90 long-sleep runs: none worse) |
 | **The computed dollar after a weekend wake** (FX legs stale since Friday 15:00, ICE 0.3% higher at 17:00, awake Saturday 18:00) | TODAY and 1H -0.30% while FX was shut (true 0) | 0.0% |
 | **An answer with no bar for an ETF that did trade** (SPY, a 30-minute outage while awake) | the 30 minutes written as the 9:59 price, flagged live; the hole cleared for good, also in the cache | left unknown (30 of 30), given up as "no exchange data", downloaded again at the next start |
 | **A window closed as a stop begins** (during the feeds' stop, after Ctrl+Break or Ctrl+C) | 0 of 33 files saved | 33 of 33 (saved within a second) |
@@ -1426,6 +1437,36 @@ code before this round (10246f7) and now:
   start carries the same close over the same shut hours (with that carry off too, the test catches
   it). Two older ones (an empty answer not seeded, an older cache's empty night not filled) were
   caught at first only by that webhook test: new test cases catch them.
+
+**Thirteenth round (27 Nov 2026): a review of the twelfth round.** Checked on the review's
+reproductions and harnesses (offline; the real `python -m` start in a console window of its own where
+it says so), on the code before this round (60e7442) and now:
+
+| | Before | Now |
+|---|---|---|
+| **A wake in a session a day or more after an ETF's close** (SPY 600 until Friday 15:30, closed at 606; awake Monday 10:00, or Friday 10:00 after Thanksgiving; a live trade before the back-fill or not) | TODAY +1.0% all session (true 0), 1H +1.0% until 10:30; the 1-minute grid held 600 at TODAY's start, the 5-minute one 606. Random lifecycle 7401 (an outage from Friday 9:54 to Monday 11:49): 1,001 wrong 1-minute steps | 0.0% at every read, also after a restart the same day; 7401: 1 (a live step, the same before) |
+| **UUP's quiet opening** (its first IEX print 50, 40 or 27 minutes after the open; a start at 10:15, 10:05 or 9:50) | 4 Alpaca requests instead of 2; UUP's 1H blank at 11, 1 and 0 reads an hour later | 2 requests; no blank read |
+| **An open stretch of 16-19 minutes with no bar** (a start at 9:46-9:49) | the 1-minute grid unknown with a hole, the 5-minute one carried and flagged live | both grids the same |
+| **A stop with a text selection in the console window** (the auto-stop, run as `python -m`) | the cache saved (33 of 33), then "Fatal Python error: _enter_buffered_busy" (exit code 0xC0000409) once the selection ended | the cache saved, exit code 0 two seconds later, the selection still held |
+| **The first roll in a later minute of a shut 5-minute step** (a start at 15:36) | the 15:35 minute left empty for good | filled |
+
+- **The quiet limit on this PC's cache** (twice the longest stretch of unchanged 5-minute closes in
+  35 days of sessions): SPY, QQQ, IWM 15 minutes; GLD, TLT 20; SLV 30; HYG, IEF, USO 50; VIXY 60;
+  UUP 260. An empty answer over a longer open stretch is the venue's gap; over a shorter one, no
+  trade.
+- **Not changed:** an ETF whose history shows a new close every 5 minutes and that then prints
+  nothing for 20 minutes after the open still gets a hole, one more download and "no exchange
+  data" (the review's thin_0950 case, whose thin ETFs traded every minute before: the same on
+  60e7442). In the review's long-sleep lifecycles, 12 of 60 still read TODAY wrong, the same on
+  60e7442; the two looked at slept from before the run's first session print, so the sessions slept
+  through count as carried and are not back-filled (the eleventh round's "Not changed").
+- **Tests: 249 pass.** The new ones cover each item above.
+- **Mutation check: 141 of 142 changes are caught:** the twelfth round's (rewritten where this
+  round changed the code) and this round's. The one left is the twelfth round's equivalent one (the
+  carry of Yahoo's 5-minute bars, done by the first roll's carry as well). One older one (an empty
+  1-minute grid's carry from the 5-minute grid) got through at first: the shut-hours sync came
+  before that carry was taken, which also let an empty grid carry an older close over a download's
+  first open minutes. The sync now comes after it, with a test.
 
 ---
 
