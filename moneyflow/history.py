@@ -64,6 +64,11 @@ def save(dirpath: Path, inst: Instrument) -> bool:
         qs, tbs = _oldest_first(v.q, v.last_k, v.size), _oldest_first(v.tb, v.last_k, v.size)
         i = next((n for n, x in enumerate(qs) if x == x), len(qs))
         out["v5"] = {"k0": k0 + i, "q": _pack(qs[i:]), "tb": _pack(tbs[i:])}
+    # the gaps a download has yet to fill: an old cache's one-time whole download (mark_holes) is a gap
+    # at its first value that nothing in the data shows, so a stop before it succeeded lost it for good
+    holes = {name: h for name, h in inst.holes.items() if h is not None}
+    if holes:
+        out["holes"] = holes
     # this process's own temporary file: a copy started while this one still saves (the port is
     # free by then) must not write into the same one
     tmp = _file(dirpath, inst).with_suffix(f".{os.getpid()}.tmp")
@@ -180,6 +185,10 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
             inst.price = g.get(k)
             inst.ts = (k + 1) * g.step
     mark_holes(inst, untrusted=version == 1 or (inst.hours == "us_regular" and version < 5), now=now)
+    for name, h in (d.get("holes") or {}).items():   # (saved gaps: at the oldest step its grid holds)
+        g = getattr(inst, name, None) if name in inst.holes else None
+        if g is not None and isinstance(h, (int, float)) and math.isfinite(h):
+            inst._hole(name, max(float(h), (int(now // g.step) - g.size + 1) * g.step))
     return inst.g5.last_k
 
 
@@ -191,13 +200,17 @@ def _session_closes(g, hours: str, rewrite: bool = True) -> None:
         return
     if not rewrite:
         # the steps outside the session hold that close already: an empty one takes the value before
-        # it (market hours looked up for empty steps only: this runs at every start, for every ETF)
+        # it (market hours looked up for empty steps only: this runs at every start, for every ETF),
+        # never across an empty session step: the close after it is unknown (carried over one, a night
+        # after a gap over the close took the price from before the gap)
         carry = NaN
         for k in range(g.first_k(), g.last_k + 1):
             v = g.get(k)
             if v == v:
                 carry = v
-            elif carry == carry and not clock.market_open(hours, (k + 1) * g.step - 1):
+            elif clock.market_open(hours, (k + 1) * g.step - 1):
+                carry = NaN
+            elif carry == carry:
                 g.put(k, carry, False)
         return
     carry = NaN

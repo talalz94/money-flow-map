@@ -161,6 +161,9 @@ class Instrument:
         self.holes: dict[str, float | None] = {"g1": None, "g5": None}   # first such step, until back-filled
         self._gap_open = False              # the last closed step was uncovered...
         self.recovered = False              # ...and since then one was covered: the feed is back
+        # an ETF's first session minute its feed missed since its price was last current (a session
+        # print, or a download that covered the gap): the close after it is unknown (roll)
+        self._stale_from: float | None = None
         self._k1 = None                     # open (not yet closed) 1-minute step
         self._k5 = None                     # open 5-minute step
         self._open_any = False              # did the open steps see a real update?
@@ -195,6 +198,7 @@ class Instrument:
             # back-fill's back-off (up to 15 min) is cut short, as after any outage
             self.recovered = True
         self._live_seen = True
+        self._stale_from = None             # a session print: the price is current again
         self.feed_alive(recv_ts)
         if ev_ts is not None and measure:
             lat = (recv_ts - ev_ts) * 1000.0
@@ -213,6 +217,12 @@ class Instrument:
     def feed_alive(self, ts: float | None) -> None:
         """Real data, or the feed's own heartbeat, reached us at `ts` (local, NTP-corrected)."""
         if ts is not None and not (self._seen_ts >= ts):
+            self._seen_ts = ts
+
+    def heard_until(self, ts: float) -> None:
+        """Its feed counts as heard until `ts` at most: after a sleep, what came in since the wake says
+        nothing about the time asleep (Engine.tick, the first tick after it)."""
+        if self._seen_ts > ts:
             self._seen_ts = ts
 
     def _hole(self, grid: str, t0: float) -> None:
@@ -276,6 +286,19 @@ class Instrument:
         # before any live data, a step after an unfilled hole would only carry the CACHE's last close
         # (the app was off, the first download failed): unknown too, not that old price
         h1, h5 = self.holes["g1"], self.holes["g5"]
+        # A session minute its feed missed leaves an ETF's price stale: the close after it is unknown,
+        # so the shut steps after it are too (not live, no gap: the session's hole is the gap), until a
+        # session print or a download that covers the gap (seed). Carried, they held the price from
+        # before the gap all night; with an answer that had no bar for the ETF they stayed, and TODAY
+        # read the move since the gap began, status live, until 17:00 New York. Found before both
+        # loops: after a sleep of over a day the 1-minute loop starts past the first missed session.
+        if fed and seen == seen and self._stale_from is None and self.hours == "us_regular":
+            m = max(self._k1, int(seen // G1_STEP) + 1)
+            while m < k1_now:
+                if clock.market_open(self.hours, (m + 1) * G1_STEP - 1):
+                    self._stale_from = m * G1_STEP
+                    break
+                m += 5 if (m * G1_STEP) % G5_STEP == 0 else 1     # (sessions open on 5-minute steps)
         start = max(self._k1, k1_now - G1_SIZE)
         for k in range(start, k1_now):
             t0 = k * G1_STEP
@@ -291,6 +314,8 @@ class Instrument:
                 self._gap_open, self.recovered = False, True
             if open_ and not traded and h1 is not None and t0 >= h1:
                 self.g1.put(k, NaN, False)
+            elif not open_ and self._stale_from is not None and t0 > self._stale_from:
+                self.g1.put(k, NaN, False)
             else:
                 self.g1.put(k, p, traded and open_)
         k5_now = int(now // G5_STEP)
@@ -300,7 +325,9 @@ class Instrument:
                 open_ = clock.market_open(self.hours, t0 + G5_STEP - 1)
                 stale = open_ and not traded and h5 is not None and t0 >= h5
                 covered = not stale and not (fed and open_ and not (seen >= t0))
-                if covered:
+                if covered and not open_ and self._stale_from is not None and t0 > self._stale_from:
+                    self.g5.put(k, NaN, False)          # the close after a missed session minute (above)
+                elif covered:
                     self.g5.put(k, p, traded and open_)
                 else:
                     self.g5.put(k, NaN, False)
@@ -462,6 +489,15 @@ class Instrument:
                 # so it never counts as a quiet stretch of the symbol's own)
                 g.put(k, last, open_ and not empty)
                 n += 1
+        if session and last == last and not blocked and g.last_k is not None:
+            # the shut steps the roll closed during the download, after its end, while the price was
+            # stale (roll: unknown), hold the close the download ends on (left empty, one minute closed
+            # while a wake's download ran stayed so for good)
+            for k in range(k_until, g.last_k + 1):
+                if clock.market_open(self.hours, (k + 1) * step - 1):
+                    break
+                if g.get(k) != g.get(k):
+                    g.put(k, last, False)
         if k_ext is not None and (k_ext + 1) * step > (self.extra.get("ext_ts") or 0):
             self.extra["ext_price"], self.extra["ext_ts"] = by_k[k_ext], (k_ext + 1) * step
         if grid == "g5" and volumes and self.v5 is not None:
@@ -491,6 +527,8 @@ class Instrument:
                 nxt = next((k * step for k in range(k_until, g.last_k + 1)
                             if g.get(k) != g.get(k) and clock.market_open(self.hours, (k + 1) * step - 1)), None)
             self.holes[grid] = nxt
+            if session:
+                self._stale_from = nxt          # its price is current again (stale from that next gap)
         # the price is the newest close known: a downloaded bar newer than it takes over, also after
         # live data (a sleep or an outage over an ETF's close left the pre-outage price all night and
         # weekend: nothing after the close corrects it). Only a bar the grid took (before `until`)

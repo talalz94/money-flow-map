@@ -14,7 +14,7 @@ import datetime as dt
 import math
 
 from .. import clock, jsonutil
-from .base import PollConnector, StreamConnector
+from .base import STANDBY, PollConnector, StreamConnector
 
 
 def _hdr(keys) -> dict:
@@ -239,15 +239,16 @@ class AlpacaFallback(PollConnector):
         return self.stream.available()
 
     async def poll(self):
+        # (standing by is no poll: the ETFs' coverage comes from the stream's own messages then)
         if self.stream.health.state == "connected" and self.stream.ws is not None:
             self.health.detail = "standby (stream connected)"
-            return
+            return STANDBY
         if self.now() - self.started < 30 and not self.stream.refused_until:
             self.health.detail = "standby (stream connecting)"     # give the stream time at start-up
-            return
+            return STANDBY
         if not any(clock.market_open(i.hours, self.now()) for i in self.stream.subs.values()):
             self.health.detail = "standby (US market closed)"
-            return
+            return STANDBY
         url = f"{self.cfg.get('rest_url', 'https://data.alpaca.markets')}/v2/stocks/trades/latest"
         j = await self.get_json(url, params={"symbols": ",".join(sorted(self.stream.subs)),
                                              "feed": self.cfg.get("feed", "iex")}, headers=_hdr(self.keys))

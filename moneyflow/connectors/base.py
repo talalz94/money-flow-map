@@ -21,6 +21,11 @@ import aiohttp
 
 from .. import jsonutil
 
+# what a poll() returns when it stood by without asking (the Alpaca fallback while the stream is up):
+# no successful poll, so no `last_ok`. Counted as one, its round right after a wake, which can run
+# before the first tick, covered the whole time asleep: no gap, the pre-sleep price kept.
+STANDBY = "standby"
+
 
 class Backoff:
     def __init__(self, base: float = 1.0, cap: float = 60.0):
@@ -340,10 +345,11 @@ class PollConnector(Connector):
             try:
                 self.health.state = "polling"
                 t0 = time.perf_counter()
-                await self.poll()
+                standby = await self.poll() == STANDBY
                 self.health.last_poll_ms = round((time.perf_counter() - t0) * 1000)
                 self.health.state = "ok"
-                self.health.last_ok = self.now()
+                if not standby:
+                    self.health.last_ok = self.now()
                 self.health.detail = ""
                 self.backoff.reset()
                 delay = self.next_interval()

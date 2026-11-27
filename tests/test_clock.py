@@ -75,7 +75,7 @@ def test_an_ntp_reply_is_checked_before_its_offset_is_used():
     """A reply from pool.ntp.org with zero timestamps (a kiss-of-death when many copies start within
     minutes) set the clock 127 years back: every tick failed until the next sync. A reply is used only
     from a synchronised server (stratum 1-15, no alarm), in server mode, answering this request, with
-    its timestamps set, a round trip of 0-5 s and a correction under a day."""
+    its timestamps set and a round trip of 0-5 s (a correction over a day: see the offset's choice)."""
     import pytest
     t0 = 1795528800.0
     sent = clock._ntp_stamp(t0)
@@ -88,7 +88,6 @@ def test_an_ntp_reply_is_checked_before_its_offset_is_used():
            "not synchronised ": _reply(sent, t0, stratum=16),
            "not a server reply": _reply(sent, t0, mode=3),
            "another request": _reply(clock._ntp_stamp(t0 - 9), t0),
-           "offset -90000 s": _reply(sent, t0, offset=-90000.0),
            "short reply": _reply(sent, t0)[:40]}
     for why, data in bad.items():                              # each for its own reason
         with pytest.raises(clock.NTPError, match=why.strip()):
@@ -154,3 +153,36 @@ def test_the_clock_takes_the_servers_that_agree_and_keeps_its_offset_otherwise(m
     assert not c.sync_blocking() and abs(c.offset - 0.210) < 1e-9
     answers.update(a=(-0.4, 0.03), b=OSError("x"), c=OSError("x"), d=OSError("x"))       # one usable reply
     assert c.sync_blocking() and c.server == "a" and abs(c.offset + 0.4) < 1e-9
+
+
+def test_a_correction_over_a_day_is_taken_only_where_another_server_agrees(monkeypatch):
+    """A PC clock 30 hours or 2 days behind (a wrong date after a BIOS reset; Windows' own time service
+    corrects at most 15 hours by default) is corrected when the servers agree: a cap on every reply
+    rejected them all, and market hours, the 17:00 roll and data ages all ran 30 hours off. A lone
+    well-formed reply 1024 weeks off (19.6 years) is still not taken, alone or beside a good one."""
+    t0 = 1795528800.0
+    sent = clock._ntp_stamp(t0)
+    off, _ = clock.parse_sntp_reply(_reply(sent, t0, offset=-90000.0), sent, t0, t0 + 0.03)
+    assert abs(off + 90000.0) < 1e-3                                   # (the reply itself is fine)
+    answers = {}
+
+    def query(srv, timeout=2.0):
+        a = answers[srv]
+        if isinstance(a, Exception):
+            raise a
+        return a
+    monkeypatch.setattr(clock, "sntp_query", query)
+    c = clock.Clock(servers=("a", "b", "c", "d"))
+    week1024 = -1024 * 7 * 86400.0
+    answers.update(a=(108000.2, 0.03), b=(108000.1, 0.02), c=(108000.3, 0.04), d=OSError("x"))
+    assert c.sync_blocking() and c.server == "b" and abs(c.offset - 108000.1) < 1e-9   # 30 hours behind
+    answers.update(a=(172800.0, 0.03), b=(172800.2, 0.05), c=OSError("x"), d=OSError("x"))
+    assert c.sync_blocking() and c.server == "a" and abs(c.offset - 172800.0) < 1e-9   # two days
+    answers.update(a=(0.2, 0.03), b=OSError("x"), c=OSError("x"), d=OSError("x"))
+    assert c.sync_blocking() and abs(c.offset - 0.2) < 1e-9
+    answers.update(a=(week1024, 0.01), b=OSError("x"), c=OSError("x"), d=OSError("x"))
+    assert not c.sync_blocking() and abs(c.offset - 0.2) < 1e-9                        # alone: not taken
+    answers.update(a=(week1024, 0.01), b=(0.25, 0.04), c=OSError("x"), d=OSError("x"))
+    assert c.sync_blocking() and c.server == "b" and abs(c.offset - 0.25) < 1e-9       # beside a good one
+    answers.update(a=(week1024, 0.01), b=(0.25, 0.04), c=(0.3, 0.03), d=(0.28, 0.05))
+    assert c.sync_blocking() and c.server == "c" and abs(c.offset - 0.3) < 1e-9

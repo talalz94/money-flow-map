@@ -397,8 +397,9 @@ Latency is **receive time − the exchange's own timestamp**, measured on this P
 Pakistan) with the clock corrected by NTP. Measured on 24 Nov 2026; marketing claims were not used.
 > The PC clock ran **0.95-0.99 s fast**. Uncorrected, every source would look about 1 s slower.
 > The service measures this offset itself (SNTP) and corrects all ages. It asks four servers and
-> uses a reply only from a synchronised server answering its own request, with a correction under a
-> day; of the replies that agree (within 0.5 s of their median), the shortest round trip wins. A
+> uses a reply only from a synchronised server answering its own request, with a correction over a
+> day only where another server agrees (a PC clock days off is corrected; a lone reply 1024 weeks off
+> is not); of the replies that agree (within 0.5 s of their median), the shortest round trip wins. A
 > server's "kiss-of-death" (zero timestamps, when many copies start at once) once set the clock 127
 > years back; a failed or doubtful sync now leaves the offset in use.
 
@@ -734,6 +735,12 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     down is **empty**: no price, not live. It is never the last price carried forward as if it
     traded, which made σ too low and the history differ from the exchange (the 25 Nov night).
     Computed series (the dollar, bonds, the stablecoin share) are live only where their inputs are.
+  - The Alpaca REST fallback standing by while the stream is up asks nothing, so it is no heartbeat;
+    and the first tick after a sleep takes nothing heard since the wake as covering the time asleep.
+    After a wake every overdue timer fires at once, and when the fallback's round came first (in
+    about 1 of 100 to 120 simulated wakes with the stream up, the review found) the whole time asleep
+    counted as covered: an ETF that had traded held its pre-sleep price there, flagged live, with no
+    gap (1H +0.43% where the truth was 0; after a night asleep, TODAY +0.61% the next morning).
   - That holds before an ETF's first trade of the run too, once its feed has reported (any message:
     the stream's login counts). Started on a weekend or before the open, with the PC then asleep (or
     the network down) over one or more sessions, an ETF had those sessions carried from the cache's
@@ -741,13 +748,20 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     the hour's, and after days away TODAY the whole move since the cache. An ETF with no feed at
     all (no Alpaca key: its history comes from Yahoo) has its sessions carried from its last close,
     as before.
+  - After a session minute an ETF's feed missed, its close is unknown, and so are the shut steps after
+    it (not live, no gap: the session's gap is what gets downloaded), until a session print or a
+    download that covers the gap fills them with the close. They held the price from before the gap,
+    and when the back-fill's answer had no bar for the ETF (an Alpaca anomaly, given up after that one
+    attempt) they stayed: TODAY read the move since the gap began, status live, until 17:00 New York
+    (+0.96% where the truth was -0.04%). A cache's empty shut steps are filled with the session's
+    close when it is loaded, but not across an empty session step.
   - A **back-fill** downloads the empty steps. After a failure (DNS down after waking, no network)
     it retries after 30 s, doubling to 15 min, and 10 s after a feed delivers again (time for the
     feeds to settle; also when that happens during a download, on the first live price after a
     start whose download failed, and before an ETF's first trade when its stream reports in a
-    session again). It stops only when nothing is
-    missing, when the gap is older than the history, or when the exchange has no data there either
-    (a gap that appeared during a download was not asked for, so it is the next attempt's). It runs
+    session again). It stops only when nothing is missing, or when the exchange has no data there
+    either (a gap that appeared during a download was not asked for, so it is the next attempt's; a
+    gap older than the history starts at its oldest step). It runs
     in the background: it never holds up the auto-stop, and it stops with the app. Its state is
     under `/api/health` (`backfill`).
   - It downloads only the instruments with gaps, each from its own gap (after a sleep of many
@@ -803,7 +817,12 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once. So is an ETF's cache of format 4 or older: it can hold sessions
     slept over before the ETF's first trade of a run, carried from the close before (not live, no
-    gap, never fetched).
+    gap, never fetched). That download is a gap at the cache's first value, which nothing in the data
+    shows: the gaps a download has yet to fill are saved with the cache, and one older than the
+    history starts at its oldest step. A first start whose downloads failed for a few minutes (the
+    network down for 6, an Alpaca error for 40 s) dropped it as older than the history, and one
+    stopped before they succeeded saved the cache in the new format: either way the one-time download
+    was lost for good, and a week later 1W read SPY +1.13%, HYG +0.73%, IEF -0.27% (true 0).
   - A picked stock whose history failed to download, and a kick a connector got while busy, are
     not left to their back-off either: a recovered feed retries the stock at once, and the kick
     ends the connector's next wait.
@@ -1532,6 +1551,44 @@ a faked NTP exchange, on the code before this round (ea4dbdb) and now:
   a gap's recovery on a shut step (a test now covers it), and an older one, an empty night filled on
   loading for older formats only: its test loaded formats 3 and 4, the current one until this round,
   and loads the current one too now.
+
+**Fifteenth round (27 Nov 2026): a review of the fourteenth.** Checked on the review's reproductions
+(offline: the real engine, in the wake's case its event loop on a virtual clock; only the network
+stubbed), an old-format cache written by the code of two rounds ago, a stub NTP server and the review's
+lifecycle harness, on the code before this round (9281ec2) and now:
+
+| | Before | Now |
+|---|---|---|
+| **A wake with the Alpaca fallback's standby round due before the first tick** (asleep 9:46-11:46 with SPY trading; 9:21-11:21 before its first print; 12:01 to 10:31 the next day) | the whole time asleep covered, no gap: 110, 106 and 290 1-minute steps at the pre-sleep price (flagged live where SPY had traded); 1H +0.43%, +1.00% and +0.61% (true 0), TODAY +0.61% the next morning | gaps, back-filled: every step right, in both orders; each of the two guards alone gives the same |
+| **An old ETF cache's first start with its downloads failing** (an Alpaca error for 40 s at 09:04:30; the network down for 6 minutes) | the one-time 35-day download dropped as older than the history; Friday's 42 carried steps kept, the cache saved as format 5; a week later 1W SPY +1.13%, HYG +0.73%, IEF -0.27% (true 0) | downloaded once the network is back: 42 right, 1W 0.00% |
+| **The same start stopped 5 minutes in, still down, and started again** | saved as format 5 with nothing pending: never downloaded, 1W as above | the pending gap saved with the cache: downloaded at the next start, 1W 0.00% |
+| **The PC clock 30 hours or 2 days behind, three NTP servers agreeing** | every reply rejected: offset 0, all times 30 hours off | +108000 s and +172800 s |
+| **A sleep (or an outage) over a close, the back-fill's answer without a bar for SPY** (12:30 to 10:00 the next day; also asleep from before SPY's first print) | the night held the price from before the gap: TODAY +0.96% (true -0.04%), status live, at every read till 16:00; 9 wrong reads in each case | the night unknown: TODAY unknown; 0 wrong reads, and right after a restart as before |
+| **A wake at 16:20, after the close, with a full answer** | the 1-minute grid's night at the pre-gap price (1,029 steps): TODAY +0.96% (true -0.04%) at 16:21 | right |
+
+- **The rules:** a poll that only stood by is no successful poll; the first tick after the wall clock
+  jumped (over 25 s between the tick loop's rounds, as the watchdog's) counts every feed as heard
+  until the tick before it. A gap older than the history starts at its oldest step, and the gaps a
+  download has yet to fill are saved with the cache. A correction over a day counts where another
+  NTP server agrees (a lone reply over a day off is still ignored). After a session minute an ETF's
+  feed missed, the shut steps after it are unknown until a session print or a download that covers
+  the gap; the download also fills the ones the roll closed while it ran, and loading a cache no
+  longer carries a close across an empty session step.
+- **Lifecycles** (the review's engine-order harness, 480 long sleeps, before and now): with its empty
+  back-fill answers, the runs off by a point or more went from 8 to 0 (the largest error from 14.34
+  to 0.38 points), none worse, 13 better; 45 read unknown more often, 44 of them after an empty
+  answer (the close it left unknown, where the stale price read an accidental 0.00 off-hours). With
+  every answer complete: 477 the same, 2 better (one of them 1.95 points off before: the wake after
+  the close), none worse; one reads unknown twice in the seconds between an off-hours wake and its
+  back-fill. In the earlier reviews' harness: 150 short lifecycles 149 the same and 1 better, 120
+  long sleeps 101 the same and 19 better, 200 mixed (24/7 and ETF) all the same; none worse, and the
+  extra unknown reads come after an empty answer or in the seconds between an off-hours wake and its
+  back-fill.
+- **Tests: 277 pass.** The new ones cover each item above.
+- **Mutation check: 188 of 189 changes are caught:** the fourteenth round's (rewritten where this round
+  changed the code) and this round's. The one left is the twelfth round's equivalent one. One of
+  this round's got through at first (a session print's making the price current again after a missed
+  minute): a test now covers it.
 
 ---
 

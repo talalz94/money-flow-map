@@ -93,7 +93,8 @@ class Engine:
         self._feed_waiters: set[asyncio.Event] = set()   # retries that a recovered feed cuts short
         self._save_lock = threading.Lock()  # one cache save at a time (they run in worker threads)
         self.resumes = 0
-        self._last_wall = time.time()
+        self._last_wall = time.time()       # the tick loop's last round (a jump since: the PC slept)
+        self._ticked: float | None = None   # the last tick's time
         self._tasks: list[asyncio.Task] = []
         self.local_tz = cfg.get("general", {}).get("local_timezone", "") or ""
         self.flow_cfg = cfg.get("flow", {})
@@ -804,7 +805,8 @@ class Engine:
         await asyncio.get_running_loop().run_in_executor(None, self.save_cache, insts)
 
     # ── the clock tick ──────────────────────────────────────────────────────────────────────
-    def tick(self, now: float | None = None) -> None:
+    def tick(self, now: float | None = None, woke: bool = False) -> None:
+        """Close the steps that ended (each instrument's roll). `woke`: the first tick after the PC slept."""
         now = now or self.clock.now()
         roll = clock.day_roll(now)
         if roll != getattr(self, "_roll_seen", roll):
@@ -818,8 +820,15 @@ class Engine:
             self._eased = {k: v for k, v in self._eased.items() if k[0] != "today"}
             self._rescreen_soon()
         self._roll_seen = roll
+        before, self._ticked = self._ticked, now
         for inst in self.instruments.values():
-            inst.feed_alive(self._feed_seen(inst.source))   # a quiet market on a live feed is covered
+            seen = self._feed_seen(inst.source)             # a quiet market on a live feed is covered...
+            if woke and before is not None:
+                # ...but not the time asleep by what came in since the wake: the Alpaca fallback's round
+                # or a REST answer can come before this tick, and then no slept step was a gap
+                inst.heard_until(before)
+                seen = None if seen is None else min(seen, before)
+            inst.feed_alive(seen)
             inst.roll(now)
         self._ensure_share_anchor(now)
         for d in self.derived:
@@ -1315,11 +1324,15 @@ class Engine:
             await asyncio.sleep(delay)
             delay = min(900.0, delay * 2)
 
+    WAKE_GAP_S = 25.0     # wall-clock seconds between two rounds that mean the PC slept (as the watchdog)
+
     async def _loop(self):
         while True:
             t0 = time.monotonic()
+            wall = time.time()
+            woke, self._last_wall = wall - self._last_wall > self.WAKE_GAP_S, wall
             try:
-                self.tick()
+                self.tick(woke=woke)
                 for fn in list(self.listeners):
                     try:
                         await fn(self)
@@ -1478,10 +1491,14 @@ class Engine:
             while True:
                 now = self.clock.now()
                 horizon = now - int(self.cfg.get("general", {}).get("history_days", 35)) * 86400
-                for i in self.instruments.values():         # a gap older than the history is moot
+                for i in self.instruments.values():
+                    # a gap older than the history starts at its oldest step: an old cache's one-time
+                    # whole download is a gap at its first value (history.load), which the horizon
+                    # passes within 5 minutes. Dropped, a first start whose downloads failed for longer
+                    # lost that download for good (the cache then saved in the new format).
                     for g, h in list(i.holes.items()):
                         if h is not None and h < horizon:
-                            i.holes[g] = None
+                            i.holes[g] = horizon
                 todo = self.holes()
                 if not todo:
                     if attempt:

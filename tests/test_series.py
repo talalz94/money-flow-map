@@ -645,3 +645,75 @@ def test_a_gap_up_to_the_close_is_not_recovered_by_the_shut_hours_after_it():
     inst.feed_alive(opened + 5)
     inst.roll(opened + 61)
     assert inst.recovered
+
+
+def test_the_close_after_a_session_minute_the_feed_missed_is_unknown_until_a_download_covers_it():
+    """Out from 15:30 to 16:20 (a sleep or an outage over the close): the session minutes are gaps, and
+    the shut minutes after them are unknown, not 600 carried (the price from before the gap), until a
+    download covers the gap: it fills them with the session's close, also the minute the roll closed
+    while it ran, after its end. An answer with no bar for the ETF leaves them unknown."""
+    t0, back = ny_ts(2026, 11, 24, 15, 30), ny_ts(2026, 11, 24, 16, 20)
+    night = range(int((t0 + 1800) // G1_STEP), int(back // G1_STEP))
+    for answer in ("bars", "none"):
+        inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")
+        inst.seed("g1", [(t0 - 600 + 60 * j, 600.0) for j in range(10)], t0)
+        inst.on_price(600.0, t0 - 1, t0 - 1)                          # traded; its feed heard till 15:29:59
+        inst.roll(back)
+        assert inst.holes["g1"] == t0 and all(inst.g1.get(k) != inst.g1.get(k) for k in night)
+        asked = back + 30
+        inst.feed_alive(back + 60)
+        inst.roll(back + 61)                                          # the download still running
+        bars = [(t0 - 600 + 60 * j, 601.0) for j in range(40)] if answer == "bars" else []
+        inst.seed("g1", bars, asked, since=t0 - 600)
+        after = range(int(back // G1_STEP), int((back + 61) // G1_STEP))
+        if answer == "bars":
+            assert all(inst.g1.get(k) == 601.0 and not inst.g1.is_live(k) for k in list(night) + list(after))
+            inst.roll(back + 121)
+            assert inst.g1.get(int((back + 60) // G1_STEP)) == 601.0             # current again
+        else:
+            assert all(inst.g1.get(k) != inst.g1.get(k) for k in list(night) + list(after))
+            inst.roll(back + 121)
+            assert inst.g1.get(int((back + 60) // G1_STEP)) != 600.0             # still unknown
+
+
+def test_a_minute_closed_while_a_download_ran_after_a_weekend_wake_holds_the_close():
+    """Asleep from Thursday 15:00 to Saturday 23:16: the 1-minute download (a day long) has no session
+    in it, so it covers no gap of its own, and the minute the roll closed while it ran, unknown (after a
+    session minute the feed missed), stayed so for good. It takes the close the download ends on."""
+    thu, wake = ny_ts(2026, 11, 19, 15, 0), ny_ts(2026, 11, 21, 23, 16)
+    inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")
+    inst.seed("g5", [(thu - 600, 600.0), (thu - 300, 600.0)], thu)
+    inst.seed("g1", [(thu - 600 + 60 * j, 600.0) for j in range(10)], thu)
+    inst.on_price(600.0, thu - 1, thu - 1)
+    inst.roll(wake)
+    assert inst.holes["g1"] is None and inst.holes["g5"] == thu
+    asked = wake + 15
+    inst.feed_alive(wake + 60)
+    inst.roll(wake + 61)                                          # the download still running
+    k = int(wake // G1_STEP)
+    assert inst.g1.get(k) != inst.g1.get(k)
+    bars = [(t, 601.0) for t in range(int(thu), int(ny_ts(2026, 11, 20, 16, 0)), int(G5_STEP))
+            if clock.market_open("us_regular", t + G5_STEP - 1)]
+    inst.seed("g5", bars, asked, since=thu - 600)
+    inst.seed("g1", [], asked, since=asked - 86400 + 60)
+    assert inst.g1.get(k) == 601.0 and inst.g1.get(k - 60) == 601.0 and inst.price == 601.0
+
+
+def test_a_session_print_after_a_missed_minute_makes_the_price_current_again():
+    """A session minute the feed missed leaves the price stale (the close after it unknown) until a
+    download covers the gap or the ETF prints again: out from 15:00 to 15:10, then printing till the
+    close, the night carries that close as ever (the missed minutes stay a gap, for the back-fill)."""
+    t0 = ny_ts(2026, 11, 24, 15, 0)
+    inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")
+    inst.seed("g1", [(t0 - 600 + 60 * j, 600.0) for j in range(10)], t0)
+    inst.on_price(600.0, t0 - 1, t0 - 1)
+    inst.roll(t0 + 600)
+    assert inst.holes["g1"] == t0
+    for t in range(int(t0) + 600, int(t0) + 4200, 30):           # back at 15:10: prints till the close
+        if clock.market_open("us_regular", t):
+            inst.on_price(601.0, t, t)
+        inst.feed_alive(t)
+        inst.roll(t + 1)
+    night = range(int((t0 + 3600) // G1_STEP), int((t0 + 4170) // G1_STEP))
+    assert all(inst.g1.get(k) == 601.0 and not inst.g1.is_live(k) for k in night)
+    assert inst.holes["g1"] == t0

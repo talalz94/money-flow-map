@@ -27,7 +27,7 @@ log = logging.getLogger("moneyflow.clock")
 
 NTP_SERVERS = ("time.cloudflare.com", "time.google.com", "pool.ntp.org", "time.windows.com")
 _NTP_DELTA = 2208988800
-NTP_MAX_OFFSET_S = 86400.0     # a correction over a day is a bad reply, not the PC's clock
+NTP_MAX_OFFSET_S = 86400.0     # a correction over a day: a bad reply, unless another server agrees
 NTP_MAX_RTT_S = 5.0
 NTP_AGREE_S = 0.5              # replies whose offsets agree within this
 
@@ -66,8 +66,6 @@ def parse_sntp_reply(data: bytes, sent: tuple[int, int], t0: float, t3: float) -
     offset, rtt = ((t1 - t0) + (t2 - t3)) / 2, (t3 - t0) - (t2 - t1)
     if not 0.0 <= rtt <= NTP_MAX_RTT_S:
         raise NTPError(f"round trip {rtt:.3f} s")
-    if abs(offset) > NTP_MAX_OFFSET_S:
-        raise NTPError(f"offset {offset:+.0f} s")
     return offset, rtt
 
 
@@ -85,8 +83,14 @@ def sntp_query(server: str, timeout: float = 2.0) -> tuple[float, float]:
 
 def pick_offset(replies: list[tuple[str, float, float]]) -> tuple[str, float, float] | None:
     """The reply to trust among (server, offset, rtt): of those within NTP_AGREE_S of the replies'
-    median offset, the shortest round trip. Two or more replies of which no two agree: none (the
-    offset in use stays)."""
+    median offset, the shortest round trip. A correction over a day counts only where another reply
+    agrees with it: one server's well-formed reply 1024 weeks off would set the clock 19.6 years back,
+    while servers that agree correct a PC clock that is days off (a cap on every reply left it so;
+    Windows' own time service corrects at most 15 hours by default). Two or more replies of which no
+    two agree: none (the offset in use stays)."""
+    def agreed(r):
+        return any(q is not r and abs(q[1] - r[1]) <= NTP_AGREE_S for q in replies)
+    replies = [r for r in replies if abs(r[1]) <= NTP_MAX_OFFSET_S or agreed(r)]
     if len(replies) <= 1:
         return replies[0] if replies else None
     offs = sorted(o for _, o, _ in replies)
@@ -133,8 +137,9 @@ class Clock:
             replies.append((srv, off, rtt))
         best = pick_offset(replies)
         if best is None:
-            log.warning("NTP sync failed (%s); the clock offset stays %+.0f ms",
-                        "no usable reply" if not replies else "the servers disagree", self.offset * 1000)
+            why = ("no usable reply" if not replies else "its one reply corrects over a day" if len(replies) == 1
+                   else "the servers disagree")
+            log.warning("NTP sync failed (%s); the clock offset stays %+.0f ms", why, self.offset * 1000)
             return False
         self.server, self.offset, self.rtt = best
         self.synced_at = time.time()
