@@ -2,8 +2,9 @@
 
 Why NTP: on the development PC the Windows clock ran 0.95 s FAST. Data age and latency are
 "now minus the exchange's own timestamp", so an uncorrected clock would add ~1 s of fake lag to
-every source. `Clock` measures the offset with SNTP (several servers, lowest round trip wins) and
-re-checks it every 30 minutes and after the PC wakes from sleep.
+every source. `Clock` measures the offset with SNTP (several servers; of the replies that agree, the
+shortest round trip wins; unusable replies are dropped) and re-checks it every 30 minutes and after
+the PC wakes from sleep.
 """
 from __future__ import annotations
 
@@ -26,21 +27,73 @@ log = logging.getLogger("moneyflow.clock")
 
 NTP_SERVERS = ("time.cloudflare.com", "time.google.com", "pool.ntp.org", "time.windows.com")
 _NTP_DELTA = 2208988800
+NTP_MAX_OFFSET_S = 86400.0     # a correction over a day is a bad reply, not the PC's clock
+NTP_MAX_RTT_S = 5.0
+NTP_AGREE_S = 0.5              # replies whose offsets agree within this
+
+
+class NTPError(ValueError):
+    """A reply not to use: a kiss-of-death, an unsynchronised server, zero timestamps, ..."""
+
+
+def _ntp_stamp(t: float) -> tuple[int, int]:
+    t += _NTP_DELTA
+    sec = int(t)
+    return sec, int((t - sec) * 2**32) & 0xFFFFFFFF
+
+
+def parse_sntp_reply(data: bytes, sent: tuple[int, int], t0: float, t3: float) -> tuple[float, float]:
+    """(offset_s, round_trip_s) of a server's reply to a request sent at t0 (its transmit stamp `sent`)
+    and received at t3. Unusable replies raise NTPError: one from pool.ntp.org with zero timestamps (a
+    kiss-of-death when many copies start at once) set the clock 127 years back, and every tick failed
+    until the next sync half an hour later."""
+    if len(data) < 48:
+        raise NTPError("short reply")
+    w = struct.unpack("!12I", data[:48])
+    li, version, mode, stratum = data[0] >> 6, (data[0] >> 3) & 7, data[0] & 7, data[1]
+    if stratum == 0:
+        raise NTPError(f"kiss-of-death {data[12:16].decode('ascii', 'replace').strip(chr(0))!r}")
+    if li == 3 or stratum > 15:
+        raise NTPError("server not synchronised")
+    if mode != 4 or not 1 <= version <= 4:
+        raise NTPError("not a server reply")
+    if (w[6], w[7]) != sent:
+        raise NTPError("a reply to another request")
+    if not (w[8] or w[9]) or not (w[10] or w[11]):
+        raise NTPError("zero timestamps")
+    t1 = w[8] + w[9] / 2**32 - _NTP_DELTA
+    t2 = w[10] + w[11] / 2**32 - _NTP_DELTA
+    offset, rtt = ((t1 - t0) + (t2 - t3)) / 2, (t3 - t0) - (t2 - t1)
+    if not 0.0 <= rtt <= NTP_MAX_RTT_S:
+        raise NTPError(f"round trip {rtt:.3f} s")
+    if abs(offset) > NTP_MAX_OFFSET_S:
+        raise NTPError(f"offset {offset:+.0f} s")
+    return offset, rtt
 
 
 def sntp_query(server: str, timeout: float = 2.0) -> tuple[float, float]:
     """One SNTP request. Returns (offset_s, round_trip_s); offset = true time - local time."""
-    pkt = b"\x1b" + 47 * b"\0"
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(timeout)
         t0 = time.time()
-        s.sendto(pkt, (server, 123))
+        sent = _ntp_stamp(t0)                 # echoed back as the reply's originate stamp
+        s.sendto(b"\x1b" + 39 * b"\0" + struct.pack("!II", *sent), (server, 123))
         data, _ = s.recvfrom(512)
         t3 = time.time()
-    w = struct.unpack("!12I", data[:48])
-    t1 = w[8] + w[9] / 2**32 - _NTP_DELTA
-    t2 = w[10] + w[11] / 2**32 - _NTP_DELTA
-    return ((t1 - t0) + (t2 - t3)) / 2, (t3 - t0) - (t2 - t1)
+    return parse_sntp_reply(data, sent, t0, t3)
+
+
+def pick_offset(replies: list[tuple[str, float, float]]) -> tuple[str, float, float] | None:
+    """The reply to trust among (server, offset, rtt): of those within NTP_AGREE_S of the replies'
+    median offset, the shortest round trip. Two or more replies of which no two agree: none (the
+    offset in use stays)."""
+    if len(replies) <= 1:
+        return replies[0] if replies else None
+    offs = sorted(o for _, o, _ in replies)
+    n = len(offs)
+    median = offs[n // 2] if n % 2 else (offs[n // 2 - 1] + offs[n // 2]) / 2
+    agree = [r for r in replies if abs(r[1] - median) <= NTP_AGREE_S]
+    return min(agree, key=lambda r: r[2]) if len(agree) >= 2 else None
 
 
 class Clock:
@@ -67,16 +120,21 @@ class Clock:
             self._fixed += seconds
 
     def sync_blocking(self) -> bool:
-        best = None
+        """Measure the offset; a failed or doubtful sync leaves the one in use (the PC's clock at first)."""
+        replies = []
         for srv in self.servers:
             try:
                 off, rtt = sntp_query(srv)
-            except Exception:
+            except NTPError as e:
+                log.info("NTP %s: %s (ignored)", srv, e)
                 continue
-            if rtt >= 0 and (best is None or rtt < best[2]):
-                best = (srv, off, rtt)
+            except Exception:  # noqa: BLE001 - no reply, DNS down, ...
+                continue
+            replies.append((srv, off, rtt))
+        best = pick_offset(replies)
         if best is None:
-            log.warning("NTP sync failed on all servers; using the PC clock as is")
+            log.warning("NTP sync failed (%s); the clock offset stays %+.0f ms",
+                        "no usable reply" if not replies else "the servers disagree", self.offset * 1000)
             return False
         self.server, self.offset, self.rtt = best
         self.synced_at = time.time()

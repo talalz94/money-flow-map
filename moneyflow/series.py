@@ -266,6 +266,13 @@ class Instrument:
         # it is back-filled from the exchange. Carried as live, the 25 Nov night (Bitcoin flat for
         # 26 steps) made σ too low and every Binance series differ from the exchange.
         seen = self._seen_ts
+        # That holds before its first live price too, once its feed has reported this run (any message:
+        # trades, or the stream's login on a weekend): an ETF started on a weekend or before the open
+        # whose PC then slept over one or more sessions had them carried from the cache's close, not
+        # live but with no gap, so they were never back-filled (TODAY and 1H +3.0% where the truth was
+        # 0, after a sleep from a Monday's pre-market to the Friday). With no feed at all (TLT without
+        # a key) its steps are carried, as above.
+        fed = traded or seen == seen
         # before any live data, a step after an unfilled hole would only carry the CACHE's last close
         # (the app was off, the first download failed): unknown too, not that old price
         h1, h5 = self.holes["g1"], self.holes["g5"]
@@ -273,23 +280,26 @@ class Instrument:
         for k in range(start, k1_now):
             t0 = k * G1_STEP
             open_ = clock.market_open(self.hours, t0 + G1_STEP - 1)
-            if open_ and not traded and h1 is not None and t0 >= h1:
-                self.g1.put(k, NaN, False)
-            elif traded and open_ and not (seen >= t0):
+            if fed and open_ and not (seen >= t0):
                 self.g1.put(k, NaN, False)
                 self._hole("g1", t0)
                 self._gap_open = True
+                continue
+            if self._gap_open and open_:
+                # its feed is back, traded or not yet (a step after the hole stays unknown until then:
+                # below), so the back-fill's back-off is cut short
+                self._gap_open, self.recovered = False, True
+            if open_ and not traded and h1 is not None and t0 >= h1:
+                self.g1.put(k, NaN, False)
             else:
                 self.g1.put(k, p, traded and open_)
-                if self._gap_open and traded and open_:
-                    self._gap_open, self.recovered = False, True
         k5_now = int(now // G5_STEP)
         if k5_now > self._k5:
             for k in range(max(self._k5, k5_now - G5_SIZE), k5_now):
                 t0 = k * G5_STEP
                 open_ = clock.market_open(self.hours, t0 + G5_STEP - 1)
                 stale = open_ and not traded and h5 is not None and t0 >= h5
-                covered = not stale and not (traded and open_ and not (seen >= t0))
+                covered = not stale and not (fed and open_ and not (seen >= t0))
                 if covered:
                     self.g5.put(k, p, traded and open_)
                 else:
@@ -394,8 +404,9 @@ class Instrument:
         # A stretch reaching the download's end runs on to `until` when that is open: both grids then
         # measure the same time (the 1-minute one said unknown at 16 minutes, the 5-minute one saw 15).
         unknown: set[int] = set()
-        if since is not None and not any(k_from <= k < k_until and (not session or clock.market_open(
-                self.hours, (k + 1) * step - 1)) for k in by_k):
+        empty = since is not None and not any(k_from <= k < k_until and (not session or clock.market_open(
+            self.hours, (k + 1) * step - 1)) for k in by_k)
+        if empty:
             limit, start = None, None
             for k in range(k_from, k_until + 1):
                 if k < k_until and g.get(k) != g.get(k) and clock.market_open(self.hours, (k + 1) * step - 1):
@@ -447,7 +458,9 @@ class Instrument:
                     last, blocked = v, False
                     continue
             if last == last and not blocked:
-                g.put(k, last, open_)
+                # (an empty answer's "no trade" over an open market is ours, not the exchange's: not live,
+                # so it never counts as a quiet stretch of the symbol's own)
+                g.put(k, last, open_ and not empty)
                 n += 1
         if k_ext is not None and (k_ext + 1) * step > (self.extra.get("ext_ts") or 0):
             self.extra["ext_price"], self.extra["ext_ts"] = by_k[k_ext], (k_ext + 1) * step
@@ -469,7 +482,15 @@ class Instrument:
             t_u = min(unknown) * step
             self.holes[grid] = t_u if h is None or covered else min(h, t_u)
         elif covered:
-            self.holes[grid] = None          # the exchange's own data now covers the gap
+            # the exchange's own data now covers the gap. A step the roll closed during the download,
+            # after its end, is still empty if the feed missed it or, before the first live price, if
+            # it came after the gap: the next attempt's (cleared with the gap, a minute closed while a
+            # wake's download ran stayed empty for good). Not without a feed (no key: carried as before)
+            nxt = None
+            if self._seen_ts == self._seen_ts and not self.computed and g.last_k is not None:
+                nxt = next((k * step for k in range(k_until, g.last_k + 1)
+                            if g.get(k) != g.get(k) and clock.market_open(self.hours, (k + 1) * step - 1)), None)
+            self.holes[grid] = nxt
         # the price is the newest close known: a downloaded bar newer than it takes over, also after
         # live data (a sleep or an outage over an ETF's close left the pre-outage price all night and
         # weekend: nothing after the close corrects it). Only a bar the grid took (before `until`)
@@ -504,11 +525,16 @@ class Instrument:
 
     def quiet_limit_s(self) -> float:
         """How long its open market can go without a trade before an answer with no bar for it is more
-        likely the venue's gap than no trade: twice the longest run of unchanged closes in the session
-        steps its 5-minute grid holds (35 days), QUIET_MAX_S at least. On IEX, UUP often prints nothing
-        for 50 minutes after the open; SPY's close changes every 5 minutes. A fixed 15 minutes left
-        UUP's quiet opening unknown, fetched it again and gave it up."""
-        g = self.g5
+        likely the venue's gap than no trade: twice the longest run of session steps without one in the
+        35 days its 5-minute grid holds, QUIET_MAX_S at least. A step without a trade: live (a bar's
+        session, or a live feed's), no traded volume (none, or 0) and its close unchanged. An empty
+        answer's own "no trade" fill is not live, so it never counts (each one raised the limit: SPY's
+        went from 15 to 20 and 30 minutes over two); nor does a price that held while it traded (HYG got
+        50 minutes from six equal closes, five of them with volume). On IEX, UUP often prints nothing
+        for 50 minutes after the open; in this PC's cache SPY never went a 5-minute step without a
+        trade, HYG one. A fixed 15 minutes left UUP's quiet opening unknown, fetched it again and gave
+        it up."""
+        g, vol = self.g5, self.v5
         if g.last_k is None:
             return QUIET_MAX_S
         day = g.last_k // (86400 // G5_STEP)
@@ -521,7 +547,8 @@ class Instrument:
             if not g.is_live(k):                   # shut (the close carried) or not traded: a new run
                 run, prev = 0, v
                 continue
-            run = run + 1 if v == prev else 0
+            traded = v != prev or (vol is not None and vol.get(k)[0] > 0)
+            run = 0 if traded else run + 1
             best = max(best, run)
             prev = v
         self._quiet = (day, max(QUIET_MAX_S, 2.0 * best * g.step))

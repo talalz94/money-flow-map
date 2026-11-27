@@ -456,4 +456,5 @@ def test_a_held_console_write_holds_no_lock_of_pythons_stdio():
     finally:
         released.set()
         writer.close()
-    assert b"".join(got) == "history cache saved in 0.4 s\n".encode()
+    import os
+    assert b"".join(got) == ("history cache saved in 0.4 s" + os.linesep).encode()   # (a line's end as the stream's own)

@@ -93,6 +93,7 @@ def test_carried_price_is_not_trading_until_live_data_arrives():
     k = int((t0 + 600) // G5_STEP)
     assert inst.g5.get(k) == 80.5 and not inst.g5.is_live(k)
     assert not inst.g1.is_live(int((t0 + 600) // G1_STEP))
+    assert inst.holes == {"g1": None, "g5": None}                 # no feed at all (no key): no gap either
     assert math.isnan(inst.v5.get(k)[0])                          # volume unknown, not zero (no RVOL 0)
     inst.on_price(81.0, t0 + 1810, t0 + 1810)                     # the first live trade
     inst.roll(t0 + 2101)
@@ -508,3 +509,139 @@ def test_an_empty_1_minute_grid_carries_the_5_minute_close_from_an_open_start_no
     shut = [k for k in range(int(until // G1_STEP) - 1439, int(mon // G1_STEP))
             if not clock.market_open("us_regular", (k + 1) * G1_STEP - 1)]
     assert all(inst.g1.get(k) == 27.0 for k in shut)                # the shut hours: the 5-minute grid's
+
+
+def test_before_its_first_trade_a_session_step_its_feed_did_not_cover_is_a_gap():
+    """Once an ETF's feed has reported (any message: its stream's login counts), a session step the feed
+    did not cover is a gap, before the ETF's first trade of the run too: a sleep or an outage from before
+    it had the sessions carried from the cache's close, never back-filled. A step the feed covered (a
+    quiet market before the first trade) is the close carried, not live, as before."""
+    t0 = ny_ts(2026, 11, 24, 10, 0)
+    for covered in (False, True):
+        inst = Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular", volume=True)
+        inst.seed("g5", [(t0 - 600, 80.0), (t0 - 300, 80.5)], t0)
+        inst.feed_alive(t0 - 60)                                  # the stream logged in, no trade yet
+        inst.roll(t0 + 1)
+        for t in range(int(t0) + 60, int(t0) + 1801, 60):
+            if covered:
+                inst.feed_alive(t)                                # its messages (other ETFs' trades)
+            inst.roll(t + 1)
+        k = int((t0 + 600) // G5_STEP)
+        if covered:
+            assert inst.g5.get(k) == 80.5 and not inst.g5.is_live(k) and inst.holes == {"g1": None, "g5": None}
+        else:
+            assert inst.g5.get(k) != inst.g5.get(k) and not inst.g5.is_live(k)
+            assert inst.holes == {"g1": t0, "g5": t0}
+
+
+def _sessions(inst, quiet, volume_in_quiet, until):
+    """35 days of 5-minute steps to `until`: each session's close changes every step except a quiet stretch
+    of `quiet` steps from 11:00 (its close held), with traded volume there if `volume_in_quiet`; shut
+    hours carry the session's close."""
+    prev, n = 50.0, 0
+    for j in range(int(until // G5_STEP) - 35 * 288, int(until // G5_STEP)):
+        t = j * G5_STEP
+        live = clock.market_open("us_regular", t + G5_STEP - 1)
+        n = (0 if not clock.market_open("us_regular", t - 1) else n + 1) if live else n
+        held = live and 18 <= n < 18 + quiet                      # 11:00 is the 19th step of a session
+        if live and not held:
+            prev = 50.0 + 0.01 * (j % 11) + (0.005 if 50.0 + 0.01 * (j % 11) == prev else 0.0)
+        inst.g5.put(j, prev, live)
+        if live and inst.v5 is not None:
+            inst.v5.put(j, 2e5 if (not held or volume_in_quiet) else 0.0, NaN)
+
+
+def test_the_quiet_limit_counts_steps_without_a_trade_not_equal_closes_nor_its_own_fills():
+    """The quiet limit is twice the longest stretch of session steps without a trade: no traded volume and
+    the close unchanged. Equal closes with volume are a price that held while it traded (HYG got 50
+    minutes from six equal closes, five of them with volume); and an empty answer's own "no
+    trade" fill is not live, so it does not count (on this PC's cache SPY's limit went from 15 to 20
+    and 30 minutes over a 14- and a 19-minute empty answer, each filled with its last price)."""
+    until = ny_ts(2026, 11, 25, 9, 0)
+    hyg = Instrument("x:HYG", "x", "HYG", "us_regular", volume=True)
+    _sessions(hyg, 6, True, until)
+    assert hyg.quiet_limit_s() == 900.0                           # held, but traded: 15 minutes
+    uup = Instrument("x:UUP", "x", "UUP", "us_regular", volume=True)
+    _sessions(uup, 6, False, until)
+    assert uup.quiet_limit_s() == 2 * 6 * 300                     # 30 minutes without a trade: 60
+    spy = Instrument("x:SPY", "x", "SPY", "us_regular", volume=True)
+    _sessions(spy, 0, False, until)
+    assert spy.quiet_limit_s() == 900.0
+    opened = ny_ts(2026, 11, 25, 9, 30)
+    for k in range(int(until // G5_STEP), int(opened // G5_STEP)):
+        spy.g5.put(k, spy.g5.get(k - 1), False)                   # (the pre-market, carried)
+    start = opened + 14 * 60
+    spy.seed("g5", [], start, since=opened - 600)                 # a 14-minute empty answer: no trade...
+    session = range(int(opened // G5_STEP), int(start // G5_STEP))
+    assert all(spy.g5.get(k) == spy.g5.get(k) and not spy.g5.is_live(k) for k in session)   # ...ours, not live
+    spy._quiet = (None, 900.0)                                    # (worked out again, as the next day)
+    assert spy.quiet_limit_s() == 900.0                           # still 15 minutes
+
+
+def test_a_gap_before_the_first_trade_counts_as_recovered_once_the_feed_is_back():
+    """A gap opened before the ETF's first trade of the run: once its feed covers a session step again
+    (the stream is back, no trade yet), the back-fill's back-off is cut short, as after any outage."""
+    inst = Instrument("alpaca:UUP", "alpaca", "UUP", "us_regular")
+    t0 = ny_ts(2026, 11, 24, 10, 0)
+    inst.seed("g5", [(t0 - 600, 27.0), (t0 - 300, 27.1)], t0)
+    inst.feed_alive(t0 - 60)
+    inst.roll(t0 + 1)
+    inst.roll(t0 + 1201)                                          # 20 minutes the feed did not cover
+    assert inst.holes["g1"] == t0 and not inst.recovered
+    for t in range(int(t0) + 1260, int(t0) + 1500, 60):
+        inst.feed_alive(t)                                        # the stream is back: other ETFs' messages
+        inst.roll(t + 1)
+    assert inst.recovered and not inst.live_seen
+
+
+def test_a_step_closed_while_the_back_fill_downloaded_is_the_next_attempts_gap():
+    """Before its first live price, a step after an unfilled gap is empty (it would carry the price from
+    before the gap). One the roll closed while the back-fill's download ran, after the download's end,
+    stayed empty for good once the answer cleared the gap (a thin pair in the lifecycle harness, after a
+    wake): it is the next attempt's gap now, and that attempt fills it."""
+    inst = Instrument("binance_spot:XUSDT", "binance_spot", "XUSDT", "24/7")
+    t0 = 1795521600.0                                             # a 5-minute boundary
+    inst.seed("g1", [(t0 - 600 + 60 * j, 10.0) for j in range(10)], t0)
+    inst.seed("g5", [(t0 - 600, 10.0), (t0 - 300, 10.0)], t0)
+    inst.feed_alive(t0 - 1)
+    inst.roll(t0 + 1)
+    inst.roll(t0 + 601)                                           # asleep for 10 minutes
+    assert inst.holes["g1"] == t0
+    asked = t0 + 650                                              # awake: the back-fill asks at 10:50
+    inst.feed_alive(asked)
+    inst.roll(asked)
+    inst.feed_alive(t0 + 660)                                     # its download still running at 11:00
+    inst.roll(t0 + 661)
+    k = int((t0 + 600) // 60)
+    assert inst.g1.get(k) != inst.g1.get(k)                       # after the gap: empty
+    bars = [(t0 - 600 + 60 * j, 10.0 + 0.01 * j) for j in range(21)]   # (the bar at 10:00 still open)
+    inst.seed("g1", [b for b in bars if b[0] < asked], asked)
+    assert inst.holes["g1"] == t0 + 600 and not inst.live_seen    # the 10:00 minute: next attempt's
+    inst.seed("g1", bars, t0 + 670)                               # the next attempt
+    assert inst.holes["g1"] is None and inst.g1.get(k) == 10.2
+    keyless = Instrument("alpaca:TLT", "alpaca", "TLT", "us_regular")   # no feed (no key): carried, no gap
+    t1 = ny_ts(2026, 11, 24, 11, 0)
+    keyless.holes["g1"] = t1
+    keyless.g1.put(int((t1 + 600) // 60), NaN, False)
+    keyless.seed("g1", [(t1 - 600 + 60 * j, 88.0) for j in range(20)], t1 + 650)
+    assert keyless.holes["g1"] is None
+
+
+def test_a_gap_up_to_the_close_is_not_recovered_by_the_shut_hours_after_it():
+    """Shut steps are not checked against the feed (a quiet stream is normal then), so they say nothing
+    about it: a gap up to the close stays open over the night, and only a session step the feed covers
+    again counts as the feed being back (a shut step would cut the back-fill's back-off short with the
+    network still down)."""
+    inst = Instrument("alpaca:UUP", "alpaca", "UUP", "us_regular")
+    t0 = ny_ts(2026, 11, 24, 15, 40)
+    inst.seed("g5", [(t0 - 600, 27.0), (t0 - 300, 27.1)], t0)
+    inst.feed_alive(t0 - 60)
+    inst.roll(t0 + 1)
+    inst.roll(t0 + 1801)                                          # the feed lost from 15:40 to past the close
+    assert inst.holes["g1"] == t0 and not inst.recovered
+    opened = ny_ts(2026, 11, 25, 9, 30)
+    inst.roll(opened - 59)                                        # the night
+    assert not inst.recovered
+    inst.feed_alive(opened + 5)
+    inst.roll(opened + 61)
+    assert inst.recovered

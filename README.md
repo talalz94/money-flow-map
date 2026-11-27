@@ -396,7 +396,11 @@ changes from the perpetuals can differ from the ETF's own by about 0.1% around t
 Latency is **receive time − the exchange's own timestamp**, measured on this PC (home connection,
 Pakistan) with the clock corrected by NTP. Measured on 24 Nov 2026; marketing claims were not used.
 > The PC clock ran **0.95-0.99 s fast**. Uncorrected, every source would look about 1 s slower.
-> The service measures this offset itself (SNTP) and corrects all ages.
+> The service measures this offset itself (SNTP) and corrects all ages. It asks four servers and
+> uses a reply only from a synchronised server answering its own request, with a correction under a
+> day; of the replies that agree (within 0.5 s of their median), the shortest round trip wins. A
+> server's "kiss-of-death" (zero timestamps, when many copies start at once) once set the clock 127
+> years back; a failed or doubtful sync now leaves the offset in use.
 
 | Source (what is used) | Median | p90 | Rate | Notes |
 |---|---|---|---|---|
@@ -730,10 +734,18 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     down is **empty**: no price, not live. It is never the last price carried forward as if it
     traded, which made σ too low and the history differ from the exchange (the 25 Nov night).
     Computed series (the dollar, bonds, the stablecoin share) are live only where their inputs are.
+  - That holds before an ETF's first trade of the run too, once its feed has reported (any message:
+    the stream's login counts). Started on a weekend or before the open, with the PC then asleep (or
+    the network down) over one or more sessions, an ETF had those sessions carried from the cache's
+    close: not live, but with no gap, so they were never back-filled; 1H read the night's move as
+    the hour's, and after days away TODAY the whole move since the cache. An ETF with no feed at
+    all (no Alpaca key: its history comes from Yahoo) has its sessions carried from its last close,
+    as before.
   - A **back-fill** downloads the empty steps. After a failure (DNS down after waking, no network)
     it retries after 30 s, doubling to 15 min, and 10 s after a feed delivers again (time for the
-    feeds to settle; also when that happens during a download, and on the first live price after a
-    start whose download failed). It stops only when nothing is
+    feeds to settle; also when that happens during a download, on the first live price after a
+    start whose download failed, and before an ETF's first trade when its stream reports in a
+    session again). It stops only when nothing is
     missing, when the gap is older than the history, or when the exchange has no data there either
     (a gap that appeared during a download was not asked for, so it is the next attempt's). It runs
     in the background: it never holds up the auto-stop, and it stops with the app. Its state is
@@ -770,10 +782,14 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     first bar means no trade: the last close is carried there, and no gap is left. The same holds
     for an answer with no bar at all for an ETF (a weekend, a holiday, a start before its first
     print) over shut hours, and over open ones up to the ETF's own limit: twice the longest stretch
-    of unchanged 5-minute closes in its last 35 days of sessions, 15 minutes at least. UUP often
-    prints nothing on IEX for 50 minutes after the open, so its limit is long; SPY's close changes
-    every 5 minutes, so an answer without SPY over a 30-minute outage (the review's case) is taken for
-    the venue's gap: those minutes stay unknown and are fetched again (then given up as "no exchange
+    of 5-minute session steps without a trade (no traded volume, the close unchanged) in its last 35
+    days, 15 minutes at least. A price that held while it traded is not such a stretch (six equal
+    closes gave HYG 50 minutes, though it traded in five of them), nor is the app's own "no trade"
+    fill of an empty answer, which is not live (counted, each one raised the limit: SPY's from 15 to
+    20 and 30 minutes over two). On this PC's cache: SPY, QQQ, IWM, GLD, TLT, HYG 15 minutes; SLV
+    20; VIXY 30; IEF 40; USO 50; UUP 210 (it often prints nothing on IEX for 50 minutes after the
+    open). So an answer without SPY over a 30-minute outage (the review's case) is taken for the
+    venue's gap: those minutes stay unknown and are fetched again (then given up as "no exchange
     data"), not filled with the last price as if nothing had traded. A thin ETF's first trade after
     9:30 left a gap (fetched again, then given up), also with the start before that trade; a cache
     saved on a Saturday left the weekend empty until Monday's first bar, and with no bar at all
@@ -785,7 +801,9 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     kept the pre-sleep price, and TODAY read the move to the close slept over all session.
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
-    range is downloaded again once.
+    range is downloaded again once. So is an ETF's cache of format 4 or older: it can hold sessions
+    slept over before the ETF's first trade of a run, carried from the close before (not live, no
+    gap, never fetched).
   - A picked stock whose history failed to download, and a kick a connector got while busy, are
     not left to their back-off either: a recovered feed retries the stock at once, and the kick
     ends the connector's next wait.
@@ -1453,7 +1471,7 @@ it says so), on the code before this round (60e7442) and now:
 - **The quiet limit on this PC's cache** (twice the longest stretch of unchanged 5-minute closes in
   35 days of sessions): SPY, QQQ, IWM 15 minutes; GLD, TLT 20; SLV 30; HYG, IEF, USO 50; VIXY 60;
   UUP 260. An empty answer over a longer open stretch is the venue's gap; over a shorter one, no
-  trade.
+  trade. (The fourteenth round measures steps without a trade instead.)
 - **Not changed:** an ETF whose history shows a new close every 5 minutes and that then prints
   nothing for 20 minutes after the open still gets a hole, one more download and "no exchange
   data" (the review's thin_0950 case, whose thin ETFs traded every minute before: the same on
@@ -1467,6 +1485,53 @@ it says so), on the code before this round (60e7442) and now:
   1-minute grid's carry from the 5-minute grid) got through at first: the shut-hours sync came
   before that carry was taken, which also let an empty grid carry an older close over a download's
   first open minutes. The sync now comes after it, with a test.
+
+**Fourteenth round (27 Nov 2026): a sleep or an outage from before an ETF's first print, the quiet
+limit, and the clock.** Checked on engine tests, the review's reproductions (offline: the real engine,
+only the network stubbed), its lifecycle harness, the quiet-limit cases on a copy of this PC's cache and
+a faked NTP exchange, on the code before this round (ea4dbdb) and now:
+
+| | Before | Now |
+|---|---|---|
+| **Started on a Saturday, asleep from noon to Monday 10:00** (SPY 600 on Friday, 606 from Monday's open) | Monday's 9:30-10:00 carried at 600, not live, with no gap, never back-filled: 1H +1.0% at 10:30 (true 0) | a gap from 9:30, back-filled: 1H 0.0% |
+| **Started on a Monday before the open, asleep to the Friday after Thanksgiving** (606, 612, 618 on the three sessions slept over) | the three sessions carried at 600: TODAY and 1H +3.0% at 10:30 (true 0) | back-filled: 0.0% |
+| **Started before the open, the network down 9:20-9:50** | 1H +1.0% at 10:30 (true 0) | 0.0% |
+| **The review's seven cases** (a Thanksgiving start asleep over Friday's session, woken on Monday at 10:00 or on Saturday at noon; a Sunday start asleep over Monday's session; asleep, or the network down, from before the open to 11:00; two controls) | 33 wrong reads: TODAY +1.0% all Monday after Thanksgiving and after a restart that evening (true 0); a week on, 1W +1.0% for SPY, +0.6% for HYG and -0.4% for IEF (true 0: the risk meter's credit input); woken on the Saturday, 1W -0.03% (true +0.97%) | none: every session slept over back-filled, also after a restart |
+| **Such a sleep with the back-fill failing, then a restart** | the carried steps saved as data: no gap at the next start | saved empty: the next start downloads them |
+| **The quiet limit on this PC's cache** (an answer with no bar for an ETF is no trade over an open stretch up to it) | equal closes counted, also those that traded: HYG 50 minutes, VIXY 60, UUP 260; and the app's own "no trade" fills, flagged live: SPY's limit 15, then 20 and 30 minutes after a 14- and a 19-minute empty answer | steps without a trade only: HYG 15, VIXY 30, UUP 210; the fills not live: SPY's stays 15, and its 19-minute empty answer stays unknown and is fetched again |
+| **A 30-minute outage from 10:00 with no bar for the ETF in the answer** (25 Nov, each ETF's own history) | HYG, IEF, USO, VIXY, UUP: the 30 minutes filled with the last price, flagged live | HYG, VIXY: unknown, fetched again; IEF, USO, UUP (limits 40, 50, 210 minutes): filled, not live |
+| **One NTP server (pool.ntp.org) answering with zero timestamps** (a kiss-of-death), at the shortest round trip | taken: the clock 127 years back, every tick failing (OSError 22) until the next sync | ignored ("kiss-of-death 'RATE'" in the log); the others agree: offset +202 ms |
+
+- **The rules:** once an ETF's feed has reported in a run (any message: the stream's login counts),
+  a session step the feed did not cover is a gap, before the ETF's first trade too, and when the
+  stream reports in a session again the back-fill's back-off is cut short; with no feed at all (no
+  Alpaca key) its steps are carried as before. A step the roll closed during a back-fill's download,
+  after the download's end, that is still empty is the next attempt's gap (it was cleared with the
+  gap before it: in the lifecycle harness, a minute closed while a wake's download ran, before a
+  thin pair's first trade). An ETF's cache of format 4 or older is downloaded again once (format 5).
+  The quiet limit is twice the longest stretch of 5-minute session steps without a trade (no traded
+  volume, the close unchanged), 15 minutes at least. An NTP reply is used only from a synchronised
+  server (stratum 1-15, no alarm), in server mode, answering this request, with its timestamps set,
+  a round trip of 0-5 s and a correction under a day; of the replies within half a second of their
+  median, the shortest round trip wins; a sync with no usable reply, or replies that disagree,
+  leaves the offset in use.
+- **Lifecycles** (the review's harness, with a wake whose first tick rolls the time asleep before
+  the stream reports again, as the engine does): 150 short lifecycles: 124 the same as before, 26
+  better, none worse; 120 long sleeps: 50 the same, 70 better, none worse; 200 mixed (24/7 and ETF):
+  185 the same, 15 better, none worse. TODAY or 1H read wrong at the harness's checkpoints in 12 of
+  60 long-sleep runs (14 before; the largest error 0.10 points, 30.01 before; one run reads unknown
+  after an empty back-fill answer over a long open stretch, as intended) and in 17 of 120 (18
+  before). Of the 12 runs flagged in the thirteenth round, the worst read is 0.36 points off (30.01
+  before); two read unknown twice, after an empty back-fill answer. Not changed: four long-sleep
+  runs read 3-14 points off the same way before and now (ETFs that had traded before the sleep:
+  another case).
+- **Tests: 264 pass.** The new ones cover each item above.
+- **Mutation check: 167 of 168 changes are caught:** the thirteenth round's (rewritten where this
+  round changed the code) and this round's. The one left is the twelfth round's equivalent one (the
+  carry of Yahoo's 5-minute bars, done by the first roll's carry as well). Two got through at first:
+  a gap's recovery on a shut step (a test now covers it), and an older one, an empty night filled on
+  loading for older formats only: its test loaded formats 3 and 4, the current one until this round,
+  and loads the current one too now.
 
 ---
 

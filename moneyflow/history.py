@@ -19,7 +19,10 @@ from .series import Instrument, NaN
 # 4: ... and none of them is empty: a download with no bar for an ETF (a weekend, a holiday, before its
 # first print) carried nothing, so older caches can hold an empty night or weekend: filled on loading
 # (any version: a start-up download that failed until after the first roll left them empty too).
-VERSION = 4
+# 5: ... and an ETF's sessions that a sleep or an outage from before its first trade of a run passed over
+# are a gap, not its last close carried (not live, no gap, never fetched): an ETF's cache of format 4 or
+# older can hold such sessions, so its whole range is downloaded again once.
+VERSION = 5
 
 
 def _file(dirpath: Path, inst: Instrument) -> Path:
@@ -138,7 +141,7 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
     except (OSError, ValueError):
         return None
     version = d.get("v")
-    if version not in (1, 2, 3, VERSION) or d.get("key") != inst.key:
+    if version not in (1, 2, 3, 4, VERSION) or d.get("key") != inst.key:
         return None
     for name in ("g1", "g5"):
         part = d.get(name)
@@ -176,7 +179,7 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
         if k is not None:
             inst.price = g.get(k)
             inst.ts = (k + 1) * g.step
-    mark_holes(inst, untrusted=version == 1, now=now)
+    mark_holes(inst, untrusted=version == 1 or (inst.hours == "us_regular" and version < 5), now=now)
     return inst.g5.last_k
 
 
@@ -214,7 +217,7 @@ def mark_holes(inst: Instrument, untrusted: bool = False, now: float | None = No
     """Register what a loaded cache lacks, so the history download fills it: steps of an open market
     with no value (a past sleep or outage), the time from the cache's last value to now (the app was
     off: should the first download fail, a retry must still fetch it, not just the minutes since the
-    start), and, from a version-1 cache, its whole range."""
+    start), and, from a version-1 cache (an ETF's: format 4 or older), its whole range."""
     for name in ("g1", "g5"):
         g = getattr(inst, name)
         if g.last_k is None:

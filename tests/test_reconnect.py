@@ -690,7 +690,7 @@ def test_an_old_cache_with_a_flat_live_night_is_downloaded_again(cfg, keys, monk
     b2 = eng.instruments["binance_spot:BTCUSDT"]
     assert all(b2.g5.get(k) == truth((k + 1) * G5_STEP) for k in flat)                # the real prices now
     assert b2.holes == {"g1": None, "g5": None}
-    assert json.loads(f.read_text())["v"] == history.VERSION == 4
+    assert json.loads(f.read_text())["v"] == history.VERSION == 5
     # a version-2 cache with empty steps (a past outage): marked, and filled at the next start
     k_hole = k_now - 100
     b2.g5.put(k_hole, float("nan"), False)
@@ -1458,17 +1458,18 @@ def test_an_etf_cache_from_before_version_3_is_rewritten_to_its_session_closes(v
     k_pre = int(ny_ts(2026, 11, 20, 8, 0) // G1_STEP)           # before the 1-minute grid's first session step
     assert inst.g1.get(k_pre) != inst.g1.get(k_pre)
     assert inst.price == 690.68 and inst.ts == close
-    if version == 2:
-        assert inst.holes == {"g1": None, "g5": None}          # rewritten, not downloaded again
+    for name, g in (("g1", inst.g1), ("g5", inst.g5)):         # and downloaded again (format 4 or older)
+        first = next(k for k in range(g.first_k(), g.last_k + 1) if g.get(k) == g.get(k))
+        assert inst.holes[name] == first * g.step
 
 
-@pytest.mark.parametrize("version", [3, 4])
+@pytest.mark.parametrize("version", [3, 4, "current"])
 def test_an_etf_cache_with_an_empty_night_has_it_filled_on_loading(version, cfg, keys, tmp_path):
     """A download with no bar for an ETF (a weekend, a holiday, before its first print) carried nothing
     before version 4, so a cache can hold an empty night or weekend: TODAY's start (17:00) and 1W read
-    nothing there. Loaded, those steps take the session's close. A version-4 cache too: a start-up
-    download that failed until after the first roll left them empty (only the minutes after the start
-    were downloaded again), and later starts download only from the newest value."""
+    nothing there. Loaded, those steps take the session's close. A cache of version 4 or later too: a
+    start-up download that failed until after the first roll left them empty (only the minutes after
+    the start were downloaded again), and later starts download only from the newest value."""
     import json
     from conftest import ny_ts
     from moneyflow import history, stats
@@ -1483,7 +1484,7 @@ def test_an_etf_cache_with_an_empty_night_has_it_filled_on_loading(version, cfg,
     history.save(tmp_path, spy)
     f = tmp_path / "alpaca_SPY.json"
     d = json.loads(f.read_text())
-    d["v"] = version
+    d["v"] = history.VERSION if version == "current" else version
     f.write_text(json.dumps(d))
     eng, _ = _gap_engine(cfg, keys, now, tmp_path)
     inst = eng.instruments["alpaca:SPY"]
@@ -2088,3 +2089,181 @@ def test_a_wake_in_a_session_days_after_an_etfs_close_leaves_no_old_price_in_the
     history.load(tmp_path, inst, ny_ts(*later) + 60)
     t = ny_ts(*later) + 60
     assert stats.price_at(inst, stats.window_for("today", t).start, t) == 606.0
+
+
+# ── fourteenth round: a sleep or an outage from before an ETF's first print of the run ─────────────
+def _session_levels():
+    """The price as of t: each session at its own level from its open, its close carried till the next."""
+    from conftest import ny_ts
+    opens = [(ny_ts(2026, 11, 23, 9, 30), 606.0), (ny_ts(2026, 11, 24, 9, 30), 612.0),
+             (ny_ts(2026, 11, 25, 9, 30), 618.0), (ny_ts(2026, 11, 27, 9, 30), 618.0)]
+
+    def truth(t):
+        p = 600.0                                                             # up to Friday 20 Nov's close
+        for o, v in opens:
+            if t >= o:
+                p = v
+        return p
+    return truth
+
+
+def _fed_engine(cfg, keys, monkeypatch, tmp_path, saved, start, truth, fail=None, write_cache=True):
+    """An engine started at `start` from a cache saved at `saved` (each ETF's closes as the live series
+    writes them), with an Alpaca stream whose messages are its feed's coverage, and IEX bars of `truth`
+    (a bar for each session step). `fail()`: downloads fail then. Returns (engine, clock)."""
+    from moneyflow import history
+    from moneyflow.connectors import alpaca as alp
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G1_STEP, G5_STEP
+    if write_cache:
+        old, _ = _gap_engine(cfg, keys, saved, tmp_path)
+        for etf in [i for i in old.instruments.values() if i.source == "alpaca"]:
+            for g, step in ((etf.g5, G5_STEP), (etf.g1, G1_STEP)):
+                for k in range(int(saved // step) - g.size + 1, int(saved // step)):
+                    g.put(k, truth((k + 1) * step - 1), clock.market_open("us_regular", (k + 1) * step - 1))
+            history.save(tmp_path, etf)
+    eng, clk = _gap_engine(cfg, keys, start, tmp_path)
+    eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={},
+                                                     health=types.SimpleNamespace(last_msg=None, last_ok=None))
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        if fail is not None and fail():
+            raise OSError(11001, "getaddrinfo failed")
+        step = 300 if tf == "5Min" else 60
+        t, rows = -(-int(since) // step) * step, []
+        while t + step <= clk.now():
+            if clock.market_open("us_regular", t + step - 1):
+                rows.append((t, truth(t + step - 1), 1e6))
+            t += step
+        return {sym: list(rows) for sym in symbols}
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    return eng, clk
+
+
+def _stream_up(eng, clk, t0, t1, truth, step=30.0):
+    """The stream up from t0 to t1: its messages (the feed's coverage), and SPY's prints in the session."""
+    spy = eng.instruments["alpaca:SPY"]
+
+    def feed(t):
+        eng.connectors["alpaca"].health.last_msg = t
+        if clock.market_open("us_regular", t):
+            spy.on_price(truth(t), t, t)
+    _tick(eng, clk, t0, t1, step=step, feed=feed)
+
+
+@pytest.mark.parametrize("case", ["saturday_start_asleep_to_monday_10", "monday_premarket_start_asleep_to_friday",
+                                  "premarket_start_network_down_over_the_open"])
+def test_a_sleep_or_outage_from_before_an_etfs_first_print_is_back_filled_not_carried(
+        case, cfg, keys, monkeypatch, tmp_path):
+    """An ETF's steps count as trading only after its first live price of the run, so a sleep or a
+    network outage that began before it (a start on a weekend or before the open) and went on over one
+    or more sessions had them carried from the cache's close: not live, but with no gap, so they were
+    never back-filled. 1H read the night's move as the last hour's (+1.0%, true 0), and after days away
+    TODAY the whole move since the cache (+3.0%, true 0). Once its feed has reported (a login, any
+    message), a session step it did not cover is a gap, back-filled from the exchange."""
+    from conftest import ny_ts
+    from moneyflow import stats
+    truth = _session_levels()
+    saved = ny_ts(2026, 11, 20, 18, 0)                                       # Friday's close, 600
+    start, asleep, wake, read = {
+        "saturday_start_asleep_to_monday_10": ((2026, 11, 21, 10), (2026, 11, 21, 12), (2026, 11, 23, 10), (2026, 11, 23, 10, 30)),
+        # Monday's pre-market to Friday after Thanksgiving: three sessions slept over
+        "monday_premarket_start_asleep_to_friday": ((2026, 11, 23, 4), (2026, 11, 23, 5, 16), (2026, 11, 27, 9, 40), (2026, 11, 27, 10, 30)),
+        "premarket_start_network_down_over_the_open": ((2026, 11, 23, 8), (2026, 11, 23, 9, 20), (2026, 11, 23, 9, 50), (2026, 11, 23, 10, 30)),
+    }[case]
+    start, asleep, wake, read = ny_ts(*start), ny_ts(*asleep), ny_ts(*wake), ny_ts(*read) + 20
+    eng, clk = _fed_engine(cfg, keys, monkeypatch, tmp_path, saved, start, truth)
+    asyncio.run(eng.seed_history())
+    _stream_up(eng, clk, start, asleep, truth)                                # up, no session print yet
+    clk.set_fixed(wake)                                                       # asleep (or the network down) since
+    eng.tick()
+    spy = eng.instruments["alpaca:SPY"]
+    assert spy.holes["g5"] is not None and spy.holes["g1"] is not None
+    _stream_up(eng, clk, wake, wake + 10, truth, step=5.0)
+    asyncio.run(eng._backfill("wake"))
+    assert eng.backfill_state["state"] == "done" and spy.holes == {"g1": None, "g5": None}
+    _stream_up(eng, clk, wake + 15, read, truth)
+    for tf in ("1h", "today", "1w"):
+        w = stats.window_for(tf, read)
+        want = (truth(read) / truth(w.start) - 1.0) * 100.0
+        assert stats.window_return(spy, w, read)[1] == pytest.approx(want, abs=1e-9), (tf, case)
+
+
+def test_a_failed_back_fill_after_such_a_sleep_leaves_gaps_the_next_start_fetches(cfg, keys, monkeypatch, tmp_path):
+    """The same sleep with the network still down after the wake: the session slept over stays unknown
+    and is saved so, and the next start downloads it. Carried, it was saved as if it were real data and
+    never fetched again."""
+    from conftest import ny_ts
+    from moneyflow import history
+    from moneyflow.series import G5_STEP
+    truth = _session_levels()
+    saved, start, asleep, wake = ny_ts(2026, 11, 20, 18), ny_ts(2026, 11, 21, 10), ny_ts(2026, 11, 21, 12), ny_ts(2026, 11, 23, 11)
+    down = {"on": False}
+    eng, clk = _fed_engine(cfg, keys, monkeypatch, tmp_path, saved, start, truth, fail=lambda: down["on"])
+    asyncio.run(eng.seed_history())
+    _stream_up(eng, clk, start, asleep, truth)
+    clk.set_fixed(wake)
+    eng.tick()
+    down["on"] = True
+    asyncio.run(eng.seed_history(incremental=True, only={"alpaca:SPY"}))     # the back-fill's download fails
+    spy = eng.instruments["alpaca:SPY"]
+    session = range(int(ny_ts(2026, 11, 23, 9, 30) // G5_STEP), int(wake // G5_STEP))
+    assert all(spy.g5.get(k) != spy.g5.get(k) and not spy.g5.is_live(k) for k in session)
+    eng.save_cache()
+    again, _ = _fed_engine(cfg, keys, monkeypatch, tmp_path, saved, wake + 600, truth, write_cache=False)
+    history.load(tmp_path, again.instruments["alpaca:SPY"], wake + 600)
+    assert again.instruments["alpaca:SPY"].holes["g5"] == ny_ts(2026, 11, 23, 9, 30)
+
+
+def test_a_holiday_start_asleep_over_the_next_session_is_back_filled(cfg, keys, monkeypatch, tmp_path):
+    """Opened on Thanksgiving (no ETF trades that day), asleep from 22:00 through Friday's short session
+    (SPY +1.0%), woken on Monday at 10:00: the wake's back-fill skipped every ETF (none had a gap), and
+    TODAY read +1.0% all Monday (true 0), HYG and IEF pushing the risk meter's credit input. Now Friday's
+    session is a gap, back-filled."""
+    from conftest import ny_ts
+    from moneyflow import stats
+
+    def truth(t):
+        return 606.0 if t >= ny_ts(2026, 11, 27, 9, 30) else 600.0
+    saved, start = ny_ts(2026, 11, 25, 18, 0), ny_ts(2026, 11, 26, 10, 0)
+    asleep, wake, read = ny_ts(2026, 11, 26, 22, 0), ny_ts(2026, 11, 30, 10, 0), ny_ts(2026, 11, 30, 10, 30) + 20
+    eng, clk = _fed_engine(cfg, keys, monkeypatch, tmp_path, saved, start, truth)
+    asyncio.run(eng.seed_history())
+    _stream_up(eng, clk, start, asleep, truth, step=300.0)
+    clk.set_fixed(wake)
+    eng.tick()
+    spy = eng.instruments["alpaca:SPY"]
+    assert spy.holes["g5"] == ny_ts(2026, 11, 27, 9, 30)
+    _stream_up(eng, clk, wake, wake + 10, truth, step=5.0)
+    asyncio.run(eng._backfill("wake"))
+    _stream_up(eng, clk, wake + 15, read, truth)
+    w = stats.window_for("today", read)
+    assert stats.window_return(spy, w, read)[1] == 0.0 and stats.price_at(spy, w.start, read) == 606.0
+
+
+def test_an_etf_cache_from_before_format_5_is_downloaded_again_once(cfg, keys, tmp_path):
+    """A cache written before this can hold sessions a sleep from before the ETF's first trade passed
+    over, carried from its last close (not live, no gap): an ETF's cache of format 4 or older is
+    downloaded again from its first step, once (other instruments' are not)."""
+    import json
+    from conftest import ny_ts
+    from moneyflow import history
+    from moneyflow.series import G5_STEP, Instrument
+    saved, now = ny_ts(2026, 11, 27, 18, 0), ny_ts(2026, 11, 28, 12, 0)
+    for key, hours in (("alpaca:SPY", "us_regular"), ("binance_spot:BTCUSDT", "24/7")):
+        a = Instrument(key, key.split(":")[0], key.split(":")[1], hours)
+        k = int(saved // G5_STEP)
+        for j in range(k - 2000, k):
+            a.g5.put(j, 600.0, clock.market_open(hours, (j + 1) * G5_STEP - 1))
+        history.save(tmp_path, a)
+        f = tmp_path / f"{key.replace(':', '_')}.json"
+        for version, whole in ((4, hours == "us_regular"), (5, False)):
+            d = json.loads(f.read_text())
+            d["v"] = version
+            f.write_text(json.dumps(d))
+            b = Instrument(key, key.split(":")[0], key.split(":")[1], hours)
+            history.load(tmp_path, b, now)
+            first = (k - 2000) * G5_STEP
+            assert (b.holes["g5"] == first) is whole, (key, version)

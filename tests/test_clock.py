@@ -57,3 +57,100 @@ def test_fixed_clock_for_replay():
     assert c.now() == 1000.0
     c.advance(5)
     assert c.now() == 1005.0
+
+
+def _reply(sent, t0, offset=0.25, rtt=0.03, li=0, version=4, mode=4, stratum=2, ref=b"GPS\0", zero=False, hold=0.0):
+    """A server's reply to a request sent at t0 (its transmit stamp `sent`), `rtt` round trip; `hold`:
+    how long the server says it held the request."""
+    import struct
+    t1 = clock._ntp_stamp(t0 + rtt / 2 + offset)               # received...
+    t2 = clock._ntp_stamp(t0 + rtt / 2 + offset + hold)        # ...and answered
+    if zero:
+        t1 = t2 = (0, 0)
+    return (bytes([li << 6 | version << 3 | mode, stratum, 6, 0xEC]) + bytes(8) + ref + bytes(8)
+            + struct.pack("!II", *sent) + struct.pack("!II", *t1) + struct.pack("!II", *t2))
+
+
+def test_an_ntp_reply_is_checked_before_its_offset_is_used():
+    """A reply from pool.ntp.org with zero timestamps (a kiss-of-death when many copies start within
+    minutes) set the clock 127 years back: every tick failed until the next sync. A reply is used only
+    from a synchronised server (stratum 1-15, no alarm), in server mode, answering this request, with
+    its timestamps set, a round trip of 0-5 s and a correction under a day."""
+    import pytest
+    t0 = 1795528800.0
+    sent = clock._ntp_stamp(t0)
+    t3 = t0 + 0.03
+    off, rtt = clock.parse_sntp_reply(_reply(sent, t0), sent, t0, t3)
+    assert abs(off - 0.25) < 1e-6 and abs(rtt - 0.03) < 1e-6
+    bad = {"kiss-of-death 'RATE'": _reply(sent, t0, stratum=0, ref=b"RATE", zero=True),
+           "zero timestamps": _reply(sent, t0, zero=True),
+           "not synchronised": _reply(sent, t0, li=3),               # the alarm
+           "not synchronised ": _reply(sent, t0, stratum=16),
+           "not a server reply": _reply(sent, t0, mode=3),
+           "another request": _reply(clock._ntp_stamp(t0 - 9), t0),
+           "offset -90000 s": _reply(sent, t0, offset=-90000.0),
+           "short reply": _reply(sent, t0)[:40]}
+    for why, data in bad.items():                              # each for its own reason
+        with pytest.raises(clock.NTPError, match=why.strip()):
+            clock.parse_sntp_reply(data, sent, t0, t3)
+    with pytest.raises(clock.NTPError, match="round trip"):   # a negative one (held 1 s of 0.1)
+        clock.parse_sntp_reply(_reply(sent, t0, hold=1.0), sent, t0, t0 + 0.1)
+
+
+def test_the_request_carries_its_send_time_and_the_reply_must_echo_it(monkeypatch):
+    """The request's transmit stamp comes back as the reply's originate stamp: a stray or stale datagram
+    is not taken for the answer."""
+    import socket
+    import struct
+    import pytest
+    got = {}
+
+    class FakeSocket:
+        def __init__(self, *a):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def sendto(self, pkt, addr):
+            got["pkt"], got["addr"] = pkt, addr
+
+        def recvfrom(self, n):
+            sent = struct.unpack("!II", got["pkt"][40:48]) if got.get("echo", True) else (1, 2)
+            return _reply(sent, clock.time.time(), offset=1.5), got["addr"]
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    off, rtt = clock.sntp_query("ntp.example")
+    assert len(got["pkt"]) == 48 and got["pkt"][0] == 0x1B and got["addr"] == ("ntp.example", 123)
+    assert abs(off - 1.5) < 0.05 and 0 <= rtt < 1
+    got["echo"] = False
+    with pytest.raises(clock.NTPError):
+        clock.sntp_query("ntp.example")
+
+
+def test_the_clock_takes_the_servers_that_agree_and_keeps_its_offset_otherwise(monkeypatch):
+    """Of the usable replies, those within half a second of their median, the shortest round trip
+    first: one server far off is not taken, however short its round trip. A sync with no usable reply,
+    or with replies that do not agree, leaves the offset in use."""
+    answers = {}
+
+    def query(srv, timeout=2.0):
+        a = answers[srv]
+        if isinstance(a, Exception):
+            raise a
+        return a
+    monkeypatch.setattr(clock, "sntp_query", query)
+    c = clock.Clock(servers=("a", "b", "c", "d"))
+    answers.update(a=(0.200, 0.030), b=(0.210, 0.020), c=(37.0, 0.005), d=clock.NTPError("kiss-of-death 'RATE'"))
+    assert c.sync_blocking() and c.server == "b" and abs(c.offset - 0.210) < 1e-9
+    answers.update(a=OSError("timed out"), b=clock.NTPError("zero timestamps"), c=OSError("timed out"), d=OSError("x"))
+    assert not c.sync_blocking() and c.server == "b" and abs(c.offset - 0.210) < 1e-9     # kept
+    answers.update(a=(0.2, 0.03), b=(5.0, 0.02), c=OSError("x"), d=OSError("x"))         # two that disagree
+    assert not c.sync_blocking() and abs(c.offset - 0.210) < 1e-9
+    answers.update(a=(-0.4, 0.03), b=OSError("x"), c=OSError("x"), d=OSError("x"))       # one usable reply
+    assert c.sync_blocking() and c.server == "a" and abs(c.offset + 0.4) < 1e-9

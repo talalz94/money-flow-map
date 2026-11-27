@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import logging
 import logging.handlers
+import os
 import queue
 import sys
 import threading
@@ -69,6 +70,8 @@ class ConsoleWriter:
             stream.write(text)
             stream.flush()
             return
+        if os.linesep != "\n":                  # as the text stream writes a line's end (a file: CRLF)
+            text = text.replace("\n", os.linesep)
         data = text.encode(getattr(stream, "encoding", None) or "utf-8", "replace")
         while data:
             n = raw.write(data)                  # (the console's may take part of it: the rest goes next)
