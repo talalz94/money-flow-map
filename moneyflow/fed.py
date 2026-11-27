@@ -71,7 +71,7 @@ def next_decision(meetings: list[dict], now: float, local_tz: str = "") -> dict 
     for r in meetings:
         if r["decision_ts"] + 1800 >= now:
             ts = r["decision_ts"]
-            ny = dt.datetime.fromtimestamp(ts, clock.NY)
+            ny = clock.at(ts, clock.NY)
             loc = clock.to_local(ts, local_tz)
             secs = ts - now
             label = "FOMC rate decision + projections" if r["sep"] else "FOMC rate decision"

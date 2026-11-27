@@ -44,6 +44,22 @@ def bars(today_moves: float, vol_today: float = 1000.0) -> tuple[Hourly, float]:
     return h, 100 * math.exp(logp(NOW, today_moves))
 
 
+def test_month_screen_is_exact_on_known_data():
+    """1M on the stock's 31 days of hourly bars: the move from the price 30 days back (not 7), and σ
+    the daily moves of those bars times the root of the NYSE sessions in the 30 days (about 21, not the
+    week's 5), as the map's node reads 1M; no volume ratio (no earlier month in the bars)."""
+    from moneyflow import stats
+    h, px = bars(-3.0, vol_today=3000.0)
+    s = screen_one(h, px, NOW, "1m")
+    e = math.floor(NOW / H) * H
+    p0 = h.price_interp(NOW - 30 * D)
+    k = stats.month_k("us_equity", NOW)
+    sig = stats.robust_rms(stats.roll_daily_returns(h.price_at, e, "us_equity", max_days=stats.DAILY_DAYS)) * math.sqrt(k)
+    assert 19 < k < 23 and abs(p0 / h.price_interp(NOW - 7 * D) - 1) > 1e-4
+    assert s["change_pct"] == pytest.approx((px / p0 - 1) * 100, rel=1e-9)
+    assert s["z"] == pytest.approx(math.log(px / p0) / sig, rel=1e-9) and s["rvol"] is None
+
+
 def test_perp_symbols():
     assert perp_symbol("NVDA") == "NVDAUSDT" and perp_symbol("BRK.B") == "BRKBUSDT"
 
@@ -279,7 +295,7 @@ def test_each_node_says_which_days_its_sigma_is_measured_on(cfg, keys):
             assert n["sigma_days"] == days, (tf, nid)
 
 
-@pytest.mark.parametrize("tf", ["1h", "today", "1w"])
+@pytest.mark.parametrize("tf", ["1h", "today", "1w", "1m"])
 def test_a_pick_whose_move_has_eased_says_so(cfg, keys, monkeypatch, tf):
     """'Eased' means the MOVE faded since the screen picked the stock (a 1H move can, in the minutes between
     two screens): the node's move under 3/4 of the screen's, and its |z| under the rule. The slot then says

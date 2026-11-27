@@ -133,6 +133,65 @@ class VolumeRing:
         return self.q[i], self.tb[i]
 
 
+DAY = 86400
+DAILY_KEEP_DAYS = 400                       # a year of daily closes (366 days) and a margin
+
+
+class Daily:
+    """Daily closes of about the last year (and each day's quote volume where the source gives one in
+    the instrument's own units), for the 1M window's σ: the 5-minute grid holds 35 days, a month's
+    yardstick wants a year. One row per day its market traded, keyed by the UTC date of the bar's
+    start (a weekend or a holiday has no row), complete days only. `own`: the bars are the
+    instrument's own (not a related symbol's: SPY's for the SPY perpetual), so their volume compares
+    with its other windows'."""
+    __slots__ = ("rows", "fetched_at", "source", "own")
+
+    def __init__(self):
+        self.rows: dict[int, tuple[float, float]] = {}      # day -> (close, quote volume or NaN)
+        self.fetched_at: float | None = None
+        self.source: str | None = None
+        self.own = True
+
+    def merge(self, rows, now: float) -> int:
+        """rows: [(bar_start_ts, close, quote_volume)] in any order; a bar whose day has not ended by
+        `now` is left out (its close is not final). Returns the rows taken."""
+        n = 0
+        for t, c, *rest in rows:
+            if not (isnum(c) and c > 0) or t + DAY > now:
+                continue
+            q = rest[0] if rest and isnum(rest[0]) else NaN
+            self.rows[int(t // DAY)] = (float(c), float(q))
+            n += 1
+        old = int(now // DAY) - DAILY_KEEP_DAYS
+        for d in [d for d in self.rows if d < old]:
+            del self.rows[d]
+        return n
+
+    def newest(self) -> int | None:
+        return max(self.rows) if self.rows else None
+
+    def returns(self, now: float, days: int = 366) -> list[float]:
+        """Log returns of consecutive daily closes over the last `days` calendar days (each row to
+        the next one: a weekend or a holiday between two sessions is one move, as the market made it)."""
+        d0 = int(now // DAY) - days
+        ks = sorted(d for d in self.rows if d >= d0)
+        out = []
+        for a, b in zip(ks, ks[1:]):
+            pa, pb = self.rows[a][0], self.rows[b][0]
+            out.append(math.log(pb / pa))
+        return out
+
+    def volume(self, d0: int, d1: int) -> tuple[float, int]:
+        """Sum of the quote volumes of the days in [d0, d1) and how many days had one."""
+        s, n = 0.0, 0
+        for d in range(d0, d1):
+            r = self.rows.get(d)
+            if r is not None and isnum(r[1]):
+                s += r[1]
+                n += 1
+        return s, n
+
+
 class Instrument:
     """One price series from one source (e.g. binance_fut:QQQUSDT index price)."""
 
@@ -143,11 +202,13 @@ class Instrument:
         self.key, self.source, self.symbol = key, source, symbol
         self.label = label or symbol
         self.hours = hours                  # market-hours profile, see clock.market_open
+        self._shuts = clock.has_shut_hours(hours)
         self.calendar = clock.default_calendar(hours)   # days comparable for σ, see clock.CALENDARS
         self.delayed_s = delayed_s          # known publication delay of the source (e.g. 900 s)
         self.g1 = Grid(G1_STEP, G1_SIZE)
         self.g5 = Grid(G5_STEP, G5_SIZE)
         self.v5 = VolumeRing(G5_STEP, G5_SIZE) if volume else None
+        self.daily = Daily()                # a year of daily closes: the 1M window's σ
         self.price = NaN
         self.ts: float | None = None        # exchange timestamp of the latest price
         self.recv_ts: float | None = None   # local (NTP-corrected) receive time
@@ -161,8 +222,9 @@ class Instrument:
         self.holes: dict[str, float | None] = {"g1": None, "g5": None}   # first such step, until back-filled
         self._gap_open = False              # the last closed step was uncovered...
         self.recovered = False              # ...and since then one was covered: the feed is back
-        # an ETF's first session minute its feed missed since its price was last current (a session
-        # print, or a download that covered the gap): the close after it is unknown (roll)
+        # the first open minute its feed missed since its price was last current (a print, or for an
+        # ETF a download that covered the gap): the close after it is unknown (roll). Any market with
+        # shut hours: an ETF's sessions, the FX legs' week
         self._stale_from: float | None = None
         self._k1 = None                     # open (not yet closed) 1-minute step
         self._k5 = None                     # open 5-minute step
@@ -292,7 +354,9 @@ class Instrument:
         # before the gap all night; with an answer that had no bar for the ETF they stayed, and TODAY
         # read the move since the gap began, status live, until 17:00 New York. Found before both
         # loops: after a sleep of over a day the 1-minute loop starts past the first missed session.
-        if fed and seen == seen and self._stale_from is None and self.hours == "us_regular":
+        # The same for any market with shut hours: an FX leg that slept over Friday's close holds an
+        # older price than the close all weekend (its dollar takes ICE's close then: DXY).
+        if fed and seen == seen and self._stale_from is None and self._shuts:
             m = max(self._k1, int(seen // G1_STEP) + 1)
             while m < k1_now:
                 if clock.market_open(self.hours, (m + 1) * G1_STEP - 1):
@@ -400,13 +464,16 @@ class Instrument:
 
     # ── history ─────────────────────────────────────────────────────────────────────────────
     def seed(self, grid: str, closes: list[tuple[float, float]], until: float,
-             volumes: list[tuple[float, float, float]] | None = None, since: float | None = None) -> int:
+             volumes: list[tuple[float, float, float]] | None = None, since: float | None = None,
+             last_trade: float | None = None) -> int:
         """Load history: `closes` = [(step_start_ts, close)], sorted. Fills from the first close up to
         `until` with carry-forward; the live flag follows the market-hours profile. `since`: where a
         download from a venue with bars only for steps that traded (IEX) began: no bar between there
         and its first one means no trade (the last close carried), not a gap to fetch again; that
         holds for an answer with no bar at all too (a weekend, a holiday, before an ETF's first print),
-        over shut hours and over open ones up to the symbol's own limit (quiet_limit_s)."""
+        over shut hours and over open ones up to the symbol's own limit (quiet_limit_s), or of any
+        length from after `last_trade` (the venue's own latest trade of the symbol, asked after the
+        answer: nothing traded since)."""
         g = self.g1 if grid == "g1" else self.g5
         if not closes and since is None:
             return 0
@@ -443,7 +510,11 @@ class Instrument:
                     end = k * step
                     if k == k_until and clock.market_open(self.hours, until - 1e-6):
                         end = until
-                    if end - start * step > QUIET_MAX_S:
+                    # (the venue's latest trade came before the stretch: it did not trade in it. A
+                    # thin ETF that traded every minute lately and first printed at 10:00 got a hole
+                    # for 9:30-9:50 at a 9:50 start, one more download and "no exchange data")
+                    quiet = last_trade is not None and last_trade < start * step
+                    if end - start * step > QUIET_MAX_S and not quiet:
                         limit = self.quiet_limit_s() if limit is None else limit
                         if end - start * step > limit:
                             unknown.add(start)
@@ -710,7 +781,56 @@ class DXY(Derived):
         if missing:
             raise ValueError(f"DXY needs {sorted(missing)}")
         self.pairs = pairs
+        self._seeds = 0                         # history seeds so far (own_close's cache)
+        self._own: tuple = (None, NaN)
         super().__init__(key, list(pairs.values()), hours="fx", label=label)
+
+    def seed(self, grid, closes, until, volumes=None, since=None, last_trade=None) -> int:
+        self._seeds += 1
+        return super().seed(grid, closes, until, volumes, since, last_trade)
+
+    def legs_stale(self, now: float) -> bool:
+        """FX is shut and a leg's price is from before an open minute its feed missed (a sleep over
+        Friday's 17:00 close): the legs' prices are not the close, all weekend (they print again on
+        Sunday at 17:00)."""
+        return not clock.market_open(self.hours, now) and any(i._stale_from is not None for i in self.inputs)
+
+    def _newest_close(self, now: float) -> tuple[float, float]:
+        """(when, value): the newest close in either of its own grids before `now` (the 1-minute grid
+        holds a day: after a longer sleep its newest value is older than the 5-minute grid's)."""
+        best, v = -1.0, NaN
+        for g in (self.g1, self.g5):
+            k = _newest_value(g, int(now // g.step))
+            if k is not None and (k + 1) * g.step > best:
+                best, v = (k + 1) * g.step, g.get(k)
+        return best, v
+
+    def own_close(self, now: float) -> float:
+        """The newest close of its own grids before `now`: ICE's once downloaded, then held over the
+        shut hours. (Worked out again when its grids change, or once a minute.)"""
+        key = (self.g1.last_k, self.g5.last_k, self._seeds, int(now // G1_STEP))
+        if self._own[0] != key:
+            self._own = (key, self._newest_close(now)[1])
+        return self._own[1]
+
+    def hold_close(self, now: float) -> int:
+        """After ICE's history is seeded: the unknown shut steps from its newest close up to `now` hold
+        that close (not live), in both grids. A sleep over Friday's FX close left them unknown (the
+        legs' prices are stale: Instrument.roll), and the steps it closed meanwhile are not computed
+        again. Never across an open step: what traded there is unknown. Returns the steps written."""
+        t, v = self._newest_close(now)
+        if v != v:
+            return 0
+        n = 0
+        for g in (self.g5, self.g1):
+            k_now = int(now // g.step)
+            k = -int(-t // g.step)                  # the first step from the close on
+            while k < k_now and not clock.market_open(self.hours, (k + 1) * g.step - 1):
+                if k > k_now - g.size and g.get(k) != g.get(k):
+                    g.put(k, v, False)
+                    n += 1
+                k += 1
+        return n
 
     @classmethod
     def formula(cls, px: dict[str, float]) -> float:
@@ -723,10 +843,22 @@ class DXY(Derived):
         return v
 
     def value_live(self, now: float) -> float:
+        # FX shut, a leg's price older than the close (legs_stale): the dollar's own close, ICE's once
+        # downloaded. From the legs, a sleep from Friday 15:00 over the 17:00 close read -0.30% all
+        # weekend against ICE's close 0.3% higher (TODAY from Friday 17:00, 1W, 1M).
+        if self.legs_stale(now):
+            v = self.own_close(now)
+            if isnum(v):
+                return v
         return self.formula({n: i.price for n, i in self.pairs.items()})
 
     def value_step(self, grid: str, k: int) -> float:
-        return self.formula({n: getattr(i, grid).get(k) for n, i in self.pairs.items()})
+        v = self.formula({n: getattr(i, grid).get(k) for n, i in self.pairs.items()})
+        if v != v:
+            g = getattr(self, grid)
+            if not clock.market_open(self.hours, (k + 1) * g.step - 1):
+                return g.get(k - 1)             # a shut step its legs do not know: the close holds
+        return v
 
 
 class StablecoinShare(Derived):
@@ -836,6 +968,7 @@ class Stitched(Derived):
         self._live_val = NaN
         self._live_base = (NaN, NaN)     # (S at the last closed step, proxy price then)
         super().__init__(key, [primary, proxy], hours="24/7", label=label or primary.label)
+        self.daily = primary.daily       # the real instrument's daily closes (TLT's: the proxy is thin)
 
     def primary_live(self, now: float) -> bool:
         p = self.primary

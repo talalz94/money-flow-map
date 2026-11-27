@@ -437,6 +437,29 @@ def test_an_answer_with_no_bar_over_a_long_open_stretch_leaves_it_unknown():
     assert all(inst.g5.get(j) == 27.5 for j in range(close, int(sat // G5_STEP)))   # the night carried
 
 
+def test_an_empty_answer_over_a_long_open_stretch_is_no_trade_when_the_venue_last_traded_before_it():
+    """An ETF whose close changed every 5 minutes lately (its quiet limit: 15 minutes) and that first
+    prints at 10:00: at a 9:50 start the answer has no bar for it, and 9:30-9:50 was read as the venue's
+    gap (a hole, one more download, "no exchange data"). The venue's own latest trade tells: before 9:30
+    (Friday), nothing traded since, so the stretch is no trade (the close carried, not live, no hole);
+    inside the stretch, the answer missed a trade: unknown, as without it."""
+    sat, opened, start = ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 23, 9, 30), ny_ts(2026, 11, 23, 9, 50)
+    for grid, step in (("g5", G5_STEP), ("g1", G1_STEP)):
+        for last_trade, carried in ((ny_ts(2026, 11, 20, 15, 59) + 30, True), (None, False),
+                                    (ny_ts(2026, 11, 23, 9, 36), False)):
+            inst = Instrument("x:SPY", "x", "SPY", "us_regular")
+            g = getattr(inst, grid)
+            k = int(sat // step)
+            for j in range(k - 100, k):
+                g.put(j, 27.0, False)                              # the cache: Friday's close, to Saturday noon
+            inst._hole(grid, opened)
+            assert inst.quiet_limit_s() == 900.0
+            inst.seed(grid, [], start, since=sat - 600, last_trade=last_trade)
+            session = range(int(opened // step), int(start // step))
+            assert all((g.get(j) == 27.0) is carried and not g.is_live(j) for j in session), (grid, last_trade)
+            assert inst.holes[grid] == (None if carried else opened), (grid, last_trade)
+
+
 def test_a_symbol_that_often_goes_quiet_has_its_empty_answer_read_as_no_trade_for_longer():
     """The open stretch an answer with no bar is read as "no trade" over is the symbol's own: twice the
     longest run of unchanged 5-minute closes in its sessions, 15 minutes at least. UUP often prints

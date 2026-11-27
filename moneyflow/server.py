@@ -250,7 +250,7 @@ def make_app(engine, cfg: dict, dashboard: bool = True) -> web.Application:
     async def index_api(request):
         return _json({"name": "moneyflow", "version": __version__, "schema": SCHEMA_ID, "timeframes": list(TFS),
                       "endpoints": {
-                          "/api/snapshot?tf=today|1h|1w|all": "everything for one (or all) timeframes",
+                          "/api/snapshot?tf=today|1h|1w|1m|all": "everything for one (or all) timeframes",
                           "/api/nodes?tf=": "the assets on the map", "/api/nodes/{id}?tf=": "one asset",
                           "/api/edges?tf=": "inferred flows", "/api/risk?tf=": "risk-on/off composite",
                           "/api/history/{id}?grid=5m&hours=24": "stored closes of one series (5m: 35 days, 1m: 1 day)",

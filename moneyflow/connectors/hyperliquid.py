@@ -8,13 +8,13 @@ Limits: 1,000 websocket subscriptions and 1,200 REST weight/minute per IP.
 """
 from __future__ import annotations
 
-import time
-
 from .. import jsonutil
 from .base import StreamConnector
 
 
 async def fetch_candles(conn, coin: str, interval: str, start: float, end: float) -> list[tuple]:
+    """-> [(open_ts, close, quote_vol, NaN)] of the candles closed by `end` (the caller's now, from the
+    NTP-corrected clock: the PC's own can be a day off)."""
     url = conn.cfg.get("rest_url", "https://api.hyperliquid.xyz/info")
     body = {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval,
                                               "startTime": int(start * 1000), "endTime": int(end * 1000)}}
@@ -22,10 +22,9 @@ async def fetch_candles(conn, coin: str, interval: str, start: float, end: float
         if r.status != 200:
             raise RuntimeError(f"Hyperliquid HTTP {r.status}")
         rows = jsonutil.loads(await r.read())
-    now = time.time()
-    step = {"1m": 60, "5m": 300, "1h": 3600}[interval]
+    step = {"1m": 60, "5m": 300, "1h": 3600, "1d": 86400}[interval]
     return [(c["t"] / 1000.0, float(c["c"]), float(c.get("v", 0)) * float(c["c"]), float("nan"))
-            for c in rows if c["t"] / 1000.0 + step <= now]
+            for c in rows if c["t"] / 1000.0 + step <= end]
 
 
 class HyperliquidStream(StreamConnector):

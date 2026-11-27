@@ -99,7 +99,7 @@ def test_keyless_bonds_follow_the_proxy_from_tlts_real_close(cfg, monkeypatch, t
 
     asked = []
 
-    async def chart(session, symbol, interval="5m", rng="60d"):
+    async def chart(session, symbol, interval="5m", rng="60d", now=None):
         asked.append((symbol, interval, rng))
         if symbol != "TLT":
             return []

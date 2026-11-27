@@ -419,7 +419,7 @@
     h += `<div class="row"><span>Source</span><span>${esc(src.name)}${src.proxy ? ' <span class="badge b-proxy">PROXY</span>' : ""}</span></div>`;
     h += `<div class="row"><span>What it is</span><span>${esc(src.description || "")}</span></div>`;
     h += `<div class="row"><span>Data age · latency</span><span>${fmtAge(n.age_s)} · ${n.latency_ms == null ? "—" : Math.round(n.latency_ms) + " ms"}</span></div>`;
-    h += `<div class="tfrow">` + ["1h", "today", "1w"].map((t) => { const x = all[t];
+    h += `<div class="tfrow">` + ["1h", "today", "1w", "1m"].filter((t) => d.timeframes[t]).map((t) => { const x = all[t];
       return `<div><b>${t === "today" ? "TODAY" : t.toUpperCase()}</b><span class="${cls(x && x.change_pct)}">${fmtPct(x && x.change_pct)}</span><br>` +
         `<span class="${cls(x && x.z)}">${fmtZ(x && x.z)}</span></div>`; }).join("") + `</div>`;
     {                                                              // its arrows in this window, or why it has none
@@ -435,7 +435,7 @@
     h += `<div class="row"><span>Typical move (1σ) for this window</span><span>${n.sigma_pct == null ? "—" : n.sigma_pct.toFixed(2) + "%"}</span></div>`;
     h += `<div class="row"><span>σ estimated from</span><span>${esc(n.sigma_method || "—")}${n.sigma_days ? " on " + esc(n.sigma_days) : ""} (${n.sigma_samples ?? 0})</span></div>`;
     if (v) {
-      h += `<div class="row"><span>Volume vs usual</span><span>${v.rvol == null ? "—" : v.rvol.toFixed(2) + "×"} <span class="muted">(${v.baseline_days} days)</span></span></div>`;
+      h += `<div class="row"><span>Volume vs usual</span><span>${v.rvol == null ? "—" : v.rvol.toFixed(2) + "×"} <span class="muted">(${v.baseline_days} ${v.basis === "daily bars" ? "earlier months" : "days"})</span></span></div>`;
       if (v.net_taker != null) h += `<div class="row"><span>Net taker flow</span><span class="${cls(v.net_taker)}">${fmtUsd(v.net_taker)} <span class="muted">(${(v.taker_buy_ratio * 100).toFixed(1)}% buys)</span></span></div>`;
     }
     if (dv) {

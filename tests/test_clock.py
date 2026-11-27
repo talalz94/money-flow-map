@@ -186,3 +186,83 @@ def test_a_correction_over_a_day_is_taken_only_where_another_server_agrees(monke
     assert c.sync_blocking() and c.server == "b" and abs(c.offset - 0.25) < 1e-9       # beside a good one
     answers.update(a=(week1024, 0.01), b=(0.25, 0.04), c=(0.3, 0.03), d=(0.28, 0.05))
     assert c.sync_blocking() and c.server == "c" and abs(c.offset - 0.3) < 1e-9
+    # two that agree over a day lose to a reply within a day: one good (it was -619,315,200 s) or two
+    answers.update(a=(week1024, 0.01), b=(week1024 + 0.01, 0.01), c=(0.02, 0.04), d=OSError("x"))
+    assert c.sync_blocking() and c.server == "c" and abs(c.offset - 0.02) < 1e-9
+    answers.update(a=(week1024, 0.01), b=(week1024 + 0.01, 0.01), c=(0.02, 0.04), d=(0.0, 0.03))
+    assert c.sync_blocking() and c.server == "d" and abs(c.offset) < 1e-9
+    answers.update(a=(108000.2, 0.03), b=(108000.1, 0.02), c=(108000.3, 0.04), d=(108000.2, 0.05))
+    assert c.sync_blocking() and c.server == "b" and abs(c.offset - 108000.1) < 1e-9   # all agree: taken
+
+
+def test_clock_helpers_never_raise_on_a_time_out_of_range():
+    """A bad NTP reply once set the clock 127 years back (offset -4.0e9 s): datetime raised OSError 22
+    for every time before 1970 on Windows, and every tick failed until the next sync. The offset is
+    bounded since (a lone correction over a day is refused); behind that, every helper that formats or
+    converts a time takes one out of 1970-3000, or no number at all, without raising."""
+    import math
+    from moneyflow import stats
+    for ts in (-4.0e9, -1.0, 0.0, 1.0e13, math.nan, math.inf, -math.inf):
+        assert isinstance(clock.iso(ts), str) and clock.at(ts).year in (1970, 3000)
+        clock.day_roll(ts), clock.session_date(ts), clock.same_clock_before(ts, 3), clock.to_local(ts)
+        clock.roll_n_days_before(clock.day_roll(ts), 2), clock.us_equity_session(ts), clock.market_status(ts)
+        for hours in ("24/7", "fx", "us_regular", "us_extended", "vix", "daily"):
+            clock.market_open(hours, ts)
+        for cal in ("all", "weekdays", "us_equity"):
+            clock.trading_day(cal, ts)
+        for tf in stats.TIMEFRAMES:
+            stats.window_for(tf, ts)
+    assert clock.iso(1795528800.0) == "2026-11-24T14:00:00.000Z"          # in range: as before
+
+
+def test_downloads_keep_the_bars_closed_by_the_corrected_clock_not_the_pcs(monkeypatch):
+    """The PC's clock two days behind (the NTP correction: +2 days). The downloads left out a bar still
+    open by the PC's own clock, so the last two days of closed bars looked open and were dropped (a
+    clock ahead kept an open one). They go by the caller's now, the corrected clock: Binance's
+    klines, Hyperliquid's candles, Yahoo's chart."""
+    import asyncio
+    import json
+    import time
+    import types
+    from moneyflow.connectors import binance as bn, hyperliquid as hl, pollers
+    now = time.time() + 2 * 86400
+    d0 = int(now // 86400) - 10
+    opens = [(d0 + j) * 86400 for j in range(11)]            # ten closed daily bars and today's, open
+    closed = [t for t in opens if t + 86400 <= now]
+    assert len(closed) == 10
+
+    class Resp:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def read(self):
+            return json.dumps(self.body).encode()
+
+    class Session:
+        def get(self, url, params=None, headers=None, timeout=None):
+            quote = [{"close": [1.0] * len(opens)}]
+            return Resp({"chart": {"result": [{"timestamp": opens, "indicators": {"quote": quote}}]}})
+
+        def post(self, url, json=None):
+            return Resp([{"t": t * 1000, "c": "1.0", "v": "2"} for t in opens])
+
+    async def rest_get(session, base, path, p, gate):
+        return [[t * 1000, "1", "1", "1", "1.0", "1", t * 1000 + 86399999, "5", 1, "1", "2"]
+                for t in opens if p["startTime"] <= t * 1000 <= p["endTime"]]
+    monkeypatch.setattr(bn, "rest_get", rest_get)
+
+    async def go():
+        k = await bn.fetch_klines(Session(), "spot", "BTCUSDT", "1d", opens[0] * 1000, int(now * 1000))
+        c = await hl.fetch_candles(types.SimpleNamespace(cfg={}, session=Session()), "xyz:GOLD", "1d", opens[0], now)
+        y = await pollers.yahoo_chart(Session(), "SPY", "1d", "1mo", now=now)
+        return k, c, y
+    for rows in asyncio.run(go()):
+        assert [r[0] for r in rows] == closed

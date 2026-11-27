@@ -14,6 +14,7 @@ USER_FILES = ("moneyflow.toml", "moneyflow.local.toml")
 SERIES_KINDS = {"price", "stitched", "dxy", "stable_share"}
 SOURCES = {"binance_spot", "binance_fut", "alpaca", "finnhub", "coinbase", "hyperliquid", "yahoo", "computed"}
 HOURS = {"24/7", "fx", "us_regular", "us_extended", "vix", "daily"}
+DAILY_SOURCES = ("binance_spot", "binance_fut", "alpaca", "yahoo", "hyperliquid")   # a series' `daily` closes
 DEFAULT_HOURS = {"binance_spot": "24/7", "binance_fut": "24/7", "coinbase": "24/7", "hyperliquid": "24/7",
                  "alpaca": "us_regular", "finnhub": "fx", "yahoo": "24/7"}
 
@@ -111,6 +112,9 @@ def validate(cfg: dict) -> None:
         c = s.get("calendar")
         if c is not None and c not in ("all", "weekdays", "us_equity"):
             raise ConfigError(f"series {sid}: unknown calendar {c!r} (use all, weekdays or us_equity)")
+        d = s.get("daily")
+        if d is not None and (not isinstance(d, dict) or d.get("source") not in DAILY_SOURCES or not d.get("symbol")):
+            raise ConfigError(f"series {sid}: daily needs a source ({', '.join(DAILY_SOURCES)}) and a symbol")
         for coord in ("x", "y"):
             v = s.get(coord)
             if v is not None and not (0 <= float(v) <= 1):
@@ -129,8 +133,8 @@ def validate(cfg: dict) -> None:
         if len(p) != 2 or not all(0 <= float(v) <= 1 for v in p):
             raise ConfigError("stocks.positions: each slot needs [x, y] within 0..1")
     tf = cfg.get("general", {}).get("default_timeframe", "today")
-    if tf not in ("1h", "today", "1w"):
-        raise ConfigError(f"general.default_timeframe {tf!r} must be 1h, today or 1w")
+    if tf not in ("1h", "today", "1w", "1m"):
+        raise ConfigError(f"general.default_timeframe {tf!r} must be 1h, today, 1w or 1m")
     tot = sum(float(c.get("weight", 0)) for c in cfg.get("risk", {}).get("components", []))
     if cfg.get("risk", {}).get("components") and not (0.99 <= tot <= 1.01):
         raise ConfigError(f"risk component weights must sum to 1.0 (they sum to {tot:.3f})")

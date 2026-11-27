@@ -14,11 +14,14 @@ import datetime as dt
 import math
 
 from .. import clock, jsonutil
-from .base import STANDBY, PollConnector, StreamConnector
+from .base import STANDBY, PollConnector, StreamConnector, Unauthorized
 
 
 def _hdr(keys) -> dict:
     return {"APCA-API-KEY-ID": keys.get("ALPACA_KEY_ID") or "", "APCA-API-SECRET-KEY": keys.get("ALPACA_SECRET") or ""}
+
+
+KEYS_REFUSED = "Alpaca refused the keys: ETFs are read without a key (Yahoo history, no live prints)"
 
 
 class StreamRefused(Exception):
@@ -53,10 +56,10 @@ async def fetch_bars(conn, symbols: list[str], timeframe: str, start: float, end
     """-> {symbol: [(bar_start_ts, close, quote_volume)]} via the multi-symbol bars endpoint."""
     url = f"{conn.cfg.get('rest_url', 'https://data.alpaca.markets')}/v2/stocks/bars"
     params = {"symbols": ",".join(symbols), "timeframe": timeframe, "limit": 10000, "feed": feed,
-              "start": dt.datetime.fromtimestamp(start, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+              "start": clock.at(start, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
               "adjustment": "raw"}
     if end:
-        params["end"] = dt.datetime.fromtimestamp(end, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        params["end"] = clock.at(end, dt.timezone.utc).isoformat().replace("+00:00", "Z")
     out: dict[str, list] = {s: [] for s in symbols}
     token = None
     for _ in range(60):
@@ -73,6 +76,13 @@ async def fetch_bars(conn, symbols: list[str], timeframe: str, start: float, end
     for s in out:
         out[s].sort()
     return out
+
+
+async def fetch_latest_trades(conn, symbols: list[str], feed: str = "iex") -> dict[str, float]:
+    """-> {symbol: the time of its latest trade on the feed} (any session; a symbol with none is left out)."""
+    url = f"{conn.cfg.get('rest_url', 'https://data.alpaca.markets')}/v2/stocks/trades/latest"
+    j = await conn.get_json(url, params={"symbols": ",".join(symbols), "feed": feed}, headers=_hdr(conn.keys))
+    return {s: clock.parse_iso(t["t"]) for s, t in (j.get("trades") or {}).items() if t and t.get("t")}
 
 
 class AlpacaStream(StreamConnector):
@@ -100,7 +110,18 @@ class AlpacaStream(StreamConnector):
     def available(self):
         if not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"):
             return False, "no ALPACA_KEY_ID / ALPACA_SECRET"
+        if self.auth_failed:
+            return False, self.health.detail or KEYS_REFUSED
         return (bool(self.subs), "no symbols")
+
+    def keys_refused(self, why: str) -> None:
+        """Alpaca refused the keys (the stream's login: 402; REST: HTTP 401/403). From then on the ETFs
+        are read as without a key: their history from Yahoo, carried, never covered by the stream or
+        the REST fallback. Asked again, every back-fill and start-up retry failed all day."""
+        if not self.auth_failed:
+            self.log.warning("Alpaca refused the keys (%s): ETFs read without a key from now on", why[:160])
+        self.auth_failed = True
+        self.health.detail = KEYS_REFUSED
 
     def url(self):
         return self.cfg.get("ws_url", "wss://stream.data.alpaca.markets/v2/iex")
@@ -128,8 +149,7 @@ class AlpacaStream(StreamConnector):
             self.refused_until = self.now() + 300
             self.health.detail = "stream refused: connection limit (another app?) - REST fallback every 20 s"
         elif code == 402:        # auth failed: wrong keys
-            self.auth_failed = True
-            self.health.detail = "Alpaca rejected the keys (auth failed)"
+            self.keys_refused(f"login: {text}")
         else:
             self.health.detail = text[:120]
 
@@ -238,8 +258,16 @@ class AlpacaFallback(PollConnector):
     def available(self):
         return self.stream.available()
 
+    @property
+    def auth_failed(self) -> bool:
+        return bool(getattr(self.stream, "auth_failed", False))
+
     async def poll(self):
-        # (standing by is no poll: the ETFs' coverage comes from the stream's own messages then)
+        # (a round that stands by asks nothing; it still counts as the feed heard: PollConnector.run,
+        # except with the keys refused: Engine._feed_seen)
+        if self.auth_failed:
+            self.health.detail = KEYS_REFUSED
+            return STANDBY
         if self.stream.health.state == "connected" and self.stream.ws is not None:
             self.health.detail = "standby (stream connected)"
             return STANDBY
@@ -250,8 +278,13 @@ class AlpacaFallback(PollConnector):
             self.health.detail = "standby (US market closed)"
             return STANDBY
         url = f"{self.cfg.get('rest_url', 'https://data.alpaca.markets')}/v2/stocks/trades/latest"
-        j = await self.get_json(url, params={"symbols": ",".join(sorted(self.stream.subs)),
-                                             "feed": self.cfg.get("feed", "iex")}, headers=_hdr(self.keys))
+        try:
+            j = await self.get_json(url, params={"symbols": ",".join(sorted(self.stream.subs)),
+                                                 "feed": self.cfg.get("feed", "iex")}, headers=_hdr(self.keys))
+        except Unauthorized as e:
+            self.stream.keys_refused(f"REST fallback: {e}")
+            self.health.detail = KEYS_REFUSED
+            return STANDBY
         recv = self.now()
         for sym, t in (j.get("trades") or {}).items():
             inst = self.stream.subs.get(sym)

@@ -33,7 +33,7 @@ def force(eng, monkeypatch, tf, z_of: dict):
     eng._cache.clear()
 
 
-@pytest.mark.parametrize("tf", ["1h", "today", "1w"])
+@pytest.mark.parametrize("tf", ["1h", "today", "1w", "1m"])
 def test_every_node_can_be_the_strongest_outflow_and_inflow(eng, monkeypatch, tf):
     ids = [n["id"] for n in eng.build_tf(tf, NOW)["nodes"]]
     assert "gold" in ids and "stock1" in ids and len(ids) == 11

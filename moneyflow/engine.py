@@ -9,17 +9,43 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
 
 from . import SCHEMA_ID, __version__, clock, config as cfgmod, fed as fedmod, flow, history, narrative, stats
+from .connectors.base import Unauthorized
 from .news import NewsBook
 from .series import DXY, Derived, Instrument, StablecoinShare, Stitched, isnum
 
 log = logging.getLogger("moneyflow.engine")
 NaN = float("nan")
+
+
+def _session_bar(rows, since: float, step: int) -> bool:
+    """Has an ETF's download answer a bar from its regular session, from `since` on?"""
+    return any(t >= since and clock.market_open("us_regular", t + step - 1) for t, *_ in rows or ())
+
+
+def _had_session(since: float, now: float) -> bool:
+    """Was the US regular session open at some time from `since` to `now` (an answer that spans none
+    has no session bar to miss: a night, a weekend)?"""
+    t = int(since // 300) * 300
+    while t < now:
+        if clock.market_open("us_regular", t + 299):
+            return True
+        t += 300
+    return False
+
+
+def _on_5min(t: float) -> float:
+    """A 1-minute download's start, down to a 5-minute boundary. Its carry up to its first bar comes
+    from the 5-minute grid, whose closes are on those boundaries: from inside a 5-minute step it took
+    the close before that step, and a print in its first minutes (before the download began) was
+    missed until the first 1-minute bar."""
+    return math.floor(t / 300.0) * 300.0
 
 SOURCE_NAMES = {
     "binance_spot": "Binance spot", "binance_fut": "Binance USD-M perpetual", "alpaca": "Alpaca IEX",
@@ -36,6 +62,10 @@ FLOW_STATUSES = ("live", "delayed", "closed")
 SOURCE_STALE_S = {"alpaca": 600.0}
 # the sources whose history is downloaded and cached (the cache is loaded for these at the start)
 HISTORY_SOURCES = ("binance_spot", "binance_fut", "alpaca", "hyperliquid")
+# The final save writes this many files at once. Its time goes into closing each file (Windows scans a
+# file written to as it is closed: 1.1 of a save's 1.7 s), and with every core busy it took 4.1-4.7 s
+# one file at a time (33 instruments; a closing window gets about 4.5 s): 0.9-1.5 s eight at a time.
+SAVE_THREADS = 8
 DISCLAIMER = ("A heuristic read of public prices, not a fact and not advice. Flows between assets are inferred from "
               "simultaneous opposite moves; nobody can see where each dollar actually goes.")
 
@@ -615,6 +645,7 @@ class Engine:
         if not incremental:
             if startup:
                 history.clean_tmp(self.cache_dir)     # a save killed midway (or refused) left it
+                history.load_daily(self.cache_dir, [p[0] for p in self._daily_plan()], now)
             for i in insts:
                 history.load(self.cache_dir, i, now)
         # where each download starts, taken now: once it is in, the holes are gone and the newest
@@ -626,7 +657,7 @@ class Engine:
             async with sem:
                 try:
                     since5 = start_of(inst)
-                    since1 = max(now - 86400 + 60, since5 - 600 if incremental else now - 86400 + 60)
+                    since1 = _on_5min(max(now - 86400 + 60, since5 - 600 if incremental else now - 86400 + 60))
                     if inst.source in ("binance_spot", "binance_fut"):
                         if inst.source == "binance_fut" and inst.symbol in self._funding_only():
                             return
@@ -647,54 +678,79 @@ class Engine:
         alp_insts = [i for i in insts if i.source == "alpaca"]
         tasks = [one(i) for i in insts if i.source != "alpaca"]
 
+        async def keyless():
+            # No Alpaca (no key, keys refused, or switched off): take the same ETFs' history from
+            # Yahoo's chart API instead, so the bonds node can anchor on TLT's real last close and stay
+            # live through its 24/7 proxy. These prices are history only and never shown as live.
+            if cfgmod.connector_enabled(self.cfg, "yahoo"):
+                for i in alp_insts:
+                    # Always ask (one small request per ETF): the cache's newest step can be a
+                    # carried price, which says nothing about the sessions since. Five days of
+                    # bars cover a recent cache; otherwise take the full 60.
+                    last = history.last_good_ts(i)
+                    for h in i.holes.values():
+                        if h is not None:
+                            last = min(last or h, h)
+                    rng = "5d" if last and now - last < 4 * 86400 else "60d"
+                    try:
+                        rows = await pollers.yahoo_chart(self.ctx.session, i.symbol, "5m", rng, now=now)
+                        if rows:
+                            i.seed("g5", rows, self._through_closed(i, rows[-1][0] + 300, now))
+                            i.extra["history_source"] = (
+                                "Yahoo chart (Alpaca refused the keys)" if getattr(self.connectors.get("alpaca"), "auth_failed", False)
+                                else "Yahoo chart (no Alpaca key)")
+                        # 1-minute bars too (two sessions cover the 1-day grid): without them the
+                        # 1-minute bonds series fills US hours from the proxy, 0.03% off the real TLT
+                        rows1 = await pollers.yahoo_chart(self.ctx.session, i.symbol, "1m", "2d", now=now)
+                        if rows1:
+                            i.seed("g1", rows1, self._through_closed(i, rows1[-1][0] + 60, now))
+                        st["ok"].append(i.key)
+                    except Exception as e:  # noqa: BLE001
+                        st["errors"].append(f"yahoo {i.symbol}: {e}"[:200])
+                        st["failed"].append(i.key)
+
         async def alpaca_all():
             if not alp_insts:
                 return
             conn = self.connectors.get("alpaca")
-            if conn is None or not alp_insts or not conn.available()[0]:
-                # No Alpaca (no key, or switched off): take the same ETFs' history from Yahoo's chart
-                # API instead, so the bonds node can anchor on TLT's real last close and stay live
-                # through its 24/7 proxy. These prices are history only and never shown as live.
-                if alp_insts and cfgmod.connector_enabled(self.cfg, "yahoo"):
-                    for i in alp_insts:
-                        # Always ask (one small request per ETF): the cache's newest step can be a
-                        # carried price, which says nothing about the sessions since. Five days of
-                        # bars cover a recent cache; otherwise take the full 60.
-                        last = history.last_good_ts(i)
-                        for h in i.holes.values():
-                            if h is not None:
-                                last = min(last or h, h)
-                        rng = "5d" if last and now - last < 4 * 86400 else "60d"
-                        try:
-                            rows = await pollers.yahoo_chart(self.ctx.session, i.symbol, "5m", rng)
-                            if rows:
-                                i.seed("g5", rows, self._through_closed(i, rows[-1][0] + 300, now))
-                                i.extra["history_source"] = "Yahoo chart (no Alpaca key)"
-                            # 1-minute bars too (two sessions cover the 1-day grid): without them the
-                            # 1-minute bonds series fills US hours from the proxy, 0.03% off the real TLT
-                            rows1 = await pollers.yahoo_chart(self.ctx.session, i.symbol, "1m", "2d")
-                            if rows1:
-                                i.seed("g1", rows1, self._through_closed(i, rows1[-1][0] + 60, now))
-                            st["ok"].append(i.key)
-                        except Exception as e:  # noqa: BLE001
-                            st["errors"].append(f"yahoo {i.symbol}: {e}"[:200])
-                            st["failed"].append(i.key)
-                st["done"] += len(alp_insts)
+            if conn is None or not conn.available()[0]:
+                try:
+                    await keyless()
+                finally:
+                    st["done"] += len(alp_insts)
                 return
             try:
-                since5, since1 = min(start_of(i) for i in alp_insts), now - 86400 + 60
-                b5 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "5Min", since5, None, conn.cfg.get("feed", "iex"))
-                b1 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "1Min", since1, None, conn.cfg.get("feed", "iex"))
+                since5, since1 = min(start_of(i) for i in alp_insts), _on_5min(now - 86400 + 60)
+                feed = conn.cfg.get("feed", "iex")
+                b5 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "5Min", since5, None, feed)
+                b1 = await alp.fetch_bars(conn, [i.symbol for i in alp_insts], "1Min", since1, None, feed)
+                # A symbol with no session bar in an answer: did it trade since? The venue's own latest
+                # trade says (one request, only then); without it, a long open stretch is the venue's gap
+                last: dict = {}
+                open5, open1 = _had_session(since5, now), _had_session(since1, now)
+                quiet = [i.symbol for i in alp_insts if (open5 and not _session_bar(b5.get(i.symbol), since5, 300))
+                         or (open1 and not _session_bar(b1.get(i.symbol), since1, 60))]
+                if quiet:
+                    try:
+                        last = await alp.fetch_latest_trades(conn, quiet, feed)
+                    except Exception as e:  # noqa: BLE001 - as before without it
+                        log.info("history alpaca: latest trades: %s", self.keys.redact(e))
                 for i in alp_insts:
                     # IEX has bars only for minutes that traded (`since`: none from there to the first
                     # bar is no gap), so an answer without any for a symbol is seeded too: no trade
                     # since (a weekend, a holiday, before its first print), the last close carried.
                     # Skipped, the time off stayed empty and TODAY unknown all day.
                     rows = b5.get(i.symbol, [])
-                    i.seed("g5", [(t, c) for t, c, _ in rows], now, [(t, q, math.nan) for t, _, q in rows], since=since5)
+                    i.seed("g5", [(t, c) for t, c, _ in rows], now, [(t, q, math.nan) for t, _, q in rows], since=since5,
+                           last_trade=last.get(i.symbol))
                     rows1 = b1.get(i.symbol, [])
-                    i.seed("g1", [(t, c) for t, c, _ in rows1], now, since=since1)
+                    i.seed("g1", [(t, c) for t, c, _ in rows1], now, since=since1, last_trade=last.get(i.symbol))
                     st["ok"].append(i.key)
+            except Unauthorized as e:
+                # the keys refused (HTTP 401/403): read the ETFs as without a key from now on, not retried
+                # every 30 s to 15 min all day (each back-fill and each start-up retry asked again)
+                conn.keys_refused(f"history download: {e}")
+                await keyless()
             except Exception as e:  # noqa: BLE001
                 st["errors"].append(self.keys.redact(f"alpaca: {e}")[:200])
                 st["failed"].extend(i.key for i in alp_insts)
@@ -713,8 +769,8 @@ class Engine:
                     continue
                 legs = [i.key for i in s.inst.inputs]
                 try:
-                    rows = await pollers.yahoo_chart(self.ctx.session, h["symbol"], "5m", "60d")
-                    rows1 = await pollers.yahoo_chart(self.ctx.session, h["symbol"], "1m", "1d")
+                    rows = await pollers.yahoo_chart(self.ctx.session, h["symbol"], "5m", "60d", now=now)
+                    rows1 = await pollers.yahoo_chart(self.ctx.session, h["symbol"], "1m", "1d", now=now)
                     d = s.inst
                     # ICE's DXY arrives 10 minutes late: seed only up to its last bar, never carry it
                     # forward over the minutes the live computed DXY already covers
@@ -722,6 +778,8 @@ class Engine:
                         d.seed("g5", rows, rows[-1][0] + 300)
                     if rows1:
                         d.seed("g1", rows1, rows1[-1][0] + 60)
+                    if rows or rows1:
+                        d.hold_close(self.clock.now())    # ICE's close over the shut hours since
                     d.extra["history_source"] = f"ICE DXY via Yahoo ({h['symbol']}), 5-minute"
                     # the FX legs have no history of their own: ICE's DXY over their gap fills the
                     # dollar, so their holes are done once it covers them
@@ -779,21 +837,142 @@ class Engine:
         used |= set(self._stocks)                 # picked stocks: refilled after a sleep like any node
         return {i.symbol for i in self.instruments.values() if i.source == "binance_fut"} - used
 
+    # ── daily closes: the 1M window's σ (series.Daily) ──────────────────────────────────────
+    DAILY_FIRST_S = 20.0           # after the start: the 5-minute history goes first
+    DAILY_CHECK_S = 1800.0         # stale ones looked for (and a failed download retried) this often
+    DAILY_EVERY_S = 20 * 3600.0    # a daily history this old is downloaded again: about once a day
+    DAILY_DAYS = 366
+
+    def _daily_plan(self) -> list[tuple]:
+        """(instrument, source, symbol, field, own) of each series' daily closes: its own source; the
+        `daily` it names (a perpetual listed in 2026, SPY's or gold's, takes the ETF's or the futures'
+        bars, which reach back a year); the dollar's ICE history; the bonds' TLT (the series shares its
+        primary's daily closes). The stablecoin share has none: its 1M σ comes from its 5-minute grid.
+        A picked stock: its ticker's daily bars."""
+        out, seen = [], set()
+
+        def add(inst, src, sym, fld, own):
+            if id(inst.daily) not in seen:
+                seen.add(id(inst.daily))
+                out.append((inst, src, sym, fld, own))
+        for s in self.series.values():
+            inst, d = s.inst, s.cfg.get("daily")
+            if d:
+                add(inst, d["source"], d["symbol"], d.get("field", "last"), False)
+            elif s.kind == "dxy":
+                h = s.cfg.get("history") or {}
+                if h.get("source") == "yahoo" and h.get("symbol"):
+                    add(inst, "yahoo", h["symbol"], "last", True)
+            elif s.kind == "stitched":
+                p = inst.primary
+                add(p, p.source, p.symbol, p.extra.get("field", "last"), True)
+            elif not inst.computed and inst.source in cfgmod.DAILY_SOURCES:
+                add(inst, inst.source, inst.symbol, inst.extra.get("field", "last"), True)
+        for ent in self._stocks.values():
+            add(ent["inst"], "alpaca", ent["ticker"], "last", False)
+        return out
+
+    async def seed_daily(self, force: bool = False) -> bool:
+        """Download the daily closes missing or older than about a day: a year at the first start, then
+        the days since (one small request per instrument, all ETFs in one). False if any failed."""
+        from .connectors import alpaca as alp, binance as bn, hyperliquid as hl, pollers
+        now = self.clock.now()
+        plan = [p for p in self._daily_plan()
+                if force or p[0].daily.fetched_at is None or now - p[0].daily.fetched_at > self.DAILY_EVERY_S]
+        if not plan:
+            return True
+        ok, sem = True, asyncio.Semaphore(3)
+        alp_conn = self.connectors.get("alpaca")
+        alpaca_up = alp_conn is not None and alp_conn.available()[0]
+
+        def since(inst) -> float:
+            d = inst.daily.newest()
+            first = now - self.DAILY_DAYS * 86400
+            return first if d is None else max(first, (d - 3) * 86400.0)
+
+        def took(inst, src, rows, own) -> None:
+            inst.daily.merge(rows, now)
+            inst.daily.fetched_at, inst.daily.source, inst.daily.own = now, src, own
+
+        async def one(inst, src, sym, fld, own):
+            nonlocal ok
+            try:
+                async with sem:
+                    if src in ("binance_spot", "binance_fut"):
+                        mk = "spot" if src == "binance_spot" else "fut"
+                        rows = await bn.fetch_klines(self.ctx.session, mk, sym, "1d", int(since(inst) * 1000),
+                                                     int(now * 1000), "index" if fld == "index" else "last")
+                        took(inst, f"Binance {sym}", [(t, c, q) for t, c, q, _ in rows], own)
+                    elif src == "hyperliquid":
+                        rows = await hl.fetch_candles(self.connectors["hyperliquid"], sym, "1d", since(inst), now)
+                        took(inst, f"Hyperliquid {sym}", [(t, c, q) for t, c, q, _ in rows], own)
+                    else:                                       # yahoo (and an ETF without a key)
+                        d = inst.daily.newest()
+                        rng = "1y" if d is None or now - d * 86400.0 > 25 * 86400 else "1mo"
+                        rows = await pollers.yahoo_chart(self.ctx.session, sym, "1d", rng, now=now)
+                        took(inst, f"Yahoo {sym}", [(t, c, NaN) for t, c in rows], own)
+            except Exception as e:  # noqa: BLE001 - retried at the next check
+                ok = False
+                log.warning("daily closes %s (%s %s): %s", inst.key, src, sym, self.keys.redact(e))
+
+        async def alpaca(items):
+            nonlocal ok
+            try:
+                bars = await alp.fetch_bars(alp_conn, sorted({sym for _, _, sym, _, _ in items}), "1Day",
+                                            min(since(i) for i, *_ in items), None, alp_conn.cfg.get("feed", "iex"))
+                for inst, _, sym, _, own in items:
+                    took(inst, f"Alpaca {sym} (IEX)", bars.get(sym, []), own)
+            except Unauthorized as e:
+                alp_conn.keys_refused(f"daily closes: {e}")
+                await asyncio.gather(*(one(inst, "yahoo", sym, fld, False) for inst, _, sym, fld, _ in items))
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                log.warning("daily closes alpaca: %s", self.keys.redact(e))
+
+        alp_items = [p for p in plan if p[1] == "alpaca" and alpaca_up]
+        rest = [p if p[1] != "alpaca" else (p[0], "yahoo", p[2], p[3], False) for p in plan if p not in alp_items]
+        await asyncio.gather(*(one(*p) for p in rest), *([alpaca(alp_items)] if alp_items else []))
+        insts = [p[0] for p in self._daily_plan() if p[0].daily.rows]
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, history.save_daily, self.cache_dir, insts)
+        except OSError as e:
+            log.warning("daily closes: not saved: %s", e)
+        log.info("daily closes: %d instruments (%s)", len(plan), "done" if ok else "some failed: retried later")
+        return ok
+
+    async def _daily_loop(self) -> None:
+        """The daily closes at the start, then whenever one is about a day old (checked every 30 min)."""
+        await asyncio.sleep(self.DAILY_FIRST_S)
+        while True:
+            try:
+                await self.seed_daily()
+            except Exception:  # noqa: BLE001 - the next check runs anyway
+                log.exception("daily closes failed (continuing)")
+            await asyncio.sleep(self.DAILY_CHECK_S)
+
     def save_cache(self, insts: list | None = None) -> None:
         """Write the history cache. In a worker thread (see _save_cache_off_loop) `insts` is the list
         taken on the event loop: the loop adds and drops picked stocks meanwhile, and iterating the
         live dict from the thread raised "dictionary changed size during iteration". One save at a
         time: two at once (housekeeping and a back-fill) wrote the same temporary files."""
+        threads = 1
         if insts is None:
             # (the final save) what the next start loads first: a window close gives the save about
-            # 4.5 s, and on a busy PC it takes longer; the FX legs' and Coinbase's files are read only
-            # by tools/replay_flows.py
+            # 4.5 s; the FX legs' and Coinbase's files are read only by tools/replay_flows.py. Several
+            # files at once (SAVE_THREADS), started in that order. (The saves every 10 minutes run in a
+            # worker thread, one file at a time: nothing waits for them.)
             insts = sorted(self.instruments.values(), key=lambda i: i.source not in HISTORY_SOURCES)
+            threads = SAVE_THREADS
         n = 0
         with self._save_lock:
-            for i in insts:
+            if threads > 1 and len(insts) > 1:
+                with ThreadPoolExecutor(min(threads, len(insts)), thread_name_prefix="save") as ex:
+                    done = [(i, ex.submit(history.save, self.cache_dir, i)) for i in insts]
+            else:
+                done = [(i, None) for i in insts]
+            for i, f in done:
                 try:
-                    n += history.save(self.cache_dir, i)
+                    n += f.result() if f is not None else history.save(self.cache_dir, i)
                 except OSError as e:
                     log.warning("cache %s: %s", i.key, e)
         log.debug("cached %d instruments", n)
@@ -837,10 +1016,14 @@ class Engine:
     FEEDS = {"alpaca": ("alpaca", "alpaca_rest")}    # the connectors that deliver a source's prices
 
     def _feed_seen(self, source: str) -> float | None:
-        """The newest message or successful poll of the connector(s) feeding `source`."""
+        """The newest message or successful poll of the connector(s) feeding `source` (none from one
+        whose keys were refused: its ETFs are read as without a key, carried, not covered)."""
         best = None
         for name in self.FEEDS.get(source, (source,)):
-            h = getattr(self.connectors.get(name), "health", None)
+            c = self.connectors.get(name)
+            if getattr(c, "auth_failed", False):
+                continue
+            h = getattr(c, "health", None)
             for t in (getattr(h, "last_msg", None), getattr(h, "last_ok", None)):
                 if t is not None and (best is None or t > best):
                     best = t
@@ -928,7 +1111,7 @@ class Engine:
         inst = s.inst
         tf = w.tf
         r, pct, p0 = stats.window_return(inst, w, now)
-        sig, n, method = self._cached(("sigma", s.id, tf), 60 if tf != "1h" else 120,
+        sig, n, method = self._cached(("sigma", s.id, tf), {"1h": 120, "1m": 300}.get(tf, 60),
                                       lambda: stats.sigma_for(tf, inst, now), now)
         z = r / sig if isnum(r) and isnum(sig) and sig > 0 else None
         traded = self._cached(("traded", s.id, tf), 30, lambda: stats.traded_in_window(inst, w, now), now)
@@ -964,7 +1147,7 @@ class Engine:
                 out["history_from"] = clock.iso(first)
         vol_src = inst.primary if isinstance(inst, Stitched) and clock.market_open(inst.primary.hours, now) else (
             inst.proxy if isinstance(inst, Stitched) else inst)
-        out["volume"] = self._cached(("vol", s.id, tf), 30 if tf != "1w" else 120,
+        out["volume"] = self._cached(("vol", s.id, tf), {"1w": 120, "1m": 600}.get(tf, 30),
                                      lambda: stats.volume_read(vol_src, w, now), now) if vol_src.v5 is not None else None
         out["spark"] = self._cached(("spark", s.id, tf), 5 if tf == "1h" else 20,
                                     lambda: stats.sparkline(inst, w, now), now)
@@ -1196,7 +1379,7 @@ class Engine:
                and now - 1800 <= e["ts"] <= now + hours * 3600]
         evs.sort(key=lambda e: (e.get("country") != "USD", e["ts"]))
         for e in evs:
-            ny = dt.datetime.fromtimestamp(e["ts"], clock.NY)
+            ny = clock.at(e["ts"], clock.NY)
             loc = clock.to_local(e["ts"], self.local_tz)
             out.append({"title": e["title"], "country": e["country"], "impact": e["impact"], "at": clock.iso(e["ts"]),
                         "when_text": f"{ny:%a %H:%M} New York / {loc:%a %H:%M} {clock.local_label(self.local_tz)}",
@@ -1273,6 +1456,7 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._seed_then_track(), name="seed"))
         self._tasks.append(asyncio.create_task(self._loop(), name="tick"))
         self._tasks.append(asyncio.create_task(self._housekeeping(), name="housekeeping"))
+        self._tasks.append(asyncio.create_task(self._daily_loop(), name="daily"))
 
     RESTART_FIRST, RESTART_MAX = 5.0, 300.0
 

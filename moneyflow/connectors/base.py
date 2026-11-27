@@ -21,9 +21,9 @@ import aiohttp
 
 from .. import jsonutil
 
-# what a poll() returns when it stood by without asking (the Alpaca fallback while the stream is up):
-# no successful poll, so no `last_ok`. Counted as one, its round right after a wake, which can run
-# before the first tick, covered the whole time asleep: no gap, the pre-sleep price kept.
+# what a poll() returns when it stood by without asking (the Alpaca fallback while the stream is up,
+# the market is shut, or the stream is connecting or refused). It still counts as the feed heard
+# (PollConnector.run): the first tick after a wake guards the time asleep (Engine.tick, woke).
 STANDBY = "standby"
 
 
@@ -145,6 +145,8 @@ class Connector:
                 except ValueError:
                     wait = 900.0
                 raise RateLimited(url.split("?")[0], min(max(wait, 300.0), 3600.0))
+            if r.status in (401, 403):
+                raise Unauthorized(f"HTTP {r.status} {body[:160]!r}")
             if r.status != 200:
                 raise RuntimeError(f"HTTP {r.status} {body[:160]!r}")
             return jsonutil.loads(body)
@@ -265,6 +267,10 @@ class StreamConnector(Connector):
                     raise ws.exception() or RuntimeError("websocket error")
 
 
+class Unauthorized(RuntimeError):
+    """The server refused the keys (HTTP 401 or 403): asking again changes nothing."""
+
+
 class RateLimited(RuntimeError):
     """The server answered 429 (too many requests): wait `retry_after` seconds before asking again."""
 
@@ -343,14 +349,22 @@ class PollConnector(Connector):
                     self.error(e, "cache")
         while True:
             try:
-                self.health.state = "polling"
+                # the last round's text (an error, "from cache") goes when a round starts, and what this
+                # round's poll says of itself stays ("standby (stream connected)"): cleared after every
+                # round, it never showed
+                self.health.state, self.health.detail = "polling", ""
                 t0 = time.perf_counter()
-                standby = await self.poll() == STANDBY
+                # A round that stood by (STANDBY: the Alpaca fallback while the stream is up, or the
+                # market is shut, or the stream is connecting or refused) counts as the feed heard too.
+                # Without it a stream refused (406: another copy holds the key's one stream) or
+                # unreachable left the ETFs no feed signal outside the session: a session slept over
+                # was carried, not back-filled (TODAY +1.13% all Monday, true 0); and a trading day with
+                # no trade at all ran a back-fill every 67 s. A round right after a wake covering the
+                # time asleep is the first tick's to guard (Engine.tick, woke).
+                await self.poll()
                 self.health.last_poll_ms = round((time.perf_counter() - t0) * 1000)
                 self.health.state = "ok"
-                if not standby:
-                    self.health.last_ok = self.now()
-                self.health.detail = ""
+                self.health.last_ok = self.now()
                 self.backoff.reset()
                 delay = self.next_interval()
             except asyncio.CancelledError:

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "moneyflow.snapshot/1",
   "title": "moneyflow snapshot (one timeframe)",
-  "description": "Returned by GET /api/snapshot?tf=1h|today|1w and pushed over /ws and /sse. With tf=all the per-timeframe fields (timeframe, label, window, nodes, aux, edges, risk, narrative, tiles, stocks) are nested under `timeframes.<tf>` instead (see $defs.all). A heuristic read, not a fact.",
+  "description": "Returned by GET /api/snapshot?tf=1h|today|1w|1m and pushed over /ws and /sse. With tf=all the per-timeframe fields (timeframe, label, window, nodes, aux, edges, risk, narrative, tiles, stocks) are nested under `timeframes.<tf>` instead (see $defs.all). A heuristic read, not a fact.",
   "type": "object",
   "required": ["schema", "version", "generated_at", "generated_ts", "timeframe", "window", "nodes", "edges", "risk", "narrative", "tiles", "market", "sources", "meta"],
   "properties": {
@@ -10,8 +10,8 @@
     "version": {"type": "string"},
     "generated_at": {"type": "string", "description": "UTC ISO-8601, from the NTP-corrected clock"},
     "generated_ts": {"type": "number", "description": "epoch seconds"},
-    "default_timeframe": {"enum": ["1h", "today", "1w"]},
-    "timeframe": {"enum": ["1h", "today", "1w"]},
+    "default_timeframe": {"enum": ["1h", "today", "1w", "1m"]},
+    "timeframe": {"enum": ["1h", "today", "1w", "1m"]},
     "label": {"type": "string"},
     "window": {"$ref": "#/$defs/window"},
     "nodes": {"type": "array", "items": {"$ref": "#/$defs/series"}, "description": "assets drawn on the map"},
@@ -62,7 +62,8 @@
           "id": {"type": "string"}, "name": {"type": "string"}, "short": {"type": "string"}, "symbol": {"type": "string"},
           "field": {"type": "string"}, "proxy": {"type": "boolean"}, "description": {"type": "string"}}},
         "volume": {"oneOf": [{"type": "null"}, {"type": "object", "properties": {
-          "quote_volume": {"type": "number"}, "rvol": {"$ref": "#/$defs/num"}, "baseline_days": {"type": "integer"},
+          "quote_volume": {"type": "number"}, "rvol": {"$ref": "#/$defs/num"}, "baseline_days": {"type": "integer", "description": "past windows the ratio is against: days, or for 1m earlier 30-day stretches"},
+          "basis": {"enum": ["daily bars"], "description": "1m only: from the daily bars (the 5-minute volume holds 35 days)"},
           "taker_buy_ratio": {"type": "number"}, "net_taker": {"type": "number"}}}]},
         "derivatives": {"oneOf": [{"type": "null"}, {"type": "object"}]},
         "reference": {"type": "array", "items": {"type": "object", "properties": {
@@ -129,6 +130,6 @@
       "msgs": {"type": "integer"}, "msgs_per_s": {"$ref": "#/$defs/num"}, "latency_ms_median": {"$ref": "#/$defs/num"},
       "last_message_age_s": {"$ref": "#/$defs/num"}, "last_error": {"type": ["string", "null"]}}},
     "all": {"type": "object", "required": ["schema", "timeframes"], "properties": {
-      "timeframes": {"type": "object", "required": ["1h", "today", "1w"]}}}
+      "timeframes": {"type": "object", "required": ["1h", "today", "1w", "1m"]}}}
   }
 }

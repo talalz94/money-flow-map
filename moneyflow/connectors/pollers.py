@@ -140,7 +140,7 @@ class DefiLlamaStables(PollConnector):
     async def fetch(self):
         if time.time() - self.hist_at > 12 * 3600 or not self.hist:
             j = await self.get_json(self.HIST_URL, headers={"User-Agent": POLITE_UA}, timeout=60)
-            cut = time.time() - 60 * 86400
+            cut = self.now() - 60 * 86400                  # (the NTP-corrected clock: a date's cut)
             self.hist = [(float(x["date"]), float((x.get("totalCirculatingUSD") or {}).get("peggedUSD") or 0))
                          for x in j if float(x["date"]) >= cut]
             self.hist = [h for h in self.hist if h[1] > 0]
@@ -390,8 +390,10 @@ class YahooVix(PollConnector):
                             "source": "Yahoo (unofficial)", "delay_note": "15 minutes delayed"})
 
 
-async def yahoo_chart(session, symbol: str, interval: str = "5m", rng: str = "60d") -> list[tuple[float, float]]:
-    """Unofficial Yahoo chart API (personal use) -> [(bar_start_ts, close)] for CLOSED bars."""
+async def yahoo_chart(session, symbol: str, interval: str = "5m", rng: str = "60d",
+                      now: float | None = None) -> list[tuple[float, float]]:
+    """Unofficial Yahoo chart API (personal use) -> [(bar_start_ts, close)] for CLOSED bars: closed by
+    `now`, the caller's NTP-corrected clock (the PC's own can be a day off)."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     async with session.get(url, params={"interval": interval, "range": rng},
                            headers={"User-Agent": BROWSER_UA}, timeout=aiohttp.ClientTimeout(total=30)) as r:
@@ -403,6 +405,6 @@ async def yahoo_chart(session, symbol: str, interval: str = "5m", rng: str = "60
         return []
     ts = res[0].get("timestamp") or []
     closes = ((res[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-    step = {"1m": 60, "5m": 300, "1h": 3600}.get(interval, 300)
-    now = time.time()
+    step = {"1m": 60, "5m": 300, "1h": 3600, "1d": 86400}.get(interval, 300)
+    now = time.time() if now is None else now
     return [(float(t), float(c)) for t, c in zip(ts, closes) if c is not None and t + step <= now]

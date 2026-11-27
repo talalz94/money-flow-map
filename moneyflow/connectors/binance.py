@@ -77,7 +77,8 @@ async def rest_get(session: aiohttp.ClientSession, base: str, path: str, params:
 
 async def fetch_klines(session, market: str, symbol: str, interval: str, start_ms: int, end_ms: int,
                        price: str = "last") -> list[tuple]:
-    """-> [(open_ts_s, close, quote_vol, taker_buy_quote)]; price="index" uses indexPriceKlines (no volume)."""
+    """-> [(open_ts_s, close, quote_vol, taker_buy_quote)]; price="index" uses indexPriceKlines (no volume).
+    `end_ms` is the caller's now (the NTP-corrected clock): a kline still open then is left out."""
     if market == "spot":
         base, path, lim, gate = SPOT_REST, "/api/v3/klines", 1000, SPOT_GATE
     else:
@@ -85,7 +86,7 @@ async def fetch_klines(session, market: str, symbol: str, interval: str, start_m
         # start (35 days for every perp) stays clear of the gate's half-budget pause
         base, gate, lim = FUT_REST, FUT_GATE, 1000
         path = "/fapi/v1/indexPriceKlines" if price == "index" else "/fapi/v1/klines"
-    step_ms = {"1m": 60_000, "5m": 300_000, "1h": 3_600_000}[interval]
+    step_ms = {"1m": 60_000, "5m": 300_000, "1h": 3_600_000, "1d": 86_400_000}[interval]
     out = []
     t = start_ms
     while t < end_ms:
@@ -102,9 +103,9 @@ async def fetch_klines(session, market: str, symbol: str, interval: str, start_m
         if nt <= t or len(rows) < 2:
             break
         t = nt
-    # the last kline is still open: keep it out of closed history
-    now_ms = time.time() * 1000
-    return [r for r in out if (r[0] * 1000 + step_ms) <= now_ms]
+    # the last kline is still open: keep it out of closed history. By the caller's now, not the PC's
+    # clock: one a day off (a wrong date) dropped up to a day of closed bars, or kept an open one
+    return [r for r in out if (r[0] * 1000 + step_ms) <= end_ms]
 
 
 async def fetch_oi_hist(session, symbol: str, period: str, limit: int) -> list[tuple[float, float]]:

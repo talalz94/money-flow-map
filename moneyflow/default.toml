@@ -187,6 +187,9 @@ feeds = [
 #   (FX, CME futures), "us_equity" (NYSE days). A perpetual on the S&P trades all weekend, but its
 #   typical move must come from days the S&P trades.
 # x, y: position on the map (0..1)
+# daily: where its daily closes come from (the 1M window's σ wants about a year of them): by default its
+#   own source; a perpetual listed in 2026 (SPY's, gold's) names the ETF or the futures it tracks,
+#   whose daily bars reach back a year (Alpaca with a key, else Yahoo; Yahoo for futures)
 
 [[series]]
 id = "bonds"
@@ -226,6 +229,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "XAUUSDT"
 field = "index"
+daily = { source = "yahoo", symbol = "GC=F" }
 reference = [{ source = "alpaca", symbol = "GLD", hours = "us_regular" }, { source = "binance_spot", symbol = "PAXGUSDT" }]
 x = 0.08
 y = 0.29
@@ -240,6 +244,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "XAGUSDT"
 field = "index"
+daily = { source = "yahoo", symbol = "SI=F" }
 reference = [{ source = "alpaca", symbol = "SLV", hours = "us_regular" }]
 x = 0.08
 y = 0.55
@@ -254,6 +259,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "CLUSDT"
 field = "index"
+daily = { source = "yahoo", symbol = "CL=F" }
 reference = [{ source = "alpaca", symbol = "USO", hours = "us_regular" }]
 x = 0.21
 y = 0.8
@@ -268,6 +274,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "QQQUSDT"
 field = "index"
+daily = { source = "alpaca", symbol = "QQQ" }
 reference = [{ source = "alpaca", symbol = "QQQ", hours = "us_regular" }]
 x = 0.73
 y = 0.04
@@ -282,6 +289,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "SPYUSDT"
 field = "index"
+daily = { source = "alpaca", symbol = "SPY" }
 reference = [{ source = "alpaca", symbol = "SPY", hours = "us_regular" }]
 x = 0.92
 y = 0.55
@@ -335,6 +343,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "UVXYUSDT"
 field = "index"
+daily = { source = "alpaca", symbol = "UVXY" }
 reference = [{ source = "alpaca", symbol = "VIXY", hours = "us_regular" }]
 
 [[series]]
@@ -371,6 +380,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "COPPERUSDT"
 field = "index"
+daily = { source = "yahoo", symbol = "HG=F" }
 x = 0.3
 y = 0.55
 
@@ -385,6 +395,7 @@ kind = "price"
 source = "binance_fut"
 symbol = "IWMUSDT"
 field = "index"
+daily = { source = "alpaca", symbol = "IWM" }
 reference = [{ source = "alpaca", symbol = "IWM", hours = "us_regular" }]
 x = 0.7
 y = 0.55

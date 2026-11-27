@@ -4,6 +4,8 @@ Timeframes (all assets share the same clock instants, so moves are comparable):
   1h     the last 60 minutes (rolling)
   today  since the global trading-day roll, 17:00 New York (= the US close for US-listed assets)
   1w     the last 7 days (rolling)
+  1m     the last 30 days (rolling): the move from the 5-minute grid (35 days), σ from about a year
+         of daily closes (series.Daily)
 
 σ is the typical size of a move over the SAME kind of window, from the asset's own recent history,
 on COMPARABLE days only: the asset's trading days (clock.CALENDARS: every day for crypto, weekdays
@@ -19,6 +21,10 @@ otherwise drag an equity's σ down and make every weekday move look bigger than 
          variance scaled by elapsed time
   1w     daily (roll-to-roll) moves on the trading days of the last 30 days × √(the trading
          sessions in the window: 5 in a normal week, 4 in Thanksgiving week, 7 for crypto)
+  1m     daily moves of about the last year (its daily closes: 365 for crypto, ~250 for an ETF)
+         × √(the trading sessions in the 30 days: 30 for crypto, 20-22 for an exchange); with fewer
+         than 30 such moves (a recent listing, no daily source) the last 30 days' roll-to-roll moves
+         from the 5-minute grid, as 1W
 Every σ is robust to ONE one-off: the single day whose moves are more than twice any other day's
 (an earnings gap, a crash day) counts as that next-largest day; a stock with several big days keeps
 them. The notable-stock screen (stocks.py) uses the same functions on hourly bars.
@@ -34,8 +40,10 @@ from . import clock
 from .series import G5_STEP, Instrument, isnum
 
 NaN = float("nan")
-TIMEFRAMES = ("1h", "today", "1w")
-TF_LABELS = {"1h": "1H", "today": "TODAY", "1w": "1W"}
+TIMEFRAMES = ("1h", "today", "1w", "1m")
+TF_LABELS = {"1h": "1H", "today": "TODAY", "1w": "1W", "1m": "1M"}
+MONTH_S = 30 * 86400.0
+MONTH_MIN_DAILY = 30          # daily moves the year's history needs before 1M's σ is taken from it
 
 
 @dataclass
@@ -47,15 +55,16 @@ class Window:
 
 
 def window_for(tf: str, now: float) -> Window:
-    import datetime as dt
     if tf == "1h":
         return Window(tf, now - 3600, now, "last 60 minutes")
     if tf == "today":
         r = clock.day_roll(now)
-        d = dt.datetime.fromtimestamp(r, clock.NY)
+        d = clock.at(r, clock.NY)
         return Window(tf, r, now, f"since 17:00 New York {d:%a %d %b}")
     if tf == "1w":
         return Window(tf, now - 7 * 86400, now, "last 7 days")
+    if tf == "1m":
+        return Window(tf, now - MONTH_S, now, "last 30 days")
     raise ValueError(f"unknown timeframe {tf!r}")
 
 
@@ -251,6 +260,12 @@ def week_k(calendar: str, now: float) -> float:
     return round(sessions_in(calendar, now - 7 * 86400.0, now), 1) or float(days_per_week(calendar))
 
 
+def month_k(calendar: str, now: float) -> float:
+    """The number of daily moves a 1M window (30 days) adds up, rounded to 0.1: 30 for crypto, 20-22
+    for an exchange (its holidays in the window left out)."""
+    return round(sessions_in(calendar, now - MONTH_S, now), 1) or (30.0 if calendar == "all" else 21.0)
+
+
 def sigma_1h(inst: Instrument, now: float, min_n: int = 30) -> tuple[float, int, str]:
     g = inst.g5
     cal = getattr(inst, "calendar", "all")
@@ -343,6 +358,24 @@ def sigma_1w(inst: Instrument, now: float) -> tuple[float, int, str]:
     return NaN, days, "insufficient history"
 
 
+def sigma_1m(inst: Instrument, now: float) -> tuple[float, int, str]:
+    """σ of a 30-day move: the daily moves of about the last year × √(the trading sessions in the 30
+    days). From 35 days of 5-minute closes alone a month's yardstick rests on ~20 daily moves (an
+    ETF's), one month's sample for a month's move. A single one-off day is capped, as everywhere."""
+    k = month_k(getattr(inst, "calendar", "all"), now)
+    daily = getattr(inst, "daily", None)
+    rs = daily.returns(now) if daily is not None else []
+    if len(rs) >= MONTH_MIN_DAILY:
+        return robust_rms(rs) * math.sqrt(k), len(rs), f"daily RMS, {len(rs)} days × √{k:g}"
+    rs = daily_returns(inst, now)
+    if len(rs) >= 14:
+        return robust_rms(rs) * math.sqrt(k), len(rs), f"daily RMS × √{k:g}"
+    var_day = realized_var_per_day(inst, now)
+    if isnum(var_day) and len(rs) >= 2:
+        return math.sqrt(var_day * MONTH_S / 86400.0), len(rs), "realized-variance fallback"
+    return NaN, len(rs), "insufficient history"
+
+
 def sigma_for(tf: str, inst: Instrument, now: float) -> tuple[float, int, str]:
     if tf == "1h":
         return sigma_1h(inst, now)
@@ -350,6 +383,8 @@ def sigma_for(tf: str, inst: Instrument, now: float) -> tuple[float, int, str]:
         return sigma_today(inst, now)
     if tf == "1w":
         return sigma_1w(inst, now)
+    if tf == "1m":
+        return sigma_1m(inst, now)
     raise ValueError(tf)
 
 
@@ -372,9 +407,40 @@ def _vol_sum(inst: Instrument, t0: float, t1: float) -> tuple[float, float, int]
     return q, (tb if tb_ok else NaN), n
 
 
+def volume_month(inst: Instrument, now: float) -> dict | None:
+    """1M's volume: the last 30 complete days' quote volume against the median of the previous 30-day
+    stretches of the year (daily bars: the 5-minute volume holds 35 days, no earlier month to compare),
+    with the taker split of the 5-minute volume where the venue reports it. Only from the instrument's
+    own daily bars (a related symbol's volume, SPY's for the SPY perpetual, is another market's)."""
+    daily = getattr(inst, "daily", None)
+    if daily is None or not daily.rows or not daily.own:
+        return None
+    d1 = int(now // 86400)                                 # today: not complete, not in the rows
+    q, n = daily.volume(d1 - 30, d1)
+    if n == 0:
+        return None
+    past = []
+    for m in range(1, 12):
+        a, k = daily.volume(d1 - 30 * (m + 1), d1 - 30 * m)
+        if k >= max(1, n * 0.8):
+            past.append(a)
+    past = [p for p in past if p > 0]
+    base = sorted(past)[len(past) // 2] if len(past) >= 3 else NaN
+    out = {"quote_volume": q, "rvol": (q / base) if isnum(base) and base > 0 else None, "baseline_days": len(past),
+           "basis": "daily bars"}
+    if inst.v5 is not None and inst.v5.last_k is not None:
+        q5, tb, n5 = _vol_sum(inst, now - MONTH_S, now)
+        if isnum(tb) and q5 > 0:
+            out["taker_buy_ratio"] = tb / q5
+            out["net_taker"] = tb - (q5 - tb)
+    return out
+
+
 def volume_read(inst: Instrument, w: Window, now: float) -> dict | None:
     """Relative volume against the same window on previous days, and the taker (aggressor) split.
     net taker flow = taker-buy quote volume - taker-sell quote volume (where the venue reports it)."""
+    if w.tf == "1m":
+        return volume_month(inst, now)
     if inst.v5 is None or inst.v5.last_k is None:
         return None
     q, tb, n = _vol_sum(inst, w.start, now)
@@ -410,11 +476,14 @@ def volume_read(inst: Instrument, w: Window, now: float) -> dict | None:
 
 # ── co-movement ─────────────────────────────────────────────────────────────────────────────────
 def step_returns(inst: Instrument, w: Window, now: float) -> dict[int, float]:
-    """Log returns per step inside the window: 1-minute steps (1h), 5-minute (today), hourly (1w)."""
+    """Log returns per step inside the window: 1-minute steps (1h), 5-minute (today), hourly (1w),
+    2-hourly (1m: 360 moves over 30 days for crypto, ~3 a session for an ETF)."""
     if w.tf == "1h":
         g, stride = inst.g1, 1
     elif w.tf == "today":
         g, stride = inst.g5, 1
+    elif w.tf == "1m":
+        g, stride = inst.g5, 7200 // G5_STEP
     else:
         g, stride = inst.g5, 3600 // G5_STEP
     k1 = g.k_of(now) - 1

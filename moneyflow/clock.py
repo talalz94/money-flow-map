@@ -83,14 +83,17 @@ def sntp_query(server: str, timeout: float = 2.0) -> tuple[float, float]:
 
 def pick_offset(replies: list[tuple[str, float, float]]) -> tuple[str, float, float] | None:
     """The reply to trust among (server, offset, rtt): of those within NTP_AGREE_S of the replies'
-    median offset, the shortest round trip. A correction over a day counts only where another reply
-    agrees with it: one server's well-formed reply 1024 weeks off would set the clock 19.6 years back,
-    while servers that agree correct a PC clock that is days off (a cap on every reply left it so;
-    Windows' own time service corrects at most 15 hours by default). Two or more replies of which no
-    two agree: none (the offset in use stays)."""
+    median offset, the shortest round trip. Replies within a day win over any that correct by more:
+    two servers that agree 1024 weeks off beside a good one set the clock 19.6 years back. A
+    correction over a day counts only when no reply is within a day, and then only where another
+    reply agrees with it (one server's well-formed reply 1024 weeks off is not taken), so servers that
+    agree correct a PC clock that is days off (a cap on every reply left it so; Windows' own time
+    service corrects at most 15 hours by default). Two or more replies of which no two agree: none
+    (the offset in use stays)."""
     def agreed(r):
         return any(q is not r and abs(q[1] - r[1]) <= NTP_AGREE_S for q in replies)
-    replies = [r for r in replies if abs(r[1]) <= NTP_MAX_OFFSET_S or agreed(r)]
+    sane = [r for r in replies if abs(r[1]) <= NTP_MAX_OFFSET_S]
+    replies = sane or [r for r in replies if agreed(r)]
     if len(replies) <= 1:
         return replies[0] if replies else None
     offs = sorted(o for _, o, _ in replies)
@@ -158,10 +161,27 @@ class Clock:
 
 
 # ── formatting ──────────────────────────────────────────────────────────────────────────────────
+# The times a clock helper takes: 2 Jan 1970 to the year 3000. One out of them (a wrong "now": a bad
+# NTP reply once set the clock 127 years back) is clamped into them, not raised on: datetime raised
+# OSError 22 for any time before 1970 on Windows, and every tick failed until the next sync.
+TS_MIN, TS_MAX = 2 * 86400.0, 32503680000.0
+
+
+def at(ts: float, tzinfo=None) -> dt.datetime:
+    """datetime.fromtimestamp that never raises: a time outside 1970-3000 (or not a number) is clamped."""
+    try:
+        t = float(ts)
+    except (TypeError, ValueError):
+        t = TS_MIN
+    if not TS_MIN <= t <= TS_MAX:                  # (NaN too)
+        t = TS_MAX if t > TS_MAX else TS_MIN
+    return dt.datetime.fromtimestamp(t, tzinfo)
+
+
 def iso(ts: float | None) -> str | None:
     if ts is None:
         return None
-    return dt.datetime.fromtimestamp(ts, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return at(ts, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 @lru_cache(maxsize=64)
@@ -202,8 +222,8 @@ FRIENDLY_TZ = {"Asia/Karachi": "Pakistan", "America/New_York": "New York", "Euro
 def to_local(ts: float, name: str = "") -> dt.datetime:
     """`ts` in the named IANA zone, or in this PC's own zone when `name` is empty."""
     if name:
-        return dt.datetime.fromtimestamp(ts, ZoneInfo(name))
-    return dt.datetime.fromtimestamp(ts).astimezone()
+        return at(ts, ZoneInfo(name))
+    return at(ts).astimezone()
 
 
 def local_label(name: str = "") -> str:
@@ -219,14 +239,14 @@ ROLL_HOUR_NY = 17   # the global FX/futures day roll: 17:00 New York
 @lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def day_roll(ts: float) -> float:
     """Epoch of the latest 17:00 New York at or before `ts` (start of the current trading day)."""
-    d = dt.datetime.fromtimestamp(ts, NY)
+    d = at(ts, NY)
     day = d.date() if d.hour >= ROLL_HOUR_NY else d.date() - dt.timedelta(days=1)
     return dt.datetime(day.year, day.month, day.day, ROLL_HOUR_NY, tzinfo=NY).timestamp()  # DST-safe
 
 
 @lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def roll_n_days_before(roll_ts: float, n: int) -> float:
-    d = dt.datetime.fromtimestamp(roll_ts, NY).date() - dt.timedelta(days=n)
+    d = at(roll_ts, NY).date() - dt.timedelta(days=n)
     return dt.datetime(d.year, d.month, d.day, ROLL_HOUR_NY, tzinfo=NY).timestamp()
 
 
@@ -321,7 +341,7 @@ CALENDAR_LABELS = {"all": "all days", "weekdays": "weekdays", "us_equity": "NYSE
 @lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def session_date(ts: float) -> dt.date:
     """The trading day a moment belongs to: days roll at 17:00 New York, so Sunday 20:00 is Monday."""
-    return (dt.datetime.fromtimestamp(ts, NY) + dt.timedelta(hours=24 - ROLL_HOUR_NY)).date()
+    return (at(ts, NY) + dt.timedelta(hours=24 - ROLL_HOUR_NY)).date()
 
 
 @lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
@@ -343,12 +363,12 @@ def default_calendar(hours: str) -> str:
 @lru_cache(maxsize=16384)   # pure; the stock screen asks the same for all 78 stocks
 def same_clock_before(ts: float, n: int) -> float:
     """The same New York wall-clock time `n` calendar days earlier (DST-safe)."""
-    return (dt.datetime.fromtimestamp(ts, NY) - dt.timedelta(days=n)).timestamp()
+    return (at(ts, NY) - dt.timedelta(days=n)).timestamp()
 
 
 def us_equity_session(ts: float) -> str:
     """'regular' | 'pre' | 'post' | 'closed' for US-listed stocks/ETFs at epoch `ts`."""
-    d = dt.datetime.fromtimestamp(ts, NY)
+    d = at(ts, NY)
     if not is_us_trading_day(d.date()):
         return "closed"
     hm = d.hour * 60 + d.minute
@@ -364,7 +384,7 @@ def us_equity_session(ts: float) -> str:
 
 def fx_open(ts: float) -> bool:
     """Spot FX trades from Sunday 17:00 to Friday 17:00 New York (holidays ignored: thin, not shut)."""
-    d = dt.datetime.fromtimestamp(ts, NY)
+    d = at(ts, NY)
     wd, hm = d.weekday(), d.hour * 60 + d.minute
     if wd == 5:
         return False
@@ -377,11 +397,16 @@ def fx_open(ts: float) -> bool:
 
 def vix_calc_hours(ts: float) -> bool:
     """Cboe computes VIX 03:15-09:15 and 09:30-16:15 New York on US trading days."""
-    d = dt.datetime.fromtimestamp(ts, NY)
+    d = at(ts, NY)
     if not is_us_trading_day(d.date()):
         return False
     hm = d.hour * 60 + d.minute
     return (3 * 60 + 15 <= hm < 9 * 60 + 15) or (9 * 60 + 30 <= hm < 16 * 60 + 15)
+
+
+def has_shut_hours(profile: str) -> bool:
+    """Does a market with this hours profile ever close (ETFs' sessions, FX's weekend)?"""
+    return profile not in ("24/7", "crypto", "always", "daily")
 
 
 def market_open(profile: str, ts: float) -> bool:
@@ -389,6 +414,8 @@ def market_open(profile: str, ts: float) -> bool:
     asked on every tick of a session-based instrument.)"""
     if profile in ("24/7", "crypto", "always", "daily"):
         return True
+    if not TS_MIN <= ts <= TS_MAX:                  # (see at(): NaN too)
+        ts = TS_MAX if ts > TS_MAX else TS_MIN
     return _market_open_minute(profile, int(ts // 60))
 
 

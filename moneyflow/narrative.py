@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 
-TF_PHRASE = {"1h": "in the last hour", "today": "today", "1w": "this week"}
+TF_PHRASE = {"1h": "in the last hour", "today": "today", "1w": "this week", "1m": "this month"}
+SUPPLY_SPAN = {"1w": ("w1", "7 days"), "1m": ("m1", "30 days")}     # the supply change quoted (else 24 h)
 Z1, Z2 = 1.0, 2.0
 
 
@@ -104,9 +105,9 @@ def build(tf: str, nodes: dict[str, dict], edges: list[dict], risk: dict, ctx: d
     sup = ctx.get("stable_supply") or {}
     if _ok(stables) and _ok(crypto) and stables >= 1.5 and crypto <= -1.5:
         txt = "Stablecoin share is rising: crypto traders are moving to cash."
-        d = sup.get("d1") if tf != "1w" else sup.get("w1")
+        key, span = SUPPLY_SPAN.get(tf, ("d1", "24 h"))
+        d = sup.get(key)
         if _ok(d):
-            span = "7 days" if tf == "1w" else "24 h"
             if d > 0:
                 txt += f" Supply is also up {fmt_usd(d)} in {span}, so fresh cash is parked, not leaving."
             else:

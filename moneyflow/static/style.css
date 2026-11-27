@@ -76,7 +76,7 @@ h1 { margin: 0; font: 700 30px/1 var(--wide); letter-spacing: .2em; }
 .tip h3 { margin: 0 0 6px; font: 700 14px var(--sans); display: flex; justify-content: space-between; gap: 8px; }
 .tip .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; border-bottom: 1px dashed rgba(255,255,255,.04); }
 .tip .row span:first-child { color: var(--muted); }
-.tip .tfrow { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0; text-align: center; }
+.tip .tfrow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 8px 0; text-align: center; }
 .tip .tfrow div { background: #0b1016; border: 1px solid var(--line); border-radius: 6px; padding: 5px 2px; font: 12px var(--mono); }
 .tip .tfrow b { display: block; font: 600 10px var(--wide); letter-spacing: .12em; color: var(--muted); }
 .tip .note { color: var(--muted); margin-top: 6px; font-size: 11.5px; }

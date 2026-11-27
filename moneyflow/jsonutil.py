@@ -41,5 +41,12 @@ def dumps_compact(obj) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
+def dumps_compact_bytes(obj) -> bytes:
+    """dumps_compact as UTF-8 bytes (what a file gets: no decoding and encoding again)."""
+    if _orjson is not None:
+        return _orjson.dumps(obj)
+    return json.dumps(obj, separators=(",", ":")).encode("utf-8")
+
+
 def dumps_pretty(obj) -> str:
     return json.dumps(_clean(obj), indent=2, ensure_ascii=False)

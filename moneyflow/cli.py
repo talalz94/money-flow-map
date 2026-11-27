@@ -184,7 +184,9 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
             except (ValueError, OSError):
                 pass
     closing, saved = threading.Event(), threading.Event()
+    why = ["the console window is closing"]           # (what set `closing`, for the log)
     console = _on_console_close(loop, stop, closing, saved) if sys.platform == "win32" else None
+    session = _on_session_end(loop, stop, closing, saved, why) if sys.platform == "win32" else None
 
     async def watch_idle():
         """Not in use (no dashboard tab or app) for the grace period: stop, as if Ctrl+C was pressed."""
@@ -211,7 +213,7 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
             if saved_first:
                 # (a log line reaches the console through its own thread: it cannot hold the save, and
                 # the log file shows the close even if Windows ends the process during the save)
-                log.info("the console window is closing: saving the history cache first...")
+                log.info("%s: saving the history cache first...", why[0])
                 engine.save_cache_logged(saved)
             log.info("stopping..." if saved_first else "stopping (saving the history cache)...")
             await engine.stop_feeds()
@@ -223,6 +225,8 @@ async def serve(cfg: dict, keys: KeyStore, dashboard: bool, open_browser: bool) 
         await runner.cleanup()          # closes the dashboards' streams and waits for their handlers
         if console is not None:
             _console_handler_off(console)
+        if session is not None:
+            session.close()
         for name, handler in previous.items():
             try:
                 signal.signal(getattr(signal, name), handler)
@@ -260,8 +264,8 @@ def _on_console_close(loop, stop: asyncio.Event, closing, saved):
     handlers do: the C runtime's handler for that event returns at once, so the process was gone
     within 60 ms, its cache unsaved. This handler starts the graceful stop instead and holds the
     process until the cache is saved (first, on this path). Windows does not call it at logoff or
-    shutdown in this process (user32.dll is loaded by its imports): those still end it unsaved, as
-    before (5 and 6 are taken should they ever come). Called from a thread of the system's; returned
+    shutdown in this process (user32.dll is loaded by its imports): _on_session_end's window hears of
+    those (5 and 6 are taken should they ever come). Called from a thread of the system's; returned
     to keep a reference to it (None if it could not be set)."""
     try:
         import ctypes
@@ -284,6 +288,126 @@ def _on_console_close(loop, stop: asyncio.Event, closing, saved):
 
     h = proto(handler)
     return h if kernel32.SetConsoleCtrlHandler(h, True) else None
+
+
+WM_DESTROY, WM_CLOSE, WM_QUERYENDSESSION, WM_ENDSESSION = 0x0002, 0x0010, 0x0011, 0x0016
+# how long the session's end is held for the save at most: Windows lists a program still busy after
+# about 5 s as "preventing shutdown" (with the reason given below) and goes on once it returns
+SESSION_END_WAIT_S = 30.0
+
+
+class _SessionWindow:
+    """The hidden window of _on_session_end, and its thread."""
+
+    def __init__(self):
+        self.hwnd = None
+        self.thread = None
+        self.post = None
+        self.callback = None            # (kept alive with the window)
+
+    def close(self) -> None:
+        if self.hwnd and self.post is not None:
+            self.post(self.hwnd, WM_CLOSE, 0, 0)
+        if self.thread is not None:
+            self.thread.join(2.0)
+
+
+_session_classes = iter(range(1, 1 << 30))
+
+
+def _on_session_end(loop, stop: asyncio.Event, closing, saved, why: list):
+    """Logging off and shutting Windows down ended the process unsaved: Windows does not call the
+    console handler for them in a process that loads user32.dll (this one's imports do), it treats
+    it as a windowed program. Such a program hears of them as window messages: a hidden top-level
+    window of its own (a message-only window gets no broadcasts), with a thread of its own to answer
+    them. WM_QUERYENDSESSION (may the session end?) is answered yes and changes nothing: another
+    program can still cancel it. WM_ENDSESSION with wParam TRUE (it ends: Windows ends the process
+    once this returns) starts the graceful stop, which saves the cache first as at a window close,
+    and returns once it is saved (SESSION_END_WAIT_S at most), with "Saving the history cache" as the
+    reason Windows shows if that takes long. Returns the window (None if it could not be made)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)       # (own instances: own argtypes)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (ImportError, OSError, AttributeError):
+        return None
+    lresult = ctypes.c_ssize_t
+    wndproc = ctypes.WINFUNCTYPE(lresult, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", wndproc), ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.restype = lresult
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                       wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = lresult
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+    def proc(hwnd, msg, wparam, lparam):
+        if msg == WM_QUERYENDSESSION:
+            return 1
+        if msg == WM_ENDSESSION:
+            if wparam:
+                why[0] = "Windows is ending the session (logoff or shutdown)"
+                closing.set()
+                try:
+                    loop.call_soon_threadsafe(stop.set)
+                except RuntimeError:            # the loop has ended: nothing left to save
+                    return 0
+                user32.ShutdownBlockReasonCreate(hwnd, "Saving the history cache")
+                saved.wait(SESSION_END_WAIT_S)
+                user32.ShutdownBlockReasonDestroy(hwnd)
+            return 0
+        if msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    w = _SessionWindow()
+    w.post, w.callback = user32.PostMessageW, wndproc(proc)
+    name = f"MoneyFlowMapSession{os.getpid()}_{next(_session_classes)}"
+    ready = threading.Event()
+
+    def run():
+        try:
+            hinst = kernel32.GetModuleHandleW(None)
+            wc = WNDCLASSW()
+            wc.lpfnWndProc, wc.hInstance, wc.lpszClassName = w.callback, hinst, name
+            if not user32.RegisterClassW(ctypes.byref(wc)):
+                return
+            w.hwnd = user32.CreateWindowExW(0, name, "Money Flow Map", 0, 0, 0, 0, 0, None, None, hinst, None)
+            ready.set()
+            msg = wintypes.MSG()
+            while w.hwnd and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            user32.UnregisterClassW(name, hinst)
+        except Exception:  # noqa: BLE001 - without it, logoff and shutdown are as before
+            logging.getLogger("moneyflow").exception("session-end window failed")
+        finally:
+            ready.set()
+    w.thread = threading.Thread(target=run, name="session-end", daemon=True)
+    w.thread.start()
+    ready.wait(5.0)
+    return w if w.hwnd else None
 
 
 def _console_handler_off(h) -> None:
@@ -369,7 +493,7 @@ def main(argv=None) -> int:
                         "after the last dashboard tab or app disconnects)")
     r.add_argument("--idle-minutes", type=float, help="stop after this many unused minutes (0 = never)")
     rd = sub.add_parser("read", help="print the current read from the running service")
-    rd.add_argument("--tf", default="today", choices=["1h", "today", "1w"])
+    rd.add_argument("--tf", default="today", choices=["1h", "today", "1w", "1m"])
     rd.add_argument("--json", action="store_true")
     rd.add_argument("--url")
     sub.add_parser("keys", help="show which API keys were found (never their values)")

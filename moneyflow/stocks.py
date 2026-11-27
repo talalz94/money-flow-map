@@ -17,7 +17,9 @@ For each window:
     r     = ln(price now / price at the window start)
     σ     = the map's own estimator (stats.py), here on hourly bars, on the previous 20 NYSE trading
             days: 1H the same clock hour; TODAY the same time since 17:00 New York; 1W the daily
-            moves of the last 30 days × √5. A single one-off day (an earnings gap) is capped.
+            moves of the last 30 days × √5; 1M the same × √(the ~21 sessions of 30 days), and no
+            volume ratio (the hourly bars hold no earlier month). A single one-off day (an
+            earnings gap) is capped.
     z     = r / σ
     rvol  = the window's quote volume on the perpetual / the median of the same on previous trading days
     score = |z| · √clip(rvol, 0.5, 4)     (unusual volume strengthens a move, thin volume weakens it)
@@ -215,6 +217,14 @@ def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: flo
         sig = stats.robust_rms(rs) * math.sqrt(stats.week_k(calendar, now)) if len(rs) >= 10 else NaN
         week, prior = h.volume(e - 7 * D, e), h.volume(e - 28 * D, e - 7 * D)
         rvol = week / (prior / 3.0) if _ok(week) and _ok(prior) and prior > 0 else None
+    elif tf == "1m":
+        # the 31 days of hourly bars: the month's move, and its σ from their daily moves as 1W's (the
+        # node reads a year of daily closes: a stock it shows is ranked on the node's own numbers); no
+        # earlier month to compare its volume with
+        p0 = h.price_interp(now - stats.MONTH_S)
+        rs = stats.roll_daily_returns(h.price_at, e, calendar, max_days=stats.DAILY_DAYS)
+        sig = stats.robust_rms(rs) * math.sqrt(stats.month_k(calendar, now)) if len(rs) >= 10 else NaN
+        rvol = None
     else:
         raise ValueError(tf)
     r = _lr(price, p0)
@@ -262,7 +272,7 @@ def screen(book: "StockBook", tf: str, now: float, z_min: float, score_min: floa
     return {"picks": picks, "top": rows[:5], "screened": len(rows)}
 
 
-TF_PHRASE = {"1h": "in the last hour", "today": "today", "1w": "this week"}
+TF_PHRASE = {"1h": "in the last hour", "today": "today", "1w": "this week", "1m": "this month"}
 
 
 def _vol_phrase(rvol) -> str:

@@ -72,7 +72,7 @@ def save(dirpath: Path, inst: Instrument) -> bool:
     # this process's own temporary file: a copy started while this one still saves (the port is
     # free by then) must not write into the same one
     tmp = _file(dirpath, inst).with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(jsonutil.dumps_compact(out), encoding="utf-8")
+    tmp.write_bytes(jsonutil.dumps_compact_bytes(out))
     for wait in (0.05, 0.1, 0.2, 0.4, None):
         try:
             tmp.replace(_file(dirpath, inst))
@@ -85,6 +85,48 @@ def save(dirpath: Path, inst: Instrument) -> bool:
                 raise
             time.sleep(wait)
     return True
+
+
+DAILY_FILE = "daily.json"
+
+
+def save_daily(dirpath: Path, insts) -> int:
+    """Every instrument's daily closes (series.Daily, the 1M window's σ) in one small file, written
+    after each daily download (they change once a day: the final save at a close has none of them to
+    write). Returns the instruments written."""
+    out = {}
+    for i in insts:
+        d = i.daily
+        if not d.rows:
+            continue
+        days = sorted(d.rows)
+        out[i.key] = {"d": days, "c": [d.rows[k][0] for k in days], "q": _pack([d.rows[k][1] for k in days]),
+                      "at": d.fetched_at, "src": d.source, "own": d.own}
+    dirpath.mkdir(parents=True, exist_ok=True)
+    p = dirpath / DAILY_FILE
+    tmp = p.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(jsonutil.dumps_compact({"v": 1, "instruments": out}), encoding="utf-8")
+    tmp.replace(p)
+    return len(out)
+
+
+def load_daily(dirpath: Path, insts, now: float) -> int:
+    """The daily closes saved by save_daily, for the instruments given (by key). Returns how many."""
+    try:
+        d = jsonutil.loads((dirpath / DAILY_FILE).read_bytes())
+    except (OSError, ValueError):
+        return 0
+    saved = (d.get("instruments") or {}) if d.get("v") == 1 else {}
+    n = 0
+    for i in insts:
+        e = saved.get(i.key)
+        if not e:
+            continue
+        rows = [(k * 86400, c, NaN if q is None else q) for k, c, q in zip(e.get("d", []), e.get("c", []), e.get("q", []))]
+        i.daily.merge(rows, now)
+        i.daily.fetched_at, i.daily.source, i.daily.own = e.get("at"), e.get("src"), bool(e.get("own", True))
+        n += 1
+    return n
 
 
 TMP_MAX_AGE = 600.0

@@ -43,8 +43,8 @@ def test_rest_endpoints_and_schema(cfg, keys):
         eng = filled_engine(cfg, keys)
         async with TestClient(TestServer(make_app(eng, cfg, dashboard=True))) as c:
             r = await c.get("/api")
-            assert r.status == 200 and "/api/snapshot?tf=today|1h|1w|all" in (await r.json())["endpoints"]
-            for tf in ("1h", "today", "1w"):
+            assert r.status == 200 and "/api/snapshot?tf=today|1h|1w|1m|all" in (await r.json())["endpoints"]
+            for tf in ("1h", "today", "1w", "1m"):
                 r = await c.get(f"/api/snapshot?tf={tf}")
                 assert r.status == 200 and r.headers["Access-Control-Allow-Origin"] == "*"
                 snap = await r.json()
@@ -53,7 +53,10 @@ def test_rest_endpoints_and_schema(cfg, keys):
                 assert {n["id"] for n in snap["nodes"]} >= {"btc", "eth", "spx", "ndx", "gold", "bonds"}
             r = await c.get("/api/snapshot?tf=all")
             allv = await r.json()
-            assert set(allv["timeframes"]) == {"1h", "today", "1w"}
+            assert set(allv["timeframes"]) == {"1h", "today", "1w", "1m"}
+            month = allv["timeframes"]["1m"]
+            assert month["label"] == "1M" and month["window"]["label"] == "last 30 days"
+            assert all(n["sigma_pct"] is not None for n in month["nodes"] if n["id"] in ("btc", "spx", "gold"))
             assert (await c.get("/api/snapshot?tf=5m")).status == 400
             n = await (await c.get("/api/nodes/btc?tf=1h")).json()
             assert n["id"] == "btc" and n["source"]["symbol"] == "BTCUSDT"

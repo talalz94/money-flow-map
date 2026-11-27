@@ -759,7 +759,7 @@ def test_the_dollar_is_back_filled_from_ice_when_its_fx_legs_have_a_gap(cfg, key
     before = stats.price_at(usd, roll, wake)                  # TODAY's start: none, or the stale 16:25 value
     assert before != ice(roll)
 
-    async def chart(session, symbol, interval, rng):
+    async def chart(session, symbol, interval, rng, now=None):
         assert symbol == "DX-Y.NYB"
         step = 300 if interval == "5m" else 60
         span = 60 * 86400 if rng == "60d" else 86400
@@ -1009,7 +1009,7 @@ def test_keyless_etfs_download_60_days_when_a_gap_is_older_than_the_5_day_range(
     etf.holes["g5"] = now - 10 * 86400                                    # ...with a 10-day-old gap
     asked = []
 
-    async def chart(session, symbol, interval, rng):
+    async def chart(session, symbol, interval, rng, now=None):
         asked.append((symbol, interval, rng))
         return []
     monkeypatch.setattr(pollers, "yahoo_chart", chart)
@@ -1283,7 +1283,7 @@ def test_a_download_newer_than_the_cache_becomes_the_price(kind, cfg, keys, monk
     elif kind == "yahoo":
         eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
 
-        async def chart(session_, symbol, interval, rng):
+        async def chart(session_, symbol, interval, rng, now=None):
             return session(sat - int(rng[:-1]) * 86400, 300 if interval == "5m" else 60)
         monkeypatch.setattr(pollers, "yahoo_chart", chart)
     asyncio.run(eng.seed_history())
@@ -1309,7 +1309,7 @@ def test_a_delayed_download_is_not_carried_over_open_hours(cfg, keys, monkeypatc
     eng, _ = _gap_engine(cfg, keys, now, tmp_path)
     eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
 
-    async def chart(session_, symbol, interval, rng):
+    async def chart(session_, symbol, interval, rng, now=None):
         step = 300 if interval == "5m" else 60
         t, rows = int((now - 2 * 86400) // step) * step, []
         while t + step <= now - 900:                            # 15 minutes late
@@ -1600,6 +1600,67 @@ def test_an_etfs_time_off_downloaded_at_the_start_is_not_fetched_again(saved, no
     assert bars.calls == ["5Min", "1Min"] and "no exchange data" not in caplog.text
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_an_etf_with_no_bar_in_the_answer_is_asked_when_it_last_traded(fails, cfg, keys, monkeypatch, tmp_path, caplog):
+    """Started on Monday at 9:50 from a cache saved on Saturday: UUP's close changed every 5 minutes
+    in its history (its quiet limit: 15 minutes) but it first prints at 10:00, so the answer has no
+    bar for it over 20 open minutes, read as the venue's gap (a hole, one more download, then "no
+    exchange data"). The venue's latest trade of it (Friday) says it did not trade since: no hole, the
+    close carried (not live). Asked once, for the symbols with no session bar only; when that request
+    fails, as before."""
+    import logging
+    from conftest import ny_ts
+    from moneyflow import history
+    from moneyflow.connectors import alpaca as alp
+    from moneyflow.connectors import binance as bn
+    from moneyflow.series import G5_STEP
+    caplog.set_level(logging.INFO)
+    klines, _ = _exchange(lambda t: 600.0, fail=lambda: True)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    saved, start, opened = ny_ts(2026, 11, 21, 12, 0), ny_ts(2026, 11, 23, 9, 50), ny_ts(2026, 11, 23, 9, 30)
+    old, _ = _gap_engine(cfg, keys, saved, tmp_path)
+    k = int(saved // G5_STEP)
+    for key in [x for x in old.instruments if x.startswith("alpaca:")]:
+        old.instruments[key].seed("g5", [(j * G5_STEP, 27.0 + 0.01 * (j % 13)) for j in range(k - 3000, k)], saved)
+        history.save(tmp_path, old.instruments[key])
+    close = old.instruments["alpaca:UUP"].g5.get(k - 1)
+    eng, clk = _gap_engine(cfg, keys, start, tmp_path)
+    eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={})
+    asked = []
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        step = 300 if tf == "5Min" else 60
+        out, t = {s: [] for s in symbols}, -(-int(since) // step) * step
+        while t + step <= start:
+            if clock.market_open("us_regular", t + step - 1):
+                for s in symbols:
+                    if s != "UUP":
+                        out[s].append((t, 27.5, 1e5))
+            t += step
+        return out
+
+    async def latest(conn, symbols, feed="iex"):
+        asked.append(sorted(symbols))
+        if fails:
+            raise OSError("down")
+        return {s: ny_ts(2026, 11, 20, 15, 59) + 30 for s in symbols}
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    monkeypatch.setattr(alp, "fetch_latest_trades", latest)
+    asyncio.run(eng.seed_history())
+    uup = eng.instruments["alpaca:UUP"]
+    assert asked == [["UUP"]]
+    session = range(int(opened // G5_STEP), int(start // G5_STEP))
+    if fails:
+        assert uup.holes["g5"] == opened and all(uup.g5.get(j) != uup.g5.get(j) for j in session)
+        assert "latest trades: down" in caplog.text
+    else:
+        assert uup.holes == {"g1": None, "g5": None}
+        assert all(uup.g5.get(j) == close and not uup.g5.is_live(j) for j in session)
+    # an answer over a night or a weekend has no session bar to miss: nothing asked
+    from moneyflow import engine as engmod
+    assert not engmod._had_session(saved, ny_ts(2026, 11, 23, 9, 30)) and engmod._had_session(saved, start)
+
+
 @pytest.mark.parametrize("when", [(2026, 11, 21, 16, 45), (2026, 11, 22, 16, 45)])
 def test_without_a_key_an_etf_keeps_its_today_start_all_weekend(when, cfg, keys, monkeypatch, tmp_path):
     """On a Saturday or Sunday afternoon TODAY starts more than 23.5 hours back, where it is read from
@@ -1619,7 +1680,7 @@ def test_without_a_key_an_etf_keeps_its_today_start_all_weekend(when, cfg, keys,
     eng, _ = _gap_engine(cfg, keys, now, tmp_path)
     eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
 
-    async def chart(session_, symbol, interval, rng):           # Yahoo's ranges are trading days, and
+    async def chart(session_, symbol, interval, rng, now=None):           # Yahoo's ranges are trading days, and
         step = 300 if interval == "5m" else 60                  # its last point is a 16:00 closing print
         t, rows = int((now - (int(rng[:-1]) + 2) * 86400) // step) * step, []
         while t + step <= now:
@@ -1842,41 +1903,112 @@ def test_a_sleep_over_an_etfs_close_that_wakes_days_later_leaves_no_old_price_in
         assert stats.window_return(spy, stats.window_for(tf, t1), t1)[1] == 0.0
 
 
-def test_the_computed_dollar_keeps_its_own_steps_when_ices_history_ends_at_fridays_close(
-        cfg, keys, monkeypatch, tmp_path):
+def test_an_fx_leg_that_slept_over_fridays_close_has_an_unknown_weekend_not_its_old_price():
+    """The stale-close rule of the ETFs, for an FX leg: it quoted until the PC slept on Friday at 15:00;
+    awake on Saturday, the minutes its feed missed before the 17:00 close are a gap, and the shut hours
+    after them are unknown (not live, no gap), not the 15:00 price carried as if it were the close.
+    Its next print (Sunday at 17:00) makes its price current again."""
+    from conftest import ny_ts
+    from moneyflow.series import G1_STEP, G5_STEP, Instrument
+    leg = Instrument("finnhub:OANDA:EUR_USD", "finnhub", "OANDA:EUR_USD", "fx")
+    t0, sleep, wake = ny_ts(2026, 11, 20, 14, 0), ny_ts(2026, 11, 20, 15, 0), ny_ts(2026, 11, 21, 1, 0)
+    t = t0
+    while t <= sleep:
+        leg.on_price(1.1, t, t)
+        leg.roll(t)
+        t += 30
+    leg.roll(wake)
+    assert leg._stale_from == sleep + 60 and leg.holes == {"g1": sleep + 60, "g5": sleep + 300}
+    for g in (leg.g1, leg.g5):
+        k = int((wake - 900) // g.step)                       # Saturday 00:45: FX shut
+        assert g.get(k) != g.get(k) and not g.is_live(k)
+    assert leg.g1.get(int(sleep // G1_STEP)) == 1.1 and leg.g5.get(int(sleep // G5_STEP)) == 1.1
+    sunday = ny_ts(2026, 11, 22, 17, 0) + 5
+    leg.on_price(1.2, sunday, sunday)
+    assert leg._stale_from is None and leg.price == 1.2
+
+
+@pytest.mark.parametrize("wake_hm,one_min", [((21, 18, 0), True), ((21, 1, 0), True), ((21, 18, 0), False)])
+def test_the_computed_dollar_takes_ices_close_over_a_weekend_its_fx_legs_slept_through(
+        wake_hm, one_min, cfg, keys, monkeypatch, tmp_path):
     """The dollar is computed from six FX legs on every tick; ICE's DXY is its history. The legs quoted
-    until the PC slept on Friday at 15:00 and ICE closed 0.3% higher at 17:00; awake on Saturday at
-    18:00, the back-fill seeded ICE's bars up to 17:00 and took its close as the price, and rewrote the
-    weekend's computed steps to it: the next tick computed the price from the stale legs again, and
-    TODAY and 1H read -0.3% while FX was shut (true: 0)."""
+    until the PC slept on Friday at 15:00 and ICE closed 0.3% higher at 17:00. Awake on Saturday, the
+    legs' prices are older than the close all weekend: computed from them, the price read -0.30%
+    against ICE's close (TODAY from Friday 17:00 after a wake before Saturday 17:00; 1W and 1M all
+    weekend). In the eleventh round the back-fill took ICE's close as the price and the next tick
+    computed it from the legs again, so the weekend's steps keep their computed value since. With FX
+    shut and a leg stale the dollar's own close (ICE's) is the price, held over the shut hours, until
+    the legs print again on Sunday at 17:00 (one still stale then: the legs' formula, FX is open). Also
+    with no 1-minute bars from ICE (the 1-minute grid's newest value is then the one before the sleep,
+    older than the 5-minute grid's close)."""
     from conftest import ny_ts
     from moneyflow import stats
     from moneyflow.connectors import pollers
-    t0, sleep, wake = ny_ts(2026, 11, 20, 14, 45), ny_ts(2026, 11, 20, 15, 0), ny_ts(2026, 11, 21, 18, 0)
+    from moneyflow.series import DXY
+    t0, sleep = ny_ts(2026, 11, 20, 14, 45), ny_ts(2026, 11, 20, 15, 0)
+    d, h, m = wake_hm
+    wake = ny_ts(2026, 11, d, h, m)
     eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
     eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
     usd = eng.series["usd"].inst
     legs = list(usd.inputs)
-    _tick(eng, clk, t0, sleep, feed=lambda t: [leg.on_price(1.0 + i / 10, t, t) for i, leg in enumerate(legs)])
+
+    def quote(t, n=6):
+        if clock.market_open("fx", t):
+            for i, leg in enumerate(legs[:n]):
+                leg.on_price(1.0 + i / 10, t, t)
+    _tick(eng, clk, t0, sleep, feed=quote)
     computed = usd.price
     fx_close = ny_ts(2026, 11, 20, 17, 0)
     clk.set_fixed(wake)
     eng.tick()
+    assert all(leg._stale_from is not None for leg in legs)
 
-    async def chart(session, symbol, interval, rng):           # ICE: up to the 17:00 close, 0.3% higher
+    async def chart(session, symbol, interval, rng, now=None):           # ICE: up to the 17:00 close, 0.3% higher
         step = 300 if interval == "5m" else 60
+        if step == 60 and not one_min:
+            return []
         span = 60 * 86400 if rng == "60d" else 86400
         k0, k1 = int((fx_close - span) // step), int(fx_close // step)
         return [(k * step, computed * (1.0 + 0.003 * (k + 1 - k0) / (k1 - k0))) for k in range(k0, k1)]
     monkeypatch.setattr(pollers, "yahoo_chart", chart)
     asyncio.run(eng._backfill("wake"))
     assert eng.backfill_state["state"] == "done"
-    assert usd.price == computed                                # the price is the legs' (the next tick's)
-    for t in (wake + 60, wake + 1800):
-        _tick(eng, clk, t, t)
+    ice_close = computed * 1.003
+    assert usd.g1.get(int((wake - 600) // 60)) == pytest.approx(ice_close, rel=1e-12)   # the shut hours: ICE's close
+    for t in (wake + 60, wake + 1800, ny_ts(2026, 11, 22, 16, 55)):
+        _tick(eng, clk, clk.now() + 10, t, step=300.0)
+        assert usd.price == pytest.approx(ice_close, rel=1e-12), t
         for tf in ("today", "1h"):
-            assert stats.window_return(usd, stats.window_for(tf, t), t)[1] == 0.0, (t, tf)
-    assert usd.g1.get(int((wake - 600) // 60)) == computed     # the shut hours: the computed value
+            assert stats.window_return(usd, stats.window_for(tf, t), t)[1] == pytest.approx(0.0, abs=1e-9), (t, tf)
+    sunday = ny_ts(2026, 11, 22, 17, 0) + 5                   # FX opens; one leg has not printed yet
+    _tick(eng, clk, sunday, sunday + 60, feed=lambda t: quote(t, 5))
+    assert legs[5]._stale_from is not None and usd.price == pytest.approx(computed, rel=1e-12)
+    assert usd.price == pytest.approx(DXY.formula({n: i.price for n, i in usd.pairs.items()}), rel=1e-12)
+    _tick(eng, clk, sunday + 70, sunday + 120, feed=quote)
+    assert all(leg._stale_from is None for leg in legs) and usd.price == pytest.approx(computed, rel=1e-12)
+
+
+def test_the_dollars_close_is_never_held_across_an_open_step(cfg, keys, tmp_path):
+    """ICE's history can end before Friday's 17:00 FX close (it is 10 minutes late): the open minutes
+    after its last bar are unknown (what traded there is not known), and so is everything after them;
+    ending at the close, its close is held over the shut hours up to now."""
+    from conftest import ny_ts
+    from moneyflow.series import G1_STEP, G5_STEP
+    wake = ny_ts(2026, 11, 21, 1, 0)
+    for last_bar_end, held in ((ny_ts(2026, 11, 20, 16, 45), False), (ny_ts(2026, 11, 20, 17, 0), True)):
+        eng, _ = _gap_engine(cfg, keys, wake, tmp_path)
+        usd = eng.series["usd"].inst
+        for g, step in ((usd.g5, G5_STEP), (usd.g1, G1_STEP)):          # (both grids: one close per moment)
+            k_end = int(last_bar_end // step)
+            for k in range(k_end - 30, k_end):
+                g.put(k, 100.0 + ((k + 1) * step // 300) % 7, False)
+        close = 100.0 + (int(last_bar_end) // 300) % 7
+        n = usd.hold_close(wake)
+        k5 = int((wake - 600) // G5_STEP)
+        assert (n > 0) is held and (usd.g5.get(k5) == close) is held and (usd.g1.get(int((wake - 60) // G1_STEP)) == close) is held
+        if not held:
+            assert all(usd.g5.get(k) != usd.g5.get(k) for k in range(int(last_bar_end // G5_STEP), k5 + 1))
 
 
 def test_an_empty_answer_for_a_traded_etf_leaves_its_outage_unknown_not_flat_and_live(
@@ -2012,14 +2144,29 @@ def test_the_first_roll_after_a_start_carries_the_cached_close_over_shut_hours_o
 
 
 def test_the_final_save_writes_what_the_next_start_loads_first(cfg, keys, monkeypatch, tmp_path):
-    """A window close gives the save about 4.5 s, and on a busy PC it takes longer: the files the next
-    start reads go first (the FX legs' and Coinbase's are read only by tools/replay_flows.py). The
-    cache is saved every 10 minutes, so what a cut save leaves is at most that old."""
+    """A window close gives the save about 4.5 s, and on a busy PC it took longer: the files the next
+    start reads go first (the FX legs' and Coinbase's are read only by tools/replay_flows.py), several
+    at once (SAVE_THREADS: most of a file's time is Windows closing it). The cache is saved every 10
+    minutes, so what a cut save leaves is at most that old."""
+    import threading
+    import time
     from moneyflow import engine as engmod
     from moneyflow import history
-    order = []
-    monkeypatch.setattr(history, "save", lambda d, i: order.append(i.source) or True)
+    order, threads = [], set()
+
+    def save(d, i):
+        order.append(i.source)
+        threads.add(threading.get_ident())
+        time.sleep(0.02)
+        return True
+    monkeypatch.setattr(history, "save", save)
     eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
+    t = time.monotonic()
+    eng.save_cache()
+    assert len(order) == len(eng.instruments) and len(threads) == engmod.SAVE_THREADS == 8
+    assert time.monotonic() - t < 0.02 * len(order) / 2                 # files at once
+    order.clear()
+    monkeypatch.setattr(engmod, "SAVE_THREADS", 1)                    # the order they start in
     eng.save_cache()
     n = sum(s in engmod.HISTORY_SOURCES for s in order)
     assert 0 < n < len(order) and all(s in engmod.HISTORY_SOURCES for s in order[:n])
@@ -2273,17 +2420,23 @@ def test_an_etf_cache_from_before_format_5_is_downloaded_again_once(cfg, keys, t
             assert (b.holes["g5"] == first) is whole, (key, version)
 
 
-def test_the_alpaca_fallbacks_standby_round_is_no_successful_poll():
-    """While the stream is up the REST fallback stands by without asking: no successful poll, so no
-    `last_ok` to cover a market with. Counted as one, its round right after a wake, which can run
-    before the first tick (about 1 wake in 120 with the stream connected), covered the whole time
-    asleep: no gap, the pre-sleep price kept and flagged live (1H +0.43%, true 0). A real round counts."""
+def test_every_round_of_the_alpaca_fallback_counts_as_its_feed_heard():
+    """A round of the REST fallback is its feed heard whether it asks (the stream down in a session) or
+    stands by: the stream up, the market closed, the stream connecting or refused (406: another copy
+    holds the key's one stream). The fifteenth round counted no standby round (its round right after a
+    wake covered the time asleep: the first tick after a wake guards that now), and with the stream
+    refused or unreachable nothing told of the ETFs' feed outside a session: started then and asleep
+    over the open, the slept session was carried, not back-filled (TODAY +1.13% all Monday, true 0),
+    and on a trading day with no trade at all a back-fill ran every 67 s. What each round says shows."""
+    from conftest import ny_ts
     from moneyflow.connectors.alpaca import AlpacaFallback
     from moneyflow.series import Instrument
     stream = types.SimpleNamespace(health=types.SimpleNamespace(state="connected"), ws=object(), refused_until=0.0,
-                                   subs={"SPY": Instrument("alpaca:SPY", "alpaca", "SPY", "24/7")},
+                                   subs={"SPY": Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")},
                                    available=lambda: (True, ""))
-    fb = AlpacaFallback(ctx_for(None), {}, stream)
+    ctx = ctx_for(None)
+    ctx.clock = clock.Clock(fixed=ny_ts(2026, 11, 24, 10, 0))     # a session
+    fb = AlpacaFallback(ctx, {}, stream)
     fb.started -= 60                                         # (past its first 30 s)
     asked = []
 
@@ -2301,10 +2454,24 @@ def test_the_alpaca_fallbacks_standby_round_is_no_successful_poll():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     asyncio.run(go())
-    assert fb.health.state == "ok" and fb.health.last_ok is None and not asked
-    stream.health.state = "reconnecting"                     # the stream down: real rounds
+    assert fb.health.state == "ok" and fb.health.last_ok == ctx.clock.now() and not asked
+    assert fb.health.detail == "standby (stream connected)"              # shown (it was wiped)
+    stream.health.state, stream.ws, stream.refused_until = "reconnecting", None, ctx.clock.now() + 300   # refused
+    for at, detail in ((ny_ts(2026, 11, 21, 12, 0), "standby (US market closed)"),
+                       (ny_ts(2026, 11, 23, 8, 0), "standby (US market closed)")):
+        ctx.clock.set_fixed(at)
+        fb.health.last_ok = None
+        asyncio.run(go())
+        assert fb.health.last_ok == at and fb.health.detail == detail and not asked
+    ctx.clock.set_fixed(ny_ts(2026, 11, 24, 10, 0))
+    fb.started, stream.refused_until = ctx.clock.now() - 5, 0.0          # just started, the stream connecting
+    fb.health.last_ok = None
+    asyncio.run(go())
+    assert fb.health.last_ok is not None and fb.health.detail == "standby (stream connecting)" and not asked
+    fb.started -= 60                                         # the stream down in a session: real rounds
     asyncio.run(go())
     assert asked and fb.health.last_ok is not None and fb.health.last_msg is not None
+    assert fb.health.detail == "polling (stream down)"
     assert stream.subs["SPY"].price == 600.5
 
 
@@ -2497,3 +2664,136 @@ def test_a_cache_does_not_carry_a_close_across_an_empty_session(tmp_path):
     history.load(tmp_path, b, saved + 300)
     night = range(int(ny_ts(2026, 11, 20, 16, 0) // G5_STEP), int(opened // G5_STEP))
     assert all(b.g5.get(k) != b.g5.get(k) for k in night) and b.holes["g5"] == gap
+
+
+def test_a_one_minute_download_begins_on_a_5_minute_boundary(cfg, keys, monkeypatch, tmp_path):
+    """A quiet ETF printed at 10:01 (601, from 600) and next at 10:07. Started on Wednesday at 10:01:30,
+    the day-long 1-minute download began at Tuesday 10:02:30, inside a 5-minute step: up to its first
+    bar the carry came from the 5-minute grid's close before that step (600), so 10:02-10:06 read 600.
+    It begins at 10:00 now, and takes the 10:01 print."""
+    from conftest import ny_ts
+    from moneyflow.connectors import alpaca as alp, binance as bn
+    from moneyflow.series import G1_STEP, G5_STEP
+    start = ny_ts(2026, 11, 25, 10, 1) + 30
+    t10 = ny_ts(2026, 11, 24, 10, 0)
+
+    def price(t):                                   # the last print at or before t
+        return 600.0 if t < t10 + 60 else 601.0 if t < t10 + 420 else 602.0
+    starts = []
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        starts.append((tf, since))
+        step = 300 if tf == "5Min" else 60
+        out, t = [], -(-int(since) // step) * step
+        while t + step <= start:
+            if clock.market_open("us_regular", t + step - 1) and (tf == "5Min" or t in (t10 + 60, t10 + 420) or t > t10 + 420):
+                out.append((t, price(t + step - 1), 1e5))
+            t += step
+        return {s: list(out) for s in symbols}
+    eng, clk = _gap_engine(cfg, keys, start, tmp_path)
+    eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={},
+                                                     health=types.SimpleNamespace(last_msg=None, last_ok=None))
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    uup = eng.instruments["alpaca:UUP"]
+    assert [uup.g1.get(int((t10 + 60 * m) // G1_STEP)) for m in range(2, 7)] == [601.0] * 5
+    since1 = next(s for tf, s in starts if tf == "1Min")
+    assert since1 % G5_STEP == 0 and since1 <= start - 86400 + 60
+
+
+def test_refused_alpaca_keys_read_the_etfs_as_without_a_key(cfg, keys, monkeypatch, tmp_path):
+    """Alpaca refused the keys (HTTP 401 on its REST API, 402 at the stream's login): every start-up
+    retry and every back-fill asked again and failed, all day (32 failed requests over a morning in the
+    review's run), and a message of the stream's or the fallback's could count as the ETFs' coverage.
+    The first refusal marks the keys: the ETFs' history comes from Yahoo, as without a key, their steps
+    are carried, not covered, nothing asks Alpaca again, and the sources say why."""
+    from conftest import ny_ts
+    from moneyflow.connectors import alpaca as alp, binance as bn, pollers
+    from moneyflow.connectors.base import STANDBY, Unauthorized
+    now = ny_ts(2026, 11, 24, 10, 0)
+    eng, clk = _gap_engine(cfg, keys, now, tmp_path)
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+    eng.make_connectors()
+    asked = []
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        asked.append(tf)
+        raise Unauthorized("HTTP 401 b'{\"message\": \"unauthorized.\"}'")
+
+    async def chart(session, symbol, interval="5m", rng="60d", now=None):
+        step = {"5m": 300, "1m": 60, "1d": 86400}[interval]
+        t0 = int((now - (5 if rng == "5d" else 60) * 86400) // step) * step
+        return [(t, 80.0) for t in range(t0, int(now) - step, step) if clock.market_open("us_regular", t + step - 1)]
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    stream, rest = eng.connectors["alpaca"], eng.connectors["alpaca_rest"]
+    assert stream.auth_failed and not stream.available()[0] and "refused the keys" in stream.health.detail
+    assert asked == ["5Min"]                                            # asked once, then not again
+    hyg = eng.instruments["alpaca:HYG"]
+    assert hyg.extra["history_source"] == "Yahoo chart (Alpaca refused the keys)" and hyg.price == 80.0
+    stream.health.last_msg = rest.health.last_ok = rest.health.last_msg = now + 30   # (no coverage)
+    for t in range(int(now), int(now) + 1800, 30):
+        clk.set_fixed(t)
+        eng.tick()
+    assert hyg.holes == {"g1": None, "g5": None} and hyg._seen_ts != hyg._seen_ts
+    assert hyg.g1.get(int((now + 900) // 60)) == 80.0 and not hyg.g1.is_live(int((now + 900) // 60))
+    assert asyncio.run(rest.poll()) == STANDBY and "refused the keys" in rest.health.detail
+    assert asyncio.run(eng.seed_history(incremental=True)) is None and asked == ["5Min"]
+
+
+def test_a_401_or_403_is_the_keys_refused_and_other_errors_are_not():
+    """get_json tells a refusal of the keys (HTTP 401, 403: asking again changes nothing) from other
+    errors (a 500 is retried as before)."""
+    from moneyflow.connectors.base import Unauthorized
+
+    class Resp:
+        def __init__(self, status):
+            self.status, self.headers = status, {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def read(self):
+            return b'{"message": "no"}'
+    status = {"v": 401}
+    session = types.SimpleNamespace(get=lambda url, params=None, headers=None, timeout=None: Resp(status["v"]))
+    p = PollConnector(ctx_for(session), {})
+    for code, refused in ((401, True), (403, True), (500, False), (404, False)):
+        status["v"] = code
+        with pytest.raises(RuntimeError) as e:
+            asyncio.run(p.get_json("https://example.invalid/x"))
+        assert isinstance(e.value, Unauthorized) is refused and f"HTTP {code}" in str(e.value)
+
+
+def test_a_rounds_text_goes_when_the_next_round_starts():
+    """What a round says of itself stays until the next round starts: a rate limit's "waiting" text
+    went away with the next good round (it stayed, the source shown as waiting after it recovered)."""
+    from moneyflow.connectors.base import RateLimited
+    p = PollConnector(ctx_for(None), {})
+    rounds = []
+
+    async def poll():
+        rounds.append(1)
+        if len(rounds) == 1:
+            raise RateLimited("x", 300.0)
+
+    async def fast(seconds):
+        await asyncio.sleep(0.01)
+    p.poll, p.sleep = poll, fast
+
+    async def go():
+        task = asyncio.create_task(p.run())
+        while len(rounds) < 3:
+            await asyncio.sleep(0.005)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(go())
+    assert p.health.state == "ok" and p.health.detail == "" and p.health.last_error.startswith("poll")

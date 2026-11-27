@@ -47,9 +47,9 @@ refresh is fine; the 5 minutes are there for that. Stopping is clean: the feeds 
 freed, the history cache is saved, open dashboard tabs and apps are told the service is going away,
 and the process exits, within 2 s of Ctrl+C with a tab or an app connected (the port is free
 during the save, so `start.bat` works again at once; a second Ctrl+C meanwhile waits for the save).
-Closing the window saves the cache first, then Windows ends the process (about a second after the
-close; Windows allows about 4.5 s, so on a busy PC a longer save is cut short: see section 9).
-Logging off or shutting Windows down ends it without that last save. The log says why ("no dashboard
+Closing the window, logging off or shutting Windows down saves the cache first, then Windows ends
+the process (Windows allows a closing window about 4.5 s; the save takes about half a second, and
+1-1.5 s with every core busy: see section 9). The log says why ("no dashboard
 tab or app connected for 5 minutes: stopping"). Nothing restarts it: there is no scheduled task, startup
 entry, service or watchdog. Start it again with `start.bat` when you want it.
 
@@ -99,7 +99,7 @@ Windows. Everything is in `requirements.txt`.
 | **Curved edge with moving dots** | An **inferred** flow from an outflow asset to an inflow asset in the same window. Thicker means stronger. Hover over an asset to see its arrows, or, if it has none, why not (for example "it moved −0.4σ, inside ±0.5σ, too small to count"). |
 | **Notable stock** (right of the map) | The large-cap US stock whose move is most unusual in the window, with why it was picked (section 3.8). It changes with the window and the moment; when no stock clears the threshold the spot shows "none stands out now". |
 | **The Fed** (centre) | Days to the next FOMC rate decision. |
-| **1H / TODAY / 1W** | The window: the last 60 minutes; since **17:00 New York** yesterday (the global trading-day roll, i.e. the US close); the last 7 days. |
+| **1H / TODAY / 1W / 1M** | The window: the last 60 minutes; since **17:00 New York** yesterday (the global trading-day roll, i.e. the US close); the last 7 days; the last 30 days (section 3.9). |
 | **Risk-on / risk-off meter** | A −100…+100 composite of documented components (section 3). |
 | **FEAR · VIX** | The VIX level. It is licensed and **15 minutes delayed**, and is labelled so. Beside it is a live 24/7 proxy, the UVXY perpetual. |
 | **DOLLAR · DXY** | The ICE Dollar Index formula, computed live from six FX pairs. |
@@ -150,6 +150,7 @@ of window, on the days its market trades**:
 | 1H | **Same clock hour**: RMS of the 60-minute moves ending within 30 minutes of this clock time on each of the previous 20 trading days (10 days for crypto), grouped by day. The pre-market hour is judged against past pre-market hours, the opening hour against past opening hours. An hour belongs to the session of its midpoint: at 17:00 the hour 16:00-17:00 is Friday's closing hour, not Saturday's. Only hours when the market was open count. Fallback (fewer than 30 such moves, e.g. a recent listing): every 60-minute move of the last 10 days. |
 | TODAY | **Same-clock σ**: RMS, over the previous 20 trading days (30 days for crypto), of the move from that day's 17:00 New York roll to the *same clock time*. At 10:00 New York it compares with 10:00 on previous days, so overnight gaps and intraday volatility patterns are handled for every asset class. In the first hour after the roll, the yardstick is the typical move of that first hour; otherwise right after 17:00 every past window would be shorter than one 5-minute step and σ would read 0. In the first 5 minutes of a session, a past day's move is read from that day's opening 5-minute step (the step before it holds the previous close: σ read 0 and z was missing until 9:35, for every ETF); 1W's start the same way. Fallback (fewer than 8 such days, e.g. a recent listing): daily realized variance from 5-minute returns, scaled to the elapsed part of the day. |
 | 1W | RMS of the daily (roll-to-roll) moves on the trading days of the last 30 days, × √k, where k is the number of trading sessions in the window: 5 in a normal week, 4 in Thanksgiving week (z would otherwise be 11% too small), 7 for crypto. Sessions cut by the window's ends count by the share of their 24 hours inside. |
+| 1M | RMS of the daily moves of about the last year (daily closes, section 3.9), × √k, k the trading sessions in the 30 days: 30 for crypto, 22 on weekdays, 19.7-22 for NYSE days. Fallback (fewer than 30 daily moves: a recent listing, the stablecoin share): the last 30 days' roll-to-roll moves × √k, as 1W. |
 
 - **Trading days only.** Each series has a `calendar`:
   - `all`: crypto and the stablecoin share, every day;
@@ -171,7 +172,7 @@ of window, on the days its market trades**:
 - **No information is not a zero move:** a market that was **shut for the whole window** gets a missing z. HYG at 3 a.m. has no "1H" move.
 
 ### 3.3 Volume confirmation (where volume exists)
-- **Relative volume:** volume in the window ÷ the median volume of the same window on the previous 20 trading days. For 1W it is the previous 4 weeks.
+- **Relative volume:** volume in the window ÷ the median volume of the same window on the previous 20 trading days. For 1W it is the previous 4 weeks; for 1M the year's earlier 30-day stretches, from daily bars (section 3.9).
 - **Net taker flow (USD):** taker-buy quote volume − taker-sell quote volume, from Binance 1-minute klines. It shows how much aggressive buying versus selling hit the book.
 - **IEX volume** (Alpaca) is a *sample*, about 2-3% of US volume, so only relative volume is used from it.
 
@@ -254,7 +255,7 @@ These are deterministic rules in `narrative.py`; each bullet carries its rule id
 The fixed nodes are asset classes. A single stock is not one: on the reference map "Anthropic" was
 simply the stock that stood out at that moment. So one slot (`[stocks] slots`, 0 to 5) shows **the
 large-cap stock whose move is most unusual in the window**, and only when one clears the rule. It
-can be a different stock in 1H, TODAY and 1W, and it can be empty.
+can be a different stock in 1H, TODAY, 1W and 1M (section 3.9), and it can be empty.
 
 - **Universe.** The configured large caps (138 S&P 100 and Nasdaq-100 names plus big ADRs, editable
   in `[stocks] universe`) that have a Binance 24/7 TradFi perpetual: **78 of them** on 25 Nov 2026.
@@ -277,11 +278,12 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
     r     = ln(price now / price at the window start)
     σ     = the map's own estimator (section 3.2) on hourly bars, over the previous 20 NYSE trading
             days: 1H the same clock hour; TODAY the same time since 17:00 New York; 1W the daily
-            moves of the last 30 days × √(sessions in the window). A one-off day is capped.
+            moves of the last 30 days × √(sessions in the window); 1M the same daily moves ×
+            √(sessions in the 30 days). A one-off day is capped.
             Read the way the node reads it at this minute: for each of the node's window ends
             (now ± 30 min for 1H), the variance is interpolated between the whole hours either side.
     z     = r / σ
-    rvol  = the window's quote volume / the median of the same on previous trading days
+    rvol  = the window's quote volume / the median of the same on previous trading days (1M: none)
     score = |z| · √clip(rvol, 0.5, 4)      (unusual volume strengthens a move, thin volume weakens it)
     ```
   - **Rule:** a stock qualifies with **|z| ≥ 2 and score ≥ 2.5**; the highest scores fill the slots.
@@ -334,6 +336,71 @@ can be a different stock in 1H, TODAY and 1W, and it can be empty.
     after a 12.4% fall in Tuesday's session (Alpaca), an arrow into bonds, the dollar and stablecoins;
   - 1H: **WMT** (−3.0σ for that pre-market hour, 6.7× volume);
   - 1W: none (best: ZS +18% but only +1.4σ, its weekly swings being large).
+
+### 3.9 The monthly view (1M)
+**1M is the last 30 days, rolling:** the move from the price 30 days back (the 5-minute grid holds
+35 days) to the live price, like 1W's over 7 days.
+
+**Its σ comes from a year of daily closes.** From 35 days of 5-minute closes a month's yardstick
+would rest on about 20 daily moves (an ETF's), a month of samples for a month's move. So each
+instrument also keeps about a year of daily closes (`series.Daily`, complete days only), and σ_1M is
+the robust RMS of their daily moves (one one-off day capped, as everywhere) × √k, where k is the
+number of trading sessions in the 30 days: 30 for crypto, 22 on weekdays, 19.7 to 22 for NYSE days
+(holidays left out; sessions cut by the window's ends count by their share), the same rule as 1W's
+√5. With fewer than 30 daily moves (a recent listing; the stablecoin share, which has no daily
+source) it falls back to the last 30 days' roll-to-roll moves from the 5-minute grid × √k, as 1W.
+
+| Node | Daily closes from |
+|---|---|
+| Bitcoin, Ether, the basket coins | Binance spot, 1-day klines (with their volume) |
+| Gold, silver, oil, copper | the futures on Yahoo (GC=F, SI=F, CL=F, HG=F): the perpetuals were listed in 2025-26, so they have only months of their own (gold since 10 Dec 2025, oil since 31 Mar 2026), and Binance has no copper pair |
+| Nasdaq-100, S&P 500, the VIX proxy | QQQ, SPY, UVXY: Alpaca's daily bars with a key, Yahoo's without (the SPY and QQQ perpetuals have their own since 3 Apr 2026, UVXY's since 11 Jun 2026) |
+| Bonds, HYG, IEF, the reference ETFs | the ETF itself (TLT for the bonds node), from Alpaca or Yahoo |
+| The dollar | ICE's DXY (Yahoo DX-Y.NYB), its history as for the other windows |
+| A picked stock | its ticker's daily bars (Alpaca) |
+
+- **Light.** One small request per instrument 20 s after the start (the 5-minute history goes
+  first; all ETFs in one Alpaca request), then a check every 30 minutes that downloads again only
+  what is about a day old (20 hours), from three days before its newest close. No extra streams.
+  They are kept in one file, `data/cache/daily.json` (95 KB in a keyless run), written after each
+  download, so a restart downloads nothing new and the final save has none of it to write.
+- **Measured on real data** (27 Nov 2026, keyless: Binance, Yahoo): σ_1M against the RMS of the
+  year's actual 30-day moves, from the same daily closes:
+
+  | | σ_1M | RMS of the 30-day moves | yearly volatility |
+  |---|---|---|---|
+  | S&P 500 (SPY) | 4.41% | 3.97% | 14.9% |
+  | Nasdaq-100 (QQQ) | 6.98% | 6.50% | 23.3% |
+  | Bitcoin | 13.52% | 15.61% | 44.2% |
+  | Ether | 18.93% | 22.02% | 60.5% |
+  | Dollar (ICE DXY) | 1.56% | 1.56% | 5.2% |
+  | Gold (GC=F) | 9.01% | 7.71% | 29.1% |
+  | Silver (SI=F) | 19.44% | 17.34% | 69.7% |
+  | Oil (CL=F) | 18.67% | 18.72% | 57.8% |
+  | Bonds (TLT) | 2.94% | 2.65% | 10.0% |
+  | HYG / IEF | 1.26% / 1.58% | 1.13% / 1.48% | 4.3% / 5.4% |
+  | VIX proxy (UVXY) | 33.14% | 22.94% | 99.0% |
+
+  σ_1M came within 12% of the actual 30-day moves for the indices, the bonds, the dollar, silver
+  and oil; it ran 17% above them for gold, 13-14% below for Bitcoin and Ether (trending months), and
+  44% above for UVXY (it decays and swings back). A year holds only 12 separate months, so the
+  right-hand column is rough itself.
+- **Volume:** the last 30 complete days against the median of the year's earlier 30-day stretches,
+  from the daily bars, and only where they are the instrument's own (the S&P 500 perpetual's are
+  SPY's, another market's volume: no ratio). The taker split comes from the 5-minute volume.
+- **The notable stock:** screened on its 31 days of hourly bars: the move from 30 days back, σ the
+  daily moves of those bars × √k as above (fewer than 10: none), and no volume ratio (no earlier
+  month in the bars). A stock the map reads is ranked on the node's own numbers, as in every window.
+- **What the flow says** speaks of "this month", and quotes the stablecoin supply's change over
+  30 days.
+- **The risk meter and an asset without arrows** follow the same rules as in the other windows, on
+  the 1M moves and z's: same components and weights, the same ±0.5σ threshold for an arrow, and a
+  market shut for the whole window has no move (none is, over 30 days).
+- **Cost:** a fourth window in every snapshot. With caches as in use (σ worked out every 5 minutes
+  for 1M, its volume every 10), a snapshot a second took 5 ms instead of 4 as a median (9 ms
+  instead of 8 on average); one with every cache cold, 0.20-0.31 s instead of 0.17-0.18 s.
+- **API:** `tf=1m` wherever a window is taken (`/api/snapshot?tf=1m`, `/ws`, `/sse`, `tf=all`
+  gives all four), and the JSON schema lists it.
 
 ---
 
@@ -397,11 +464,18 @@ Latency is **receive time − the exchange's own timestamp**, measured on this P
 Pakistan) with the clock corrected by NTP. Measured on 24 Nov 2026; marketing claims were not used.
 > The PC clock ran **0.95-0.99 s fast**. Uncorrected, every source would look about 1 s slower.
 > The service measures this offset itself (SNTP) and corrects all ages. It asks four servers and
-> uses a reply only from a synchronised server answering its own request, with a correction over a
-> day only where another server agrees (a PC clock days off is corrected; a lone reply 1024 weeks off
-> is not); of the replies that agree (within 0.5 s of their median), the shortest round trip wins. A
+> uses a reply only from a synchronised server answering its own request. Replies within a day win
+> over any that correct by more; a correction over a day counts only when no reply is within a day,
+> and then only where another server agrees (a PC clock days off is corrected; a lone reply 1024
+> weeks off is not, nor two that agree on it beside a good one). Of the replies that agree (within
+> 0.5 s of their median), the shortest round trip wins. Every reply from one box that intercepts NTP
+> (all of them days off and agreeing) cannot be told from a PC clock days off, and is followed. A
 > server's "kiss-of-death" (zero timestamps, when many copies start at once) once set the clock 127
-> years back; a failed or doubtful sync now leaves the offset in use.
+> years back; a failed or doubtful sync now leaves the offset in use. The downloads leave out a bar
+> still open by this corrected clock, not by the PC's own (two days behind, they dropped the last two
+> days of closed bars as open; ahead, they kept an open one), and so does the stablecoin supply's
+> 60-day cut. The clock's helpers that format or convert a time take one out of range (not a
+> number, before 1970, after 3000) as the nearest end instead of raising.
 
 | Source (what is used) | Median | p90 | Rate | Notes |
 |---|---|---|---|---|
@@ -541,7 +615,7 @@ The service listens on `http://127.0.0.1:8765` (localhost only). Everything is r
 
 | Endpoint | Returns |
 |---|---|
-| `GET /api/snapshot?tf=today` | Everything for one window (`1h`, `today`, `1w`), or `tf=all` for all three |
+| `GET /api/snapshot?tf=today` | Everything for one window (`1h`, `today`, `1w`, `1m`), or `tf=all` for all four |
 | `GET /api/nodes?tf=1h` · `/api/nodes/{id}` | Assets (`bonds usd gold silver oil ndx spx btc eth stables`, plus `stock1` when a stock is picked; aux: `vix_proxy hyg ief`) |
 | `GET /api/edges?tf=` · `/api/risk?tf=` · `/api/narrative?tf=` · `/api/tiles?tf=` | Parts of the read |
 | `GET /api/history/{id}?grid=5m&hours=24` | Stored closes of one series (5m: 35 days, 1m: 1 day), each `[step end time, close, market open 1/0]`, for drawing your own charts. `stock1` gives the stock now in that slot (`&tf=` picks the window, default `today`) |
@@ -640,7 +714,7 @@ external requests** (no CDNs, no web fonts).
 - On a **phone** the map re-flows into two columns with shorter labels and compact badges. The legend moves below the map.
 - The news wire shows headlines immediately and loops seamlessly. New headlines join at the end of a loop, so it never jumps back.
 - The hover card also shows:
-  - the move and σ in all three windows, and the typical 1σ move;
+  - the move and σ in all four windows, and the typical 1σ move;
   - relative volume and net taker flow;
   - funding and open interest;
   - the reference quotes with their basis;
@@ -735,12 +809,17 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     down is **empty**: no price, not live. It is never the last price carried forward as if it
     traded, which made σ too low and the history differ from the exchange (the 25 Nov night).
     Computed series (the dollar, bonds, the stablecoin share) are live only where their inputs are.
-  - The Alpaca REST fallback standing by while the stream is up asks nothing, so it is no heartbeat;
-    and the first tick after a sleep takes nothing heard since the wake as covering the time asleep.
-    After a wake every overdue timer fires at once, and when the fallback's round came first (in
-    about 1 of 100 to 120 simulated wakes with the stream up, the review found) the whole time asleep
-    counted as covered: an ETF that had traded held its pre-sleep price there, flagged live, with no
-    gap (1H +0.43% where the truth was 0; after a night asleep, TODAY +0.61% the next morning).
+  - The first tick after a sleep takes nothing heard since the wake as covering the time asleep.
+    After a wake every overdue timer fires at once, and when the Alpaca REST fallback's round came
+    first (in about 1 of 100 to 120 simulated wakes with the stream up, the review found) the whole
+    time asleep counted as covered: an ETF that had traded held its pre-sleep price there, flagged
+    live, with no gap (1H +0.43% where the truth was 0; after a night asleep, TODAY +0.61% the next
+    morning). Every round of the fallback counts as the ETFs' feed heard, standing by or asking (the
+    stream up, the market shut, the stream connecting or refused): the fifteenth round counted no
+    standby round, and with the stream refused (406: another copy holds the key's one stream) or
+    unreachable nothing then told of the feed outside a session. Started then and asleep over the
+    open, the slept session was carried, not back-filled; and a trading day with no trade at all
+    (an unscheduled closure, IEX silent) ran a back-fill about every 67 s.
   - That holds before an ETF's first trade of the run too, once its feed has reported (any message:
     the stream's login counts). Started on a weekend or before the open, with the PC then asleep (or
     the network down) over one or more sessions, an ETF had those sessions carried from the cache's
@@ -766,7 +845,15 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     under `/api/health` (`backfill`).
   - It downloads only the instruments with gaps, each from its own gap (after a sleep of many
     hours, from its newest value, not 35 days back). The dollar's six FX legs have no history of
-    their own, so a gap in them re-downloads the dollar from ICE's DXY (Yahoo). An attempt that got
+    their own, so a gap in them re-downloads the dollar from ICE's DXY (Yahoo). The stale-close rule
+    above holds for every market with shut hours, the FX legs too: one that slept over Friday's
+    17:00 close holds an older price than the close all weekend, so its shut steps after the gap are
+    unknown. While FX is shut and a leg is stale, the dollar's price is its own close (ICE's, once
+    downloaded), held over the shut hours, instead of the formula on the legs' stale prices, until
+    they print again on Sunday at 17:00. In the review's case (the legs stale from Friday 15:00, ICE
+    0.3% higher at the close) the price read -0.30% against ICE's all weekend: TODAY -0.30% after a
+    wake on Saturday at 1:00 (true 0), and 1W and 1M 0.30% off whenever the wake; now 0.00% and ICE's
+    close. An attempt that got
     nothing does no more work; one that did rebuilds only the computed series it fed, each from its
     inputs' gap, and writes the cache off the event loop (each attempt used to stall the app for a
     second or more).
@@ -804,7 +891,17 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     20; VIXY 30; IEF 40; USO 50; UUP 210 (it often prints nothing on IEX for 50 minutes after the
     open). So an answer without SPY over a 30-minute outage (the review's case) is taken for the
     venue's gap: those minutes stay unknown and are fetched again (then given up as "no exchange
-    data"), not filled with the last price as if nothing had traded. A thin ETF's first trade after
+    data"), not filled with the last price as if nothing had traded. Unless the venue says otherwise:
+    for an ETF with no session bar in an answer that spans session time, Alpaca's latest trade of
+    it is asked (one request for all such ETFs, with a key; none at night or on a weekend), and a
+    stretch from after that trade had no trade, whatever its length. An ETF whose close changed
+    every 5 minutes lately (a limit of 15 minutes) and that first prints at 10:00 got a hole for
+    9:30-9:50 at a 9:50 start, one more download and "no exchange data"; in the review's runs (5
+    thin ETFs; starts at 9:50 on a Monday and the Friday after Thanksgiving, and 10:30 with the first
+    print at 10:45) each had 25 to 65 unknown 1-minute steps since 9:30, now none, with 3 requests
+    instead of 4. SPY missing from an answer while the venue's latest trade of it is recent is still
+    the venue's gap. Other symbols' bars in the same answer were considered as the signal, but they
+    cannot tell a thin ETF that did not trade from a liquid one whose bars the venue lost. A thin ETF's first trade after
     9:30 left a gap (fetched again, then given up), also with the start before that trade; a cache
     saved on a Saturday left the weekend empty until Monday's first bar, and with no bar at all
     since, the time off stayed empty (every ETF's TODAY unknown all day). A cache can hold such an
@@ -812,7 +909,11 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   - A back-fill's 1-minute download is one day long; the 5-minute one reaches back to the gap. So
     after a download the 1-minute grid's shut hours before its first bar take the 5-minute grid's
     close: after a wake in a session a day or more after an ETF's close (a weekend, a holiday) they
-    kept the pre-sleep price, and TODAY read the move to the close slept over all session.
+    kept the pre-sleep price, and TODAY read the move to the close slept over all session. The
+    1-minute download begins on a 5-minute boundary: begun inside a 5-minute step (a day before a
+    start at 10:01:30, so at 10:02:30), its carry up to the first bar came from the 5-minute grid's
+    close before that step, and a quiet ETF's print in the step's first minutes was missed (10:02 to
+    10:06 read the 10:00 price, not the 10:01 print).
   - Empty steps in the cache (a past outage) are downloaded at the next start. A cache written
     before this fix (format version 1) can hold a sleep's flat stretch flagged live, so its whole
     range is downloaded again once. So is an ETF's cache of format 4 or older: it can hold sessions
@@ -836,6 +937,15 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 - **No network at start-up:** history is retried every 1 min (then 2, 4 … up to 15 min) until every instrument has it.
 - **Another app holds Alpaca's single stream:** the free plan allows one, and Alpaca refuses the second with code 406. The service waits 5 min between retries and meanwhile polls the latest IEX trades over REST every 20 s.
   - It waits for Alpaca's login answer before subscribing, so a refusal is never mistaken for bad keys.
+  - The fallback's status says what it is doing ("standby (stream connected)", "standby (US market
+    closed)", "polling (stream down)"); it was cleared right after each round, so the sources panel
+    showed nothing.
+- **Alpaca refuses the keys** (HTTP 401 or 403 from its REST API, 402 at the stream's login): the
+  first refusal marks them, and from then on the ETFs are read as without a key: history from
+  Yahoo, their steps carried, not covered by the stream's or the fallback's messages (an error
+  message used to count as coverage), and nothing asks Alpaca again (every start-up retry and
+  back-fill asked and failed, 32 requests over a morning in the review's run). The sources panel
+  says why ("Alpaca refused the keys: ETFs are read without a key (Yahoo history, no live prints)").
   - Tested live: the bonds node stayed **live** through the REST fallback, at a data age of about 20 s.
 - **Finnhub also allows one stream per key.** A second copy of this service, or another app using the same key, takes the slot, and Finnhub refuses the first with HTTP 429 (seen live on 24 Nov 2026).
   - Any websocket refused with 429 waits at least 2 minutes before retrying instead of hammering, and its status says why.
@@ -843,8 +953,10 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 - **Closing the window or Ctrl+C / Ctrl+Break:** a graceful stop that saves the history cache. Tested: exit code 0 in 1.2 s, cache written.
   - The feeds stop first, then the port is freed, then the cache is saved (the log says how long it
     took), and then open dashboard tabs and SSE apps are closed ("going away") and the server shuts
-    down. The save is the stop's slow part: about a second, 4-13 s on a busy PC. It takes half the time
-    or less now (no rounding of every value, a slice of each ring buffer, `orjson` when installed).
+    down. The save is the stop's slow part: about half a second, 1-1.5 s with every core busy, since
+    it writes 8 files at once (one at a time it took about a second, and 4-13 s on a busy PC in the
+    reviews' runs; earlier it took twice that: no rounding of every value now, a slice of each ring
+    buffer, `orjson` when installed).
   - Measured with the real `serve()` (33 instruments) and a tab or an SSE app connected: the save
     starts at once and the process ends 0.5-1.6 s after Ctrl+C. Before, the save waited for the
     open streams (41 s for a tab, 122 s for an SSE app, the process lingering as long), and a second
@@ -867,13 +979,27 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     then ends normally (the log file has every line); it used to end in "Fatal Python error" once the
     selection ended. The log file also says when a window close started the stop ("the console
     window is closing: saving the history cache first...").
-  - **The limit:** Windows ends the process about 4.5 s after the close, saved or not. On a busy PC
-    the save can take longer (the review measured 7-8 s with the PC loaded); it writes the files the
-    next start reads first, and those it does not reach keep their last save (every 10 minutes): the
-    next start downloads the rest. Each file is written whole or not at all.
-  - **Logging off or shutting Windows down** is not covered: Windows does not call the handler in
-    this process then (`user32.dll` is loaded by its imports), so those end it without the final
-    save, as before. The cache then holds the last periodic save.
+  - **The limit:** Windows ends the process about 4.5 s after the close, saved or not. Most of a
+    save's time went into closing each file (Windows scans a file written to as it is closed: 1.1 of
+    a save's 1.7 s), one file at a time, so the final save now writes 8 at once. Measured on an
+    engine with every instrument's grids full (33 instruments, 12.1 MB), 5 saves each: 1.34-1.40 s
+    before, 0.43-0.53 s now; with every core busy (8 processes spinning), 4.12-4.74 s before and
+    0.94-1.52 s now. It still starts the files the next start reads first, and those a cut save
+    does not reach keep their last save (every 10 minutes). Each file is written whole or not at
+    all. The saves every 10 minutes stay one file at a time, in a worker thread: nothing waits for them.
+  - **Logging off or shutting Windows down** ended it without the final save: Windows does not call
+    the console handler in this process then (`user32.dll` is loaded by its imports, so it counts
+    as a windowed program), and such a program hears of a session's end as window messages. A
+    hidden window of its own, on a thread of its own, now gets them: `WM_QUERYENDSESSION` (may the
+    session end?) is answered yes and changes nothing, since another program can still cancel it;
+    `WM_ENDSESSION` (it ends: Windows ends the process once the message returns) starts the stop,
+    which saves the cache first, and returns once it is saved, giving "Saving the history cache" as
+    the reason Windows shows if that takes long (30 s at most). Tested on the real app (keyless, 23
+    instruments) by sending its windows the messages Windows sends at a logoff, then ending the
+    process as Windows does: 23 of 23 files saved before the message returned, 0.13 s after it was
+    sent (0.94 s with every core busy); the log says "Windows is ending the session (logoff or
+    shutdown): saving the history cache first...". Before, the process had no window of its own to
+    tell: nothing was saved.
 - **History** is saved to `data/cache/` every 10 minutes, after each download and on exit. The files
   are written in a worker thread, from the list of instruments taken on the event loop (which picks
   and drops stocks meanwhile: reading its live list from the thread failed), one save at a time. An
@@ -922,7 +1048,13 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     roll carried of it; the first five minutes of a session; a refused replace retried and stale
     temporary files removed; and (`tests/test_idle.py`) the stop with a tab and an SSE app connected
     (the port free during the save, the save first and at once, the streams told to go away) and
-    the console-close handler saving first.
+    the console-close handler saving first;
+  - a logoff or a shutdown (the hidden window: a query changes nothing, a cancelled end nothing, the
+    end returns only once the cache is saved, through the real `serve()` too); the final save's
+    files written several at once, in the order the next start reads them; refused Alpaca keys (one
+    request, then the ETFs as without a key); the downloads' bars closed by the corrected clock; an
+    FX leg's unknown weekend after a gap over Friday's close and the dollar on ICE's close over it;
+    the venue's latest trade for an answer without a bar (and none asked over a night).
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -952,7 +1084,8 @@ down for 2.5 minutes after waking:
 A real network cut needs admin rights and would cut your own connection, so the DNS outage was
 simulated inside the test copy. The websocket drops it causes are covered by the drop and silence
 tests and by the Finnhub relay test (section 10).
-Closing the console window was tested too (above): the cache is saved first.
+Closing the console window was tested too (above): the cache is saved first. So is a logoff or a
+shutdown.
 
 ---
 
@@ -969,7 +1102,7 @@ python -m pytest              # unit, API, reconnect and offline-replay tests (n
   - σ estimators on exact synthetic series: trading days only (a quiet weekend or Thanksgiving does not shrink an index's σ), the same clock hour (a quiet pre-open hour is not judged by the opening hour), an hour belonging to the session of its midpoint, √(sessions in the window) for 1W (4 in Thanksgiving week), one one-off day capped through the real 1H, TODAY and 1W estimators (and as one day even when all five 1H windows see it), and the stock screen and the node giving the same σ;
   - every stream connector's **real** reconnect loop through a session that ends and one that fails, no connector attribute hiding a method of its class, and a crashed connector being logged and restarted (`tests/test_reconnect.py`);
   - edge weights (including series built from each other), which edges are kept, the plain-language reason for every asset without an arrow, and the risk composite;
-  - **every node, gold and the stock slot included, as the strongest outflow and the strongest inflow, in all three windows**, through the real engine (`tests/test_every_node.py`: 66 forced cases);
+  - **every node, gold and the stock slot included, as the strongest outflow and the strongest inflow, in all four windows**, through the real engine (`tests/test_every_node.py`: 88 forced cases);
   - auto-stop: the idle timer (a tab connects, disconnects, a refresh within the delay, two viewers, API polling, a webhook delivery, the opt-out, never opened), and the real `serve()` stopping by itself and freeing its port, or staying up while an app streams (`tests/test_idle.py`);
   - the notable-stock screen on exact synthetic hourly bars (σ, volume ratio, score, the rule, "may be none"), index prices rather than last trades, 5-minute start prices after a start, a stock the map reads ranked on the map's own numbers, "eased" only when the move itself faded (and held until the next screen), the universe filter, and the slot as a full node (snapshot, schema, narrative, history id);
   - narrative rules (including the reference screenshot's read);
@@ -1589,6 +1722,54 @@ lifecycle harness, on the code before this round (9281ec2) and now:
   changed the code) and this round's. The one left is the twelfth round's equivalent one. One of
   this round's got through at first (a session print's making the price current again after a missed
   minute): a test now covers it.
+
+**Sixteenth round (27 Nov 2026): the monthly view, and the items left open.** A fourth window, 1M
+(section 3.9), and the open items of the earlier rounds. Checked on the real app (keyless, a data
+folder and port of its own: the logoff), the review's reproductions (offline: the real engine, only
+the network stubbed), benchmarks and tests, on the code before this round (86bcc62) and now:
+
+| | Before | Now |
+|---|---|---|
+| **A logoff or a shutdown** (the messages Windows sends, to the real app's windows; then the process ended as Windows does) | no window of its own to be told: nothing saved (the cache as of its last periodic save) | 23 of 23 files saved before `WM_ENDSESSION` returned, 0.13 s after it was sent (0.94 s with every core busy) |
+| **The final save** (33 instruments, 12.1 MB, 5 saves each; a closing window gets about 4.5 s) | 1.34-1.40 s; 4.12-4.74 s with every core busy | 0.43-0.53 s; 0.94-1.52 s |
+| **The computed dollar after a weekend its FX legs slept through** (stale from Friday 15:00, ICE 0.3% higher at the 17:00 close) | the price 0.30% under ICE's close until Sunday 17:00: TODAY -0.30% after a wake on Saturday at 1:00 (true 0), 1W and 1M 0.30% off after any weekend wake | ICE's close, held: 0.00% |
+| **A quiet ETF opening with the start after it** (the review's 5 thin ETFs, which printed every minute before; first print at 10:00 or 10:45; starts at 9:50 on a Monday and on the Friday after Thanksgiving, and at 10:30) | a hole each, 4 requests, "no exchange data" 5 times, 25-65 unknown 1-minute steps since 9:30 each (UUP's 1H chart 25 and 35 of 61 points blank) | no hole, 3 requests (one for the venue's latest trades), none unknown |
+| **Refused Alpaca keys** (HTTP 401) | every start-up retry and back-fill asked again (32 failed requests from 8:00 to 12:00 New York in the review's run); the stream's and the fallback's messages could count as the ETFs' coverage | asked once; the ETFs read as without a key (Yahoo history, carried, not covered); the sources panel says why |
+| **The PC clock 2 days behind** (the NTP correction +2 days) | Binance's, Hyperliquid's and Yahoo's downloads dropped the last 2 days of closed bars as still open | kept |
+| **A start at 10:01:30, a quiet ETF printing at 10:01** | the 1-minute download began at 10:02:30: 10:02 unknown, 10:03-10:06 the 10:00 price (600) | from 10:00: 601 |
+| **The Alpaca fallback's status while the stream is up** | blank (cleared after each round) | "standby (stream connected)" |
+| **A clock helper given a time out of range** (not a number, before 1970, after 3000) | raised (OSError 22) | the nearest end |
+| **The Alpaca stream refused (406: another copy holds the key's one stream), started outside a session, asleep over the open** (the review's runs: before Monday's open; Thanksgiving to Monday; a weekend) | no feed signal (the fifteenth round's standby rule): the slept session carried, not back-filled: 90 + 18, 42 and 120 + 78 steps wrong; after Thanksgiving and the weekend TODAY read HYG +0.73% and +0.6%, bonds +0.63% and +0.5% (true 0), the risk score 99 instead of 0 | back-filled: every step right, TODAY 0.00%, risk 0 |
+| **The same through the real fallback loop** (the review's other harness: refused and asleep over Monday's open; over Thanksgiving to Monday) | 60 + 12 wrong steps per ETF, no download after the wake, 9 wrong reads; Friday's 42 steps wrong, TODAY HYG +0.60% and UUP +0.50% (true 0), 15 wrong reads | all right, 0 wrong reads |
+| **A trading day on which nothing trades** (an unscheduled closure, IEX silent; the review's run from 9:00) | a back-fill about every 67 s: 135 by noon, with 270 Alpaca requests and 135 full cache saves | none |
+| **NTP: two servers that agree 1024 weeks off, beside one or two good ones** | the clock 19.6 years back (-619,315,200 s) with one good server; with two, no offset (they disagree) | the good server's (+0.02 s); 30 hours behind with all four agreeing still corrected |
+
+- **1M** (section 3.9): a year of daily closes per instrument, downloaded once and then extended
+  about daily, gives its σ; measured against the real 30-day moves of the past year. A snapshot a
+  second costs about 1 ms more.
+- **The fifteenth round's three regressions** (the review of 86bcc62): a standby round of the Alpaca
+  fallback counts as its feed heard again (the first tick after a wake alone guards the time asleep:
+  the review's race simulation found 0 of 593 slept sessions without a gap with it alone), and NTP
+  replies within a day win over any that correct by more.
+- **Considered, not done:** for the quiet opening, other symbols' bars in the same answer as the
+  signal: they cannot tell a thin ETF that did not trade from a liquid one whose bars the venue
+  lost (the review's SPY case), so the venue's latest trade is asked instead.
+- **Tests: 302 pass** (and 1 skipped on a clean copy: the replay test needs local recordings). The
+  new ones cover each item above, and 1M: a 24/7 asset's 30-day
+  move and σ against their oracle; an ETF across weekends and Thanksgiving (19.7 sessions); the
+  computed dollar (22 weekdays); σ against known daily volatility on random walks (within 3% on
+  average, 12% at worst) and a recent listing's fallback; one extraordinary day capped; the daily store
+  (complete days only, a year kept, the volume ratio against an outlier month); the download (a year
+  once, then the last days about daily, saved and loaded again); the wording; the API and schema
+  in all four windows.
+- **Mutation check: 67 of 68 changes are caught**, on this round's code only (as asked this round):
+  its own (1M, items a to i, the three regressions), the earlier rounds' on lines it changed, and the
+  wake guard's (it alone now closes the wake race). Nine got through at first (the stock screen's 1M
+  start and σ, 1M's 2-hour steps, the daily closes loaded at the start, a 401 told apart, the dollar's
+  close held across open steps, its newest close of either grid, the legs' formula while FX is open,
+  a round's text kept after a rate limit): tests now catch each. The one left is equivalent now (what
+  a standby round returns: every round counts). One more found a branch nothing reaches (1M's volume
+  for an instrument with no 5-minute volume): removed.
 
 ---
 

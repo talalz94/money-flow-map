@@ -301,6 +301,92 @@ def test_the_console_handler_takes_the_close_events_and_leaves_ctrl_c_to_python(
     asyncio.run(go())
 
 
+def _send_message():
+    """user32's SendMessageW (an instance of its own: its own argtypes)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32")
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    return user32.SendMessageW
+
+
+ENDSESSION_LOGOFF = 0x80000000
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows window messages")
+def test_logoff_and_shutdown_reach_a_hidden_window_that_holds_windows_until_the_cache_is_saved():
+    """Logging off and shutting down ended the process unsaved: Windows does not call the console
+    handler for them in a process that loads user32.dll. A hidden window of its own hears of them: a
+    query is answered yes and changes nothing (another program can still cancel the end), a cancelled
+    end changes nothing, and the end itself starts the stop and returns only once the cache is saved
+    (Windows ends the process once it returns)."""
+    import threading
+    send_message = _send_message()
+
+    async def go():
+        loop, stop = asyncio.get_running_loop(), asyncio.Event()
+        closing, saved = threading.Event(), threading.Event()
+        why = ["the console window is closing"]
+        w = cli._on_session_end(loop, stop, closing, saved, why)
+        assert w is not None and w.hwnd and w.thread.is_alive()
+
+        def send(msg, wparam):
+            return loop.run_in_executor(None, send_message, w.hwnd, msg, wparam, ENDSESSION_LOGOFF)
+        try:
+            assert await send(cli.WM_QUERYENDSESSION, 0) == 1       # may the session end? yes...
+            assert await send(cli.WM_ENDSESSION, 0) == 0            # ...and then it was cancelled
+            await asyncio.sleep(0.3)
+            assert not closing.is_set() and not stop.is_set()
+            res = send(cli.WM_ENDSESSION, 1)                        # it ends
+            await asyncio.wait_for(stop.wait(), 5)
+            await asyncio.sleep(0.5)
+            assert closing.is_set() and not res.done()              # held for the save...
+            assert why[0] == "Windows is ending the session (logoff or shutdown)"
+            saved.set()
+            assert await asyncio.wait_for(res, 5) == 0              # ...then Windows may end the process
+        finally:
+            w.close()
+        assert not w.thread.is_alive()
+    asyncio.run(go())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows window messages")
+def test_logging_off_saves_the_cache_first_and_the_session_ends_after_it(tmp_path, keys, monkeypatch, caplog):
+    """The real serve() at a logoff: its window gets WM_ENDSESSION, the cache is saved first (before
+    the feeds stop), once, and the message returns after the save; the log says why."""
+    import logging
+    caplog.set_level(logging.INFO, logger="moneyflow")
+    port = _free_port()
+    cfg = _serve_cfg(tmp_path, port, 0)
+    seen = _stop_probe(monkeypatch, port)
+    got: dict = {}
+    real_stop_feeds, real_window = Engine.stop_feeds, cli._on_session_end
+
+    async def stop_feeds(self):
+        got.setdefault("feeds_stopped_at", time.monotonic())
+        await real_stop_feeds(self)
+    monkeypatch.setattr(Engine, "stop_feeds", stop_feeds)
+    monkeypatch.setattr(cli, "_on_session_end", lambda *a: got.setdefault("w", real_window(*a)))
+    send_message = _send_message()
+
+    async def go():
+        task = asyncio.create_task(cli.serve(cfg, keys, dashboard=False, open_browser=False))
+        await asyncio.sleep(0.5)
+        w = got["w"]
+        assert w is not None and w.hwnd
+        loop = asyncio.get_running_loop()
+        assert await loop.run_in_executor(None, send_message, w.hwnd, cli.WM_QUERYENDSESSION, 0, ENDSESSION_LOGOFF) == 1
+        await loop.run_in_executor(None, send_message, w.hwnd, cli.WM_ENDSESSION, 1, ENDSESSION_LOGOFF)
+        got["returned_at"] = time.monotonic()
+        await asyncio.wait_for(task, timeout=10)
+        got["window_gone"] = not w.thread.is_alive()
+    asyncio.run(go())
+    assert seen["saves"] == 1 and seen["save_at"] < got["feeds_stopped_at"] and seen["save_at"] < got["returned_at"]
+    assert "Windows is ending the session (logoff or shutdown): saving the history cache first" in caplog.text
+    assert got["window_gone"]
+
+
 # ── twelfth round: a close as the stop begins, a second Ctrl+C in the save, a held console ──────────
 def _close_hook(monkeypatch, got):
     monkeypatch.setattr(cli, "_on_console_close",
