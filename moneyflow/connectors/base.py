@@ -22,8 +22,9 @@ import aiohttp
 from .. import jsonutil
 
 # what a poll() returns when it stood by without asking (the Alpaca fallback while the stream is up,
-# the market is shut, or the stream is connecting or refused). It still counts as the feed heard
-# (PollConnector.run): the first tick after a wake guards the time asleep (Engine.tick, woke).
+# the market is shut, or the stream is connecting or refused). It counts as the feed heard as far as the
+# poller's heard() says (the fallback: as far as the network is known up); the first tick after a wake
+# guards the time asleep (Engine.tick, woke).
 STANDBY = "standby"
 
 
@@ -332,6 +333,11 @@ class PollConnector(Connector):
     def next_interval(self) -> float:
         return self.interval
 
+    def heard(self, result, now: float) -> float | None:
+        """How far a round that ended now shows its feed heard (`result`: what poll() returned): now.
+        (The Alpaca fallback's standby rounds: as far as the network is known up.)"""
+        return now
+
     async def run(self) -> None:
         ok, why = self.available()
         if not ok:
@@ -355,16 +361,18 @@ class PollConnector(Connector):
                 self.health.state, self.health.detail = "polling", ""
                 t0 = time.perf_counter()
                 # A round that stood by (STANDBY: the Alpaca fallback while the stream is up, or the
-                # market is shut, or the stream is connecting or refused) counts as the feed heard too.
-                # Without it a stream refused (406: another copy holds the key's one stream) or
-                # unreachable left the ETFs no feed signal outside the session: a session slept over
-                # was carried, not back-filled (TODAY +1.13% all Monday, true 0); and a trading day with
-                # no trade at all ran a back-fill every 67 s. A round right after a wake covering the
-                # time asleep is the first tick's to guard (Engine.tick, woke).
-                await self.poll()
+                # market is shut, or the stream is connecting or refused) counts as the feed heard too,
+                # as far as heard() says. Not at all, a stream refused (406: another copy holds the
+                # key's one stream) or unreachable left the ETFs no feed signal outside the session: a
+                # session slept over was carried, not back-filled (TODAY +1.13% all Monday, true 0); and
+                # a trading day with no trade at all ran a back-fill every 67 s. A round right after a
+                # wake covering the time asleep is the first tick's to guard (Engine.tick, woke).
+                result = await self.poll()
                 self.health.last_poll_ms = round((time.perf_counter() - t0) * 1000)
                 self.health.state = "ok"
-                self.health.last_ok = self.now()
+                t = self.heard(result, self.now())
+                if t is not None and not (self.health.last_ok is not None and self.health.last_ok >= t):
+                    self.health.last_ok = t
                 self.backoff.reset()
                 delay = self.next_interval()
             except asyncio.CancelledError:

@@ -122,6 +122,7 @@ class Engine:
         self._backfill_wake: asyncio.Event | None = None
         self._feed_waiters: set[asyncio.Event] = set()   # retries that a recovered feed cuts short
         self._save_lock = threading.Lock()  # one cache save at a time (they run in worker threads)
+        self._daily_lock = asyncio.Lock()   # one daily download at a time (the half-hourly check, a pick's)
         self.resumes = 0
         self._last_wall = time.time()       # the tick loop's last round (a jump since: the PC slept)
         self._ticked: float | None = None   # the last tick's time
@@ -139,6 +140,7 @@ class Engine:
         self.stock_screen: dict = {}             # tf -> {"picks", "top", "screened"} of the latest screen
         self.stock_meta: dict = {"at": None, "universe": 0, "missing": []}
         self._stocks: dict[str, dict] = {}       # perpetual -> {"inst", "ticker", "picked_at", "ready", "owned"}
+        self._stock_years: dict = {}             # perpetual -> its daily closes (series.Daily), kept once dropped
         self._eased: dict[tuple, float] = {}     # (window, perpetual) -> the screen run at which its move eased
         self.build()
 
@@ -283,15 +285,17 @@ class Engine:
         z_min, score_min = float(sc.get("z_min", 2.0)), float(sc.get("score_min", 2.5))
         prev = self.stock_screen
         res = {}
+        years = self._year_sigmas(now)
         for tf in stats.TIMEFRAMES:
             exact = self._node_reads(tf, now)
-            r = stocks.screen(book, tf, now, z_min, score_min, slots, exact=exact)
+            sig = years if tf == "1m" else None
+            r = stocks.screen(book, tf, now, z_min, score_min, slots, exact=exact, sigma=sig)
             # stocks the map still reads (picked lately) among the best: on its numbers too, or a
             # borderline one went in and out of the slot at every screen with unchanged prices
             near = [s["symbol"] for s in r["top"] if s["symbol"] in self._stocks and s["symbol"] not in exact]
             more = self._node_reads(tf, now, syms=near) if near else {}
             if more:
-                r = stocks.screen(book, tf, now, z_min, score_min, slots, exact={**exact, **more})
+                r = stocks.screen(book, tf, now, z_min, score_min, slots, exact={**exact, **more}, sigma=sig)
             # a shown pick whose history still has a sleep's gap is held, not dropped on hourly bars
             # alone (it was, for good: once off the slot it was never re-read on the map)
             held = [dict(p, held=True) for p in (prev.get(tf) or {}).get("picks", [])
@@ -313,6 +317,19 @@ class Engine:
         self._prune_stocks(now)
         if any(before[tf] != [p["symbol"] for p in res[tf]["picks"]] for tf in res):
             self._cache.clear()
+
+    def _year_sigmas(self, now: float) -> dict:
+        """{perpetual: 1M σ} of the stocks whose year of daily closes is known (picked before, also once
+        dropped): the screen ranks them on it, as their node reads 1M. On hourly bars alone a stock its
+        node had dropped (its year's z under the rule) was picked again every 2 hours."""
+        from . import stocks
+        k = math.sqrt(stats.month_k(stocks.CALENDAR, now))
+        out = {}
+        for sym, d in self._stock_years.items():
+            rs = d.returns(now)
+            if len(rs) >= stats.MONTH_MIN_DAILY:
+                out[sym] = stats.robust_rms(rs) * k
+        return out
 
     def _has_holes(self, sym: str) -> bool:
         ent = self._stocks.get(sym)
@@ -357,6 +374,7 @@ class Engine:
                 inst.calendar = "us_equity"     # a US stock: σ from NYSE trading days, like the screen
             ent = self._stocks[sym] = {"inst": inst, "ticker": ticker, "picked_at": now, "owned": owned,
                                        "ready": not owned}
+            self._stock_years[sym] = inst.daily                 # (filled by its daily closes, kept)
             if owned:
                 self._spawn(self._start_stock(sym), f"stock:{sym}")
         ent["picked_at"] = now
@@ -381,6 +399,11 @@ class Engine:
             return
         inst, now = ent["inst"], self.clock.now()
         history.load(self.cache_dir, inst, now)
+        # its year of daily closes (1M's σ) as saved, then the days since, now: left to the half-hourly
+        # check, a 1M pick was judged on the 30-day fallback for up to half an hour after each pick (its
+        # saved year was never read back), dropped when its year came, and picked again 2 h later
+        history.load_daily(self.cache_dir, [inst], now)
+        self._spawn(self.seed_daily(only=[inst]), f"daily:{sym}")
         delay = self.STOCK_RETRY_FIRST
         while self._stocks.get(sym) is ent:         # dropped (or picked anew, by another task): stop
             if await self._load_stock(sym, ent):
@@ -872,13 +895,21 @@ class Engine:
             add(ent["inst"], "alpaca", ent["ticker"], "last", False)
         return out
 
-    async def seed_daily(self, force: bool = False) -> bool:
+    async def seed_daily(self, force: bool = False, only: list | None = None) -> bool:
         """Download the daily closes missing or older than about a day: a year at the first start, then
-        the days since (one small request per instrument, all ETFs in one). False if any failed."""
+        the days since (one small request per instrument, all ETFs in one); `only` those instruments (a
+        stock just picked). One at a time (the half-hourly check and a pick's). False if any failed."""
+        async with self._daily_lock:
+            return await self._seed_daily(force, only)
+
+    async def _seed_daily(self, force: bool, only: list | None) -> bool:
         from .connectors import alpaca as alp, binance as bn, hyperliquid as hl, pollers
         now = self.clock.now()
-        plan = [p for p in self._daily_plan()
-                if force or p[0].daily.fetched_at is None or now - p[0].daily.fetched_at > self.DAILY_EVERY_S]
+        plan = [p for p in self._daily_plan() if (only is None or any(p[0] is i for i in only)) and (
+            force or p[0].daily.fetched_at is None or now - p[0].daily.fetched_at > self.DAILY_EVERY_S)]
+        # Yahoo switched off ([connectors.yahoo] enabled = false) is asked nothing: those nodes take 1M's σ
+        # from their 5-minute grid, as the stablecoin share does
+        yahoo_on = cfgmod.connector_enabled(self.cfg, "yahoo")
         if not plan:
             return True
         ok, sem = True, asyncio.Semaphore(3)
@@ -924,13 +955,15 @@ class Engine:
                     took(inst, f"Alpaca {sym} (IEX)", bars.get(sym, []), own)
             except Unauthorized as e:
                 alp_conn.keys_refused(f"daily closes: {e}")
-                await asyncio.gather(*(one(inst, "yahoo", sym, fld, False) for inst, _, sym, fld, _ in items))
+                if yahoo_on:
+                    await asyncio.gather(*(one(inst, "yahoo", sym, fld, False) for inst, _, sym, fld, _ in items))
             except Exception as e:  # noqa: BLE001
                 ok = False
                 log.warning("daily closes alpaca: %s", self.keys.redact(e))
 
         alp_items = [p for p in plan if p[1] == "alpaca" and alpaca_up]
         rest = [p if p[1] != "alpaca" else (p[0], "yahoo", p[2], p[3], False) for p in plan if p not in alp_items]
+        rest = [p for p in rest if p[1] != "yahoo" or yahoo_on]
         await asyncio.gather(*(one(*p) for p in rest), *([alpaca(alp_items)] if alp_items else []))
         insts = [p[0] for p in self._daily_plan() if p[0].daily.rows]
         try:

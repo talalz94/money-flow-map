@@ -60,6 +60,38 @@ def test_month_screen_is_exact_on_known_data():
     assert s["z"] == pytest.approx(math.log(px / p0) / sig, rel=1e-9) and s["rvol"] is None
 
 
+def test_a_month_candidate_whose_year_is_known_is_ranked_on_it():
+    """1M: a stock whose year of daily closes is known (picked before, also once dropped) is ranked on
+    that year's σ, as its node reads 1M. On hourly bars alone a stock its node had dropped (the year's
+    z under the rule) was picked again every 2 hours and shown for minutes with a z under 2."""
+    s = screen_one(*bars(-3.0, vol_today=3000.0), NOW, "1m")
+    sig = math.log1p(s["sigma_pct"] / 100)
+    s2 = screen_one(*bars(-3.0, vol_today=3000.0), NOW, "1m", sigma=2 * sig)
+    assert s2["z"] == pytest.approx(s["z"] / 2) and s2["change_pct"] == s["change_pct"]
+    book = _book({"AAAUSDT": (-3.0, 3000.0)})
+    z_min = abs(s["z"]) * 0.75
+    assert [p["symbol"] for p in screen(book, "1m", NOW, z_min, 0.0, 1)["picks"]] == ["AAAUSDT"]
+    assert screen(book, "1m", NOW, z_min, 0.0, 1, sigma={"AAAUSDT": 2 * sig})["picks"] == []
+
+
+def test_the_month_screen_ranks_a_stock_on_its_known_year(cfg, keys):
+    """The engine hands the 1M screen the year σ of the stocks whose daily closes it knows: a stock
+    picked on hourly bars is not picked again once its year (here far more volatile) is known."""
+    from conftest import filled_engine_at
+    from moneyflow.series import Daily
+    eng = filled_engine_at(cfg, keys, NOW)
+    eng.stock_cfg = dict(eng.stock_cfg, z_min=0.3, score_min=0.0)          # (its hourly 1M z: -0.48)
+    book = _book({"AAAUSDT": (-3.0, 3000.0)})
+    eng.on_stock_screen(book, NOW)
+    assert [p["symbol"] for p in eng.stock_screen["1m"]["picks"]] == ["AAAUSDT"]
+    d = Daily()
+    d.merge([((int(NOW // D) - j) * D, 100.0 * (1.06 if j % 2 else 1.0), float("nan")) for j in range(300, 0, -1)], NOW)
+    eng._stocks.clear()
+    eng._stock_years = {"AAAUSDT": d}                       # its year: ±6% days
+    eng.on_stock_screen(book, NOW)
+    assert eng.stock_screen["1m"]["picks"] == []
+
+
 def test_perp_symbols():
     assert perp_symbol("NVDA") == "NVDAUSDT" and perp_symbol("BRK.B") == "BRKBUSDT"
 

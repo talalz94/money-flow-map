@@ -2152,19 +2152,24 @@ def test_the_final_save_writes_what_the_next_start_loads_first(cfg, keys, monkey
     import time
     from moneyflow import engine as engmod
     from moneyflow import history
-    order, threads = [], set()
+    order, threads, at_once = [], set(), [0, 0]
+    lock = threading.Lock()
 
     def save(d, i):
+        with lock:
+            at_once[0] += 1
+            at_once[1] = max(at_once[1], at_once[0])
         order.append(i.source)
         threads.add(threading.get_ident())
         time.sleep(0.02)
+        with lock:
+            at_once[0] -= 1
         return True
     monkeypatch.setattr(history, "save", save)
     eng, _ = _gap_engine(cfg, keys, 1795528800.0, tmp_path)
-    t = time.monotonic()
     eng.save_cache()
-    assert len(order) == len(eng.instruments) and len(threads) == engmod.SAVE_THREADS == 8
-    assert time.monotonic() - t < 0.02 * len(order) / 2                 # files at once
+    assert len(order) == len(eng.instruments) and engmod.SAVE_THREADS == 8
+    assert len(threads) > 1 and at_once[1] > 1                          # files at once (counted, not timed)
     order.clear()
     monkeypatch.setattr(engmod, "SAVE_THREADS", 1)                    # the order they start in
     eng.save_cache()
@@ -2420,23 +2425,30 @@ def test_an_etf_cache_from_before_format_5_is_downloaded_again_once(cfg, keys, t
             assert (b.holes["g5"] == first) is whole, (key, version)
 
 
-def test_every_round_of_the_alpaca_fallback_counts_as_its_feed_heard():
-    """A round of the REST fallback is its feed heard whether it asks (the stream down in a session) or
-    stands by: the stream up, the market closed, the stream connecting or refused (406: another copy
-    holds the key's one stream). The fifteenth round counted no standby round (its round right after a
-    wake covered the time asleep: the first tick after a wake guards that now), and with the stream
-    refused or unreachable nothing told of the ETFs' feed outside a session: started then and asleep
-    over the open, the slept session was carried, not back-filled (TODAY +1.13% all Monday, true 0),
-    and on a trading day with no trade at all a back-fill ran every 67 s. What each round says shows."""
+def test_a_standby_round_of_the_alpaca_fallback_counts_as_far_as_the_network_is_known_up():
+    """A round of the REST fallback that asks is its feed heard (now). One that stands by (the stream up,
+    the market closed, the stream connecting or refused: 406, another copy holds the key's one stream)
+    counts as far as the network is known up: the newest message of any stream, or a trade answer of its
+    own. Counted not at all (the fifteenth round), a stream refused or unreachable left the ETFs no feed
+    signal outside a session: a session slept over was carried, not back-filled (TODAY +1.13% all Monday,
+    true 0). Counted as now (the sixteenth), a round in the half-minute before a dropped connection is
+    noticed covered the next minute, and one across 16:00 the 15:59 minute and the night after it. A
+    stream connected but silent for a minute in a session is asked about (a stall; a day nothing
+    trades, whose old trades are a real answer). What each round says shows."""
     from conftest import ny_ts
     from moneyflow.connectors.alpaca import AlpacaFallback
     from moneyflow.series import Instrument
-    stream = types.SimpleNamespace(health=types.SimpleNamespace(state="connected"), ws=object(), refused_until=0.0,
-                                   subs={"SPY": Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")},
-                                   available=lambda: (True, ""))
+    t = ny_ts(2026, 11, 24, 10, 0)                                     # a session
+    stream = types.SimpleNamespace(health=types.SimpleNamespace(state="connected", last_msg=t - 5), ws=object(),
+                                   refused_until=0.0, available=lambda: (True, ""),
+                                   subs={"SPY": Instrument("alpaca:SPY", "alpaca", "SPY", "us_regular")})
+    other = types.SimpleNamespace(health=types.SimpleNamespace(last_msg=t - 2))      # another stream (Binance's)
     ctx = ctx_for(None)
-    ctx.clock = clock.Clock(fixed=ny_ts(2026, 11, 24, 10, 0))     # a session
+    ctx.clock = clock.Clock(fixed=t)
     fb = AlpacaFallback(ctx, {}, stream)
+    cached = PollConnector(ctx, {})                          # a poller's data can come from its cache:
+    cached.health.last_msg = t + 10**6                       # no sign of the network
+    ctx.engine.connectors = {"alpaca": stream, "alpaca_rest": fb, "binance_spot": other, "coingecko": cached}
     fb.started -= 60                                         # (past its first 30 s)
     asked = []
 
@@ -2448,31 +2460,93 @@ def test_every_round_of_the_alpaca_fallback_counts_as_its_feed_heard():
         await asyncio.sleep(0.01)
     fb.get_json, fb.sleep = get_json, fast
 
+    def one_round(at=None):
+        if at is not None:
+            ctx.clock.set_fixed(at)
+        fb.health.last_ok = None
+
+        async def go():
+            task = asyncio.create_task(fb.run())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(go())
+    other.health.last_msg = t + 50                           # a message stamped ahead (a clock corrected back)
+    one_round()
+    assert fb.health.last_ok == t and not asked              # never ahead of now
+    other.health.last_msg = t - 2
+    one_round()                                              # the stream up: as far as the newest message
+    assert fb.health.state == "ok" and fb.health.last_ok == t - 2 and not asked
+    assert fb.health.detail == "standby (stream connected)"              # shown (it was wiped)
+    stream.health.last_msg = other.health.last_msg = t - 40  # the network down since: not noticed yet
+    one_round()
+    assert fb.health.last_ok == t - 40 and fb.health.detail == "standby (stream connected)" and not asked
+    stream.health.last_msg, other.health.last_msg = t - 90, t - 1        # the stream silent a minute and more
+    one_round()
+    assert asked and fb.health.last_ok == t and fb.health.detail == "asking (stream connected but silent)"
+    assert stream.subs["SPY"].price == 600.5
+    asked.clear()
+    fb.health.last_msg = stream.health.last_msg = None
+    stream.health.state, stream.ws, stream.refused_until = "reconnecting", None, t + 300   # refused (406)
+    sat = ny_ts(2026, 11, 21, 12, 0)
+    other.health.last_msg = sat - 1
+    one_round(sat)
+    assert fb.health.last_ok == sat - 1 and fb.health.detail == "standby (US market closed)" and not asked
+    other.health.last_msg = stream.health.last_msg = None     # nothing heard of the network at all
+    one_round()
+    assert fb.health.last_ok is None and fb.health.detail == "standby (US market closed)"
+    other.health.last_msg = t - 1
+    fb.started, stream.refused_until = t - 5, 0.0                        # just started, the stream connecting
+    one_round(t)
+    assert fb.health.last_ok == t - 1 and fb.health.detail == "standby (stream connecting)" and not asked
+    fb.started -= 60                                         # the stream down in a session: real rounds
+    one_round(t)
+    assert asked and fb.health.last_ok == t and fb.health.last_msg == t
+    assert fb.health.detail == "polling (stream down)"
+
+
+def test_a_standby_round_after_the_close_leaves_a_minute_the_network_was_down_a_gap(cfg, keys, tmp_path):
+    """SPY trades every few seconds; the network drops at 15:58:30 with the PC awake, the stream not yet
+    aware of it. The fallback's round at 16:00:05 stands by (the market closed): counted as now, it
+    covered the 15:59 minute (no gap, nothing stale), and the night and Tuesday's TODAY reference held the
+    price from before the outage (the night after a gap, fixed in the fifteenth round). It counts as far
+    as the network is known up, 15:58:30: 15:59 is a gap, the night after it unknown until downloaded."""
+    from conftest import ny_ts
+    from moneyflow.connectors.alpaca import AlpacaFallback
+    from moneyflow.connectors.base import Health
+    from moneyflow.series import G1_STEP
+    t0, down = ny_ts(2026, 11, 23, 15, 50), ny_ts(2026, 11, 23, 15, 58) + 30
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    spy = eng.instruments["alpaca:SPY"]
+    stream = types.SimpleNamespace(health=Health("alpaca", "stream", "x"), ws=object(), refused_until=0.0,
+                                   subs={"SPY": spy}, available=lambda: (True, ""))
+    stream.health.state = "connected"
+    other = types.SimpleNamespace(health=Health("binance_spot", "stream", "x"))
+    fb = AlpacaFallback(eng.ctx, {}, stream)
+    fb.started -= 60
+    eng.connectors = {"alpaca": stream, "alpaca_rest": fb, "binance_spot": other}
+
+    def trade(t):
+        if t < down:
+            spy.on_price(600.0 + (t - t0) / 600, t, t)
+            stream.health.mark_msg(t)
+            other.health.mark_msg(t)
+    _tick(eng, clk, t0, down + 20, step=5.0, feed=trade)
+    clk.set_fixed(ny_ts(2026, 11, 23, 16, 0) + 5)            # the fallback's round: it stands by
+
     async def go():
         task = asyncio.create_task(fb.run())
         await asyncio.sleep(0.1)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     asyncio.run(go())
-    assert fb.health.state == "ok" and fb.health.last_ok == ctx.clock.now() and not asked
-    assert fb.health.detail == "standby (stream connected)"              # shown (it was wiped)
-    stream.health.state, stream.ws, stream.refused_until = "reconnecting", None, ctx.clock.now() + 300   # refused
-    for at, detail in ((ny_ts(2026, 11, 21, 12, 0), "standby (US market closed)"),
-                       (ny_ts(2026, 11, 23, 8, 0), "standby (US market closed)")):
-        ctx.clock.set_fixed(at)
-        fb.health.last_ok = None
-        asyncio.run(go())
-        assert fb.health.last_ok == at and fb.health.detail == detail and not asked
-    ctx.clock.set_fixed(ny_ts(2026, 11, 24, 10, 0))
-    fb.started, stream.refused_until = ctx.clock.now() - 5, 0.0          # just started, the stream connecting
-    fb.health.last_ok = None
-    asyncio.run(go())
-    assert fb.health.last_ok is not None and fb.health.detail == "standby (stream connecting)" and not asked
-    fb.started -= 60                                         # the stream down in a session: real rounds
-    asyncio.run(go())
-    assert asked and fb.health.last_ok is not None and fb.health.last_msg is not None
-    assert fb.health.detail == "polling (stream down)"
-    assert stream.subs["SPY"].price == 600.5
+    assert down - 10 < fb.health.last_ok < down              # the last message before the drop
+    _tick(eng, clk, clk.now() + 5, ny_ts(2026, 11, 23, 16, 30), step=10.0)
+    m = ny_ts(2026, 11, 23, 15, 59)
+    assert spy.holes["g1"] == m and spy._stale_from == m
+    assert spy.g1.get(int(m // G1_STEP)) != spy.g1.get(int(m // G1_STEP))                     # unknown
+    night = int(ny_ts(2026, 11, 23, 16, 20) // G1_STEP)
+    assert spy.g1.get(night) != spy.g1.get(night)            # (not the pre-outage price carried)
 
 
 def test_the_first_tick_after_a_sleep_takes_nothing_heard_since_the_wake_as_cover(cfg, keys, tmp_path):
@@ -2708,7 +2782,9 @@ def test_refused_alpaca_keys_read_the_etfs_as_without_a_key(cfg, keys, monkeypat
     retry and every back-fill asked again and failed, all day (32 failed requests over a morning in the
     review's run), and a message of the stream's or the fallback's could count as the ETFs' coverage.
     The first refusal marks the keys: the ETFs' history comes from Yahoo, as without a key, their steps
-    are carried, not covered, nothing asks Alpaca again, and the sources say why."""
+    are carried, not covered, nothing asks Alpaca again, and the sources say why. The refusal comes a
+    round trip after the first tick, which hands the ETFs the fallback's first round: that feed time is
+    forgotten (kept, every session minute was a gap, back-filled from Yahoo each minute, all session)."""
     from conftest import ny_ts
     from moneyflow.connectors import alpaca as alp, binance as bn, pollers
     from moneyflow.connectors.base import STANDBY, Unauthorized
@@ -2730,8 +2806,11 @@ def test_refused_alpaca_keys_read_the_etfs_as_without_a_key(cfg, keys, monkeypat
     monkeypatch.setattr(alp, "fetch_bars", bars)
     monkeypatch.setattr(pollers, "yahoo_chart", chart)
     monkeypatch.setattr(bn, "fetch_klines", klines)
-    asyncio.run(eng.seed_history())
     stream, rest = eng.connectors["alpaca"], eng.connectors["alpaca_rest"]
+    rest.health.last_ok = now - 1                            # its first round counted at the first tick
+    eng.tick()
+    assert eng.instruments["alpaca:HYG"]._seen_ts == now - 1
+    asyncio.run(eng.seed_history())
     assert stream.auth_failed and not stream.available()[0] and "refused the keys" in stream.health.detail
     assert asked == ["5Min"]                                            # asked once, then not again
     hyg = eng.instruments["alpaca:HYG"]
@@ -2744,6 +2823,10 @@ def test_refused_alpaca_keys_read_the_etfs_as_without_a_key(cfg, keys, monkeypat
     assert hyg.g1.get(int((now + 900) // 60)) == 80.0 and not hyg.g1.is_live(int((now + 900) // 60))
     assert asyncio.run(rest.poll()) == STANDBY and "refused the keys" in rest.health.detail
     assert asyncio.run(eng.seed_history(incremental=True)) is None and asked == ["5Min"]
+    # keys revoked mid-run: a session opened before still sends a print; taken, it armed the feed again
+    # and every minute after the session closed was a gap (a Yahoo back-fill each minute)
+    stream.on_text('[{"T": "t", "S": "HYG", "p": 81.0, "s": 100, "t": "2026-11-24T15:31:00Z"}]', now + 1830)
+    assert not hyg.live_seen and hyg._seen_ts != hyg._seen_ts and hyg.price == 80.0
 
 
 def test_a_401_or_403_is_the_keys_refused_and_other_errors_are_not():

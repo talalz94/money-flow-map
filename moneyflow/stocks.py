@@ -179,7 +179,7 @@ def _sigma_now(sig_at, now: float, offsets=(0.0,), stop: float | None = None) ->
 
 
 def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: float = 450.0,
-               calendar: str = CALENDAR) -> dict | None:
+               calendar: str = CALENDAR, sigma: float | None = None) -> dict | None:
     """One stock in one window: {z, change_pct, sigma_pct, rvol, score} (None without enough data).
     σ comes from the SAME estimator as the map's nodes (stats.py: same clock, trading days only,
     robust RMS), here on hourly bars, so the stock picked and its node on the map tell the same story."""
@@ -222,8 +222,11 @@ def screen_one(h: Hourly, price: float, now: float, tf: str, ring=None, tol: flo
         # node reads a year of daily closes: a stock it shows is ranked on the node's own numbers); no
         # earlier month to compare its volume with
         p0 = h.price_interp(now - stats.MONTH_S)
-        rs = stats.roll_daily_returns(h.price_at, e, calendar, max_days=stats.DAILY_DAYS)
-        sig = stats.robust_rms(rs) * math.sqrt(stats.month_k(calendar, now)) if len(rs) >= 10 else NaN
+        if sigma is not None:
+            sig = sigma                     # its year of daily closes, once known (as its node reads 1M)
+        else:
+            rs = stats.roll_daily_returns(h.price_at, e, calendar, max_days=stats.DAILY_DAYS)
+            sig = stats.robust_rms(rs) * math.sqrt(stats.month_k(calendar, now)) if len(rs) >= 10 else NaN
         rvol = None
     else:
         raise ValueError(tf)
@@ -247,11 +250,12 @@ def from_node(r: float, sig: float, rvol, price: float) -> dict | None:
 
 
 def screen(book: "StockBook", tf: str, now: float, z_min: float, score_min: float, slots: int,
-           exact: dict | None = None) -> dict:
+           exact: dict | None = None, sigma: dict | None = None) -> dict:
     """Rank the universe for one window: {"picks": [...], "top": [...], "screened": n}. `exact` holds the
     map's own numbers, {perpetual: (log return, σ, rvol, price)}, for stocks it already reads (the
     current and recent picks): those are ranked on exactly what their node shows, so a pick never
-    disagrees with its node after the next screen. The others use the hourly bars."""
+    disagrees with its node after the next screen. The others use the hourly bars, with `sigma`
+    {perpetual: σ} where a better one is known (1M: a stock's year of daily closes)."""
     rows = []
     for sym, h in book.hourly.items():
         px = book.last.get(sym)
@@ -259,7 +263,8 @@ def screen(book: "StockBook", tf: str, now: float, z_min: float, score_min: floa
             continue
         s = from_node(*exact[sym]) if exact and sym in exact else None
         if s is None:
-            s = screen_one(h, px[0], now, tf, book.ring.get(sym), tol=book.scan_interval * 1.5)
+            s = screen_one(h, px[0], now, tf, book.ring.get(sym), tol=book.scan_interval * 1.5,
+                           sigma=(sigma or {}).get(sym))
         if s is None:
             continue
         s.update(symbol=sym, ticker=book.ticker.get(sym, sym.removesuffix("USDT")))

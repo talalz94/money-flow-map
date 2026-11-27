@@ -257,3 +257,98 @@ def test_the_months_moves_are_read_in_two_hour_steps():
     rs = stats.step_returns(btc, stats.window_for("1m", now), now)
     ks = sorted(rs)
     assert 355 <= len(rs) <= 361 and all(b - a == 24 for a, b in zip(ks, ks[1:]))
+
+
+def test_a_picked_stock_gets_its_year_of_daily_closes_when_picked(cfg, keys, monkeypatch, tmp_path):
+    """A stock picked for the slot reads 1M on a year of daily closes from the start: they are loaded
+    from daily.json (a pick's are saved there too), and the days since downloaded at once. Left to the
+    half-hourly check, a 1M pick was judged on the 30-day fallback for up to half an hour after each
+    pick, its saved year never read back at a start; when the year came the pick dropped, and it was
+    picked again 2 hours later."""
+    from moneyflow.connectors import alpaca as alp
+    from moneyflow.engine import Engine
+    now = ny_ts(2026, 11, 30, 10, 0)
+    calls = []
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        calls.append((tuple(symbols), tf))
+        return {s: [(t, 100.0 + (t // DAY) % 5, 1e8) for t in range(int(-(-since // DAY) * DAY), int(now) - DAY, DAY)
+                    if clock.trading_day("us_equity", t + 12 * 3600)] for s in symbols}
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+
+    def engine():
+        e = Engine(cfg, keys, clock.Clock(fixed=now))
+        e.cache_dir = tmp_path
+        e.connectors = {"alpaca": types.SimpleNamespace(available=lambda: (True, ""), cfg={})}
+
+        async def loaded(sym, ent):
+            return True
+        e._load_stock = loaded
+        return e
+
+    async def pick(e):
+        e._want_stock("NVDAUSDT", "NVDA", now)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            pending = [t for t in e._tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*pending)
+        return e._stocks["NVDAUSDT"]["inst"]
+    eng = engine()
+    inst = asyncio.run(pick(eng))
+    assert calls == [(("NVDA",), "1Day")] and len(inst.daily.rows) > 240
+    assert stats.sigma_for("1m", inst, now)[2].startswith("daily RMS, ")
+    eng._stocks.clear()                                    # dropped 2 h later: the screen still ranks on it
+    ys = eng._year_sigmas(now)
+    assert list(ys) == ["NVDAUSDT"] and abs(ys["NVDAUSDT"] - stats.sigma_for("1m", inst, now)[0]) < 1e-12
+    calls.clear()
+    inst2 = asyncio.run(pick(engine()))                    # a later start: from the file, nothing downloaded
+    assert calls == [] and len(inst2.daily.rows) == len(inst.daily.rows)
+    assert stats.sigma_for("1m", inst2, now)[2].startswith("daily RMS, ")
+
+
+def test_yahoo_switched_off_is_asked_nothing_for_daily_closes(cfg, keys, monkeypatch, tmp_path):
+    """[connectors.yahoo] enabled = false turns Yahoo off: the daily closes of the dollar, the futures
+    and, without a key, the ETFs are not asked for (they were, 20 s after each start and about daily,
+    again every 30 minutes when refused). Those nodes take 1M's σ from their 5-minute grid."""
+    from moneyflow.connectors import alpaca as alp, binance as bn, pollers
+    from moneyflow.engine import Engine
+    now = ny_ts(2026, 11, 27, 18, 0)
+    calls = []
+
+    async def klines(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        calls.append(("binance", symbol))
+        return [(t, 100.0, 1e9, 5e8) for t in range(int(-(-start_ms // 1000 // DAY) * DAY), int(end_ms / 1000), DAY)]
+
+    refused = {"on": False}
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        calls.append(("alpaca", tuple(symbols)))
+        if refused["on"]:
+            from moneyflow.connectors.base import Unauthorized
+            raise Unauthorized("HTTP 401")
+        return {s: [] for s in symbols}
+
+    async def chart(session, symbol, interval="5m", rng="60d", now=None):
+        calls.append(("yahoo", symbol))
+        return []
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    off = dict(cfg, connectors=dict(cfg["connectors"], yahoo={"enabled": False}))
+    for with_key in (True, False):
+        e = Engine(off, keys, clock.Clock(fixed=now))
+        e.cache_dir = tmp_path / str(with_key)
+        e.connectors = {"alpaca": types.SimpleNamespace(available=lambda k=with_key: (k, ""), cfg={})}
+        calls.clear()
+        assert asyncio.run(e.seed_daily())
+        assert not [c for c in calls if c[0] == "yahoo"] and ("binance", "BTCUSDT") in calls
+        assert bool([c for c in calls if c[0] == "alpaca"]) is with_key
+        assert not e.series["gold"].inst.daily.rows and not e.series["usd"].inst.daily.rows
+    refused["on"] = True                                     # the keys refused: not Yahoo instead either
+    e = Engine(off, keys, clock.Clock(fixed=now))
+    e.cache_dir = tmp_path / "refused"
+    e.connectors = {"alpaca": types.SimpleNamespace(available=lambda: (True, ""), cfg={}, keys_refused=lambda why: None)}
+    calls.clear()
+    asyncio.run(e.seed_daily())
+    assert [c for c in calls if c[0] == "alpaca"] and not [c for c in calls if c[0] == "yahoo"]

@@ -363,7 +363,11 @@ source) it falls back to the last 30 days' roll-to-roll moves from the 5-minute 
   first; all ETFs in one Alpaca request), then a check every 30 minutes that downloads again only
   what is about a day old (20 hours), from three days before its newest close. No extra streams.
   They are kept in one file, `data/cache/daily.json` (95 KB in a keyless run), written after each
-  download, so a restart downloads nothing new and the final save has none of it to write.
+  download, so a restart downloads nothing new and the final save has none of it to write. A stock
+  picked for the slot gets its year at once: from that file, then the days since (one request).
+  Left to the half-hourly check, a 1M pick was judged on the 30-day fallback for up to half an hour
+  after each pick (its saved year was never read back), and when its year came it could drop out of
+  the slot, to be picked again 2 hours later.
 - **Measured on real data** (27 Nov 2026, keyless: Binance, Yahoo): σ_1M against the RMS of the
   year's actual 30-day moves, from the same daily closes:
 
@@ -390,7 +394,9 @@ source) it falls back to the last 30 days' roll-to-roll moves from the 5-minute 
   SPY's, another market's volume: no ratio). The taker split comes from the 5-minute volume.
 - **The notable stock:** screened on its 31 days of hourly bars: the move from 30 days back, σ the
   daily moves of those bars × √k as above (fewer than 10: none), and no volume ratio (no earlier
-  month in the bars). A stock the map reads is ranked on the node's own numbers, as in every window.
+  month in the bars). A stock the map reads is ranked on the node's own numbers, as in every window,
+  and one whose year is known (picked before in this run) on that year's σ: on hourly bars alone, a
+  stock its node had dropped came back to the slot every 2 hours.
 - **What the flow says** speaks of "this month", and quotes the stablecoin supply's change over
   30 days.
 - **The risk meter and an asset without arrows** follow the same rules as in the other windows, on
@@ -521,7 +527,7 @@ Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON
 | **Binance futures, legacy `/stream` path** | Connects but **delivers nothing** (Nov 2026). `/market/stream` (and `/public/stream` for book data) work. |
 | **Hyperliquid HIP-3** `xyz:DXY`, `xyz:VIX` | Listed but **zero volume and open interest**: frozen prices. The index perps (`xyz:XYZ100`, `xyz:SP500`) are liquid. The connector is included as an optional fallback, off by default. |
 | **VIX real-time** | The index is licensed. Every free quote found (Cboe, Yahoo) is 15 min delayed. The tile shows the delayed level, labelled with its age, and the live UVXY perpetual as the real-time direction. |
-| **Yahoo streaming** | Unofficial. FX about 1 s (Finnhub is 3-4× faster). Not used for live prices; the chart API is used only for history (DXY, and TLT/HYG/IEF when there is no Alpaca key) and a second delayed VIX quote. |
+| **Yahoo streaming** | Unofficial. FX about 1 s (Finnhub is 3-4× faster). Not used for live prices; the chart API is used only for history (DXY, and TLT/HYG/IEF when there is no Alpaca key), 1M's daily closes (the dollar, the gold, silver, oil and copper futures, and the ETFs when there is no Alpaca key) and a second delayed VIX quote. `[connectors.yahoo] enabled = false` turns all of it off: those nodes then take 1M's σ from their 5-minute grid. |
 | **JBlanked** (key present) | Every calendar endpoint answers **HTTP 401 "requires credits"** with this key. Not used. |
 | **Finnhub** economic calendar and FX candles | HTTP 403 on the free plan. |
 | **Spot BTC/ETH ETF flows** | Farside's pages answered this program's HTTP client with a **Cloudflare bot challenge** (403). Bot checks are respected, not worked around, so the connector is off. DefiLlama's ETF routes are 404; SoSoValue needs a key; CoinGlass is paid. No ETF flows by default. |
@@ -545,7 +551,7 @@ Run `python -m moneyflow check --seconds 120` to measure again. It writes a JSON
 - **CoinGecko public API:** 5-30 calls/min. Uses 1 per 5 min. Attribution: "Data provided by CoinGecko".
 - **DefiLlama:** free, no key. Uses 1 call per hour, plus history twice a day.
 - **FRED:** 120 calls/min per key. Uses 3 calls per 6 h.
-- **Cboe delayed quotes and Yahoo:** delayed data for personal use. Yahoo's API is unofficial, so it is used sparingly: VIX once a minute while VIX is calculated, DXY history at start, and (only without an Alpaca key) two history requests per ETF at start.
+- **Cboe delayed quotes and Yahoo:** delayed data for personal use. Yahoo's API is unofficial, so it is used sparingly: VIX once a minute while VIX is calculated, DXY history at start, 1M's daily closes (4 symbols, or 10 without an Alpaca key) once a day, and (only without an Alpaca key) two history requests per ETF at start. `[connectors.yahoo] enabled = false` stops every one of them.
 - **federalreserve.gov:** public domain. Polled once a day.
 - **Forex Factory weekly export:** polled every 2 h.
 - **RSS:** publishers' public feeds. Each is polled every 3 min with ETag / If-Modified-Since. Headlines link back to the publisher.
@@ -814,12 +820,18 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     first (in about 1 of 100 to 120 simulated wakes with the stream up, the review found) the whole
     time asleep counted as covered: an ETF that had traded held its pre-sleep price there, flagged
     live, with no gap (1H +0.43% where the truth was 0; after a night asleep, TODAY +0.61% the next
-    morning). Every round of the fallback counts as the ETFs' feed heard, standing by or asking (the
-    stream up, the market shut, the stream connecting or refused): the fifteenth round counted no
-    standby round, and with the stream refused (406: another copy holds the key's one stream) or
-    unreachable nothing then told of the feed outside a session. Started then and asleep over the
-    open, the slept session was carried, not back-filled; and a trading day with no trade at all
-    (an unscheduled closure, IEX silent) ran a back-fill about every 67 s.
+    morning). A round of the fallback that asks counts as the ETFs' feed heard; one that stands by
+    (the stream up, the market shut, the stream connecting or refused) counts as far as the network
+    is known up: the newest message of any stream, or a trade answer of its own (other pollers' data
+    can come from their cache). The fifteenth round counted no standby round: with the stream refused
+    (406: another copy holds the key's one stream) or unreachable nothing then told of the feed
+    outside a session, so a session slept over was carried, not back-filled, and a trading day with
+    no trade at all (an unscheduled closure, IEX silent) ran a back-fill about every 67 s. The
+    sixteenth counted every one as now: a round in the half-minute before a dropped connection is
+    noticed covered the next minute, and one across 16:00 the 15:59 minute and the night after it,
+    at the price from before the outage. A stream connected but silent for a minute in a session is
+    asked about (one request a round): a stalled stream's minutes get real prices, and on a day
+    nothing trades the old trades are a real answer all the same.
   - That holds before an ETF's first trade of the run too, once its feed has reported (any message:
     the stream's login counts). Started on a weekend or before the open, with the PC then asleep (or
     the network down) over one or more sessions, an ETF had those sessions carried from the cache's
@@ -946,6 +958,9 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   message used to count as coverage), and nothing asks Alpaca again (every start-up retry and
   back-fill asked and failed, 32 requests over a morning in the review's run). The sources panel
   says why ("Alpaca refused the keys: ETFs are read without a key (Yahoo history, no live prints)").
+  What the ETFs had heard of their feed before the refusal is forgotten: the refusal comes a round
+  trip after the first tick, and with that feed time every session minute became a gap, back-filled
+  from Yahoo each minute all session (20 requests and a full cache save each time, about 390 a day).
   - Tested live: the bonds node stayed **live** through the REST fallback, at a data age of about 20 s.
 - **Finnhub also allows one stream per key.** A second copy of this service, or another app using the same key, takes the slot, and Finnhub refuses the first with HTTP 429 (seen live on 24 Nov 2026).
   - Any websocket refused with 429 waits at least 2 minutes before retrying instead of hammering, and its status says why.
@@ -1770,6 +1785,31 @@ the network stubbed), benchmarks and tests, on the code before this round (86bcc
   a round's text kept after a rate limit): tests now catch each. The one left is equivalent now (what
   a standby round returns: every round counts). One more found a branch nothing reaches (1M's volume
   for an instrument with no 5-minute volume): removed.
+
+**Seventeenth round (28 Nov 2026): a review of the sixteenth.** Checked on the review's reproductions
+(offline: the real engine and fallback loop on a virtual clock, only the network stubbed), on the code
+before this round (cd9e683) and now:
+
+| | Before | Now |
+|---|---|---|
+| **Alpaca refuses the keys from the start** (the review's run, 8:00 to 12:00 New York) | a back-fill every minute of the session: 150 by noon, with 2,980 Yahoo requests and 149 full cache saves (about 390 a day); 149 of 150 SPY minutes flagged live | none; the ETFs carried, none flagged live |
+| **The keys revoked at 10:30** (a session opened before still sending) | 89 back-fills, 1,760 Yahoo requests and 88 saves by noon | none |
+| **A 1M pick** (X: +22% this month on calm days, after a year with big ones; the review's 6-hour run) | judged on the 30-day fallback for 90 minutes (z +2.80), in the slot 3 times; at the next start its saved year not read back | on its year from the start (z +1.86): shown once, for 5 minutes, until the next screen dropped it; its year read back when picked |
+| **Yahoo switched off** | 4 Yahoo requests at each start and daily (10 without an Alpaca key) | none |
+| **Outages across the 16:00 close** (200 simulated, the PC awake) | 13 missed minutes taken as covered (the pre-outage price, flagged live, never fetched); in 7 the night carried it (0.22% to 0.38% off the close) | none |
+| **Outages in a session** (120 simulated) | 11 taken as covered | none |
+| **The stream stalled 8 minutes** (connected, nothing sent; SPY +0.6% meanwhile) | 7 minutes flat at the price before, flagged live; 1H +0.600% an hour later (true +0.199%) | real prices (the fallback asks after a minute of silence); 1H right |
+
+- **Still fixed:** the sixteenth round's refused-stream wakes (every slept step right, TODAY 0.00%,
+  risk 0) and the day nothing trades (no back-fill).
+- **Not changed:** a stock picked on hourly bars before its year is known is shown until the next
+  screen (5 minutes), then judged on its year like every later screen.
+- The final save's test counts the saves at once instead of timing them (it failed at 100% CPU).
+- **Tests: 307 pass** (and 1 skipped on a clean copy: the replay test needs local recordings).
+- **Mutation check: 16 of 16 changes are caught**, on this round's code only. Two got through a
+  first run: a message stamped ahead of now taken as the network's newest (a test now covers it), and
+  the silent-stream check's own test of the session, which the market-closed rule below it already
+  does (removed).
 
 ---
 

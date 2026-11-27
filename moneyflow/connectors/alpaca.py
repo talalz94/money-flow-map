@@ -122,6 +122,12 @@ class AlpacaStream(StreamConnector):
             self.log.warning("Alpaca refused the keys (%s): ETFs read without a key from now on", why[:160])
         self.auth_failed = True
         self.health.detail = KEYS_REFUSED
+        # ...and what they had heard of their feed is forgotten: the refusal comes a round trip after the
+        # first tick, which had handed them the fallback's first round, and with that time every session
+        # minute after it became a gap, back-filled from Yahoo each minute (20 requests and a full cache
+        # save each time), all session
+        for inst in self.subs.values():
+            inst._seen_ts, inst._live_seen = float("nan"), False
 
     def url(self):
         return self.cfg.get("ws_url", "wss://stream.data.alpaca.markets/v2/iex")
@@ -156,6 +162,11 @@ class AlpacaStream(StreamConnector):
     def on_text(self, data, recv):
         for m in jsonutil.loads(data):
             T = m.get("T")
+            if T in ("t", "q") and self.auth_failed:
+                # the keys refused: the ETFs are read without a key, whatever a session opened before
+                # still sends. Taken, its last prints armed their feed again, and once it closed every
+                # session minute was a gap, back-filled from Yahoo each minute (keys revoked mid-run)
+                continue
             if T == "t":
                 inst = self.subs.get(m["S"])
                 if inst is None:
@@ -262,15 +273,40 @@ class AlpacaFallback(PollConnector):
     def auth_failed(self) -> bool:
         return bool(getattr(self.stream, "auth_failed", False))
 
+    # a stream connected but silent this long in a session is asked about (one REST request a round): a
+    # stalled stream, or a day nothing trades (whose old trades are a real answer all the same)
+    STREAM_QUIET_S = 60.0
+
+    def heard(self, result, now: float) -> float | None:
+        """A round that asked: now. One that stood by (PollConnector.run): only as far as the network is
+        known up, the newest real message of any stream (the Alpaca stream's, Binance's ...) or a trade
+        answer of this one (other pollers' data can come from their cache). Counted as now, a round in the
+        half-minute before a dropped connection is noticed covered the next minute, and one across 16:00
+        the 15:59 minute and the night after it: the price from before the outage, flagged live, never
+        fetched. None: nothing heard yet."""
+        if result != STANDBY:
+            return now
+        best = None
+        for c in getattr(getattr(self.ctx, "engine", None), "connectors", {}).values():
+            if getattr(c, "auth_failed", False) or (isinstance(c, PollConnector) and c is not self):
+                continue
+            t = getattr(getattr(c, "health", None), "last_msg", None)
+            if t is not None and (best is None or t > best):
+                best = t
+        return None if best is None else min(best, now)
+
     async def poll(self):
-        # (a round that stands by asks nothing; it still counts as the feed heard: PollConnector.run,
-        # except with the keys refused: Engine._feed_seen)
+        # (a round that stands by asks nothing: it counts as the feed heard as far as the network is known
+        # up, heard(); with the keys refused not at all: Engine._feed_seen)
         if self.auth_failed:
             self.health.detail = KEYS_REFUSED
             return STANDBY
+        now, subs = self.now(), self.stream.subs.values()
         if self.stream.health.state == "connected" and self.stream.ws is not None:
-            self.health.detail = "standby (stream connected)"
-            return STANDBY
+            if now - (getattr(self.stream.health, "last_msg", None) or 0.0) <= self.STREAM_QUIET_S:
+                self.health.detail = "standby (stream connected)"
+                return STANDBY
+            self.health.detail = "asking (stream connected but silent)"     # (the market shut: below)
         if self.now() - self.started < 30 and not self.stream.refused_until:
             self.health.detail = "standby (stream connecting)"     # give the stream time at start-up
             return STANDBY
@@ -291,7 +327,8 @@ class AlpacaFallback(PollConnector):
             if inst is not None and t.get("p"):
                 inst.on_price(float(t["p"]), clock.parse_iso(t["t"]), recv, measure=False)
         self.health.mark_msg(recv)
-        self.health.detail = "polling (stream down)"
+        if not self.health.detail.startswith("asking"):
+            self.health.detail = "polling (stream down)"
 
     def next_interval(self):
         return 20.0 if self.stream.health.state != "connected" else 60.0
