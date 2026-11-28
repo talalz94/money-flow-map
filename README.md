@@ -946,7 +946,23 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
 - **Restarts reuse fresh data:** the slow sources are cached in `data/cache/`, so frequent restarts stay far from the sources' limits:
   - market cap 10 min, stablecoin supply 1 h, FRED 6 h, calendar 2 h;
   - the FOMC calendar is also cached.
-- **No network at start-up:** history is retried every 1 min (then 2, 4 … up to 15 min) until every instrument has it.
+- **No network at start-up:** history is retried every 1 min (then 2, 4 … up to 15 min) until every instrument has it: its whole window, not only the minutes since the start.
+- **A first download cut short** (the app stopped during it, the network down, a crash): each
+  instrument's cache records how far back its downloads reached (`"from"` in its file). A window no
+  download covered is downloaded from its start (35 days back), at the next start and by the retries
+  above, not from the newest value: minutes of live or carried data are not its history (each start
+  used to download from them, and the 35 days never came). A market with nothing older (a new
+  listing) is covered by that download all the same: it is not asked again. A cache written before
+  this did not record it: its first value is taken as its reach (for an ETF, with the shut hours
+  before it).
+- **A market that opens before its feed was heard** (started offline before the open): its session
+  steps are gaps, downloaded once the network is back. They were carried at the pre-open price and,
+  the downloads starting from the newest value, kept for 35 days (1W read SPY +1.000% a week later,
+  true +0.613%). Only for an ETF with an Alpaca key: its feed is set up, its session can be
+  downloaded, and its REST fallback tells a refused stream from the network down. An ETF without a
+  key is carried, as before, and so is an FX leg before Finnhub is heard (with Finnhub refusing a
+  second copy's stream from the start, every minute would be a gap, each back-filled from ICE's
+  dollar).
 - **Another app holds Alpaca's single stream:** the free plan allows one, and Alpaca refuses the second with code 406. The service waits 5 min between retries and meanwhile polls the latest IEX trades over REST every 20 s.
   - It waits for Alpaca's login answer before subscribing, so a refusal is never mistaken for bad keys.
   - The fallback's status says what it is doing ("standby (stream connected)", "standby (US market
@@ -958,6 +974,8 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
   message used to count as coverage), and nothing asks Alpaca again (every start-up retry and
   back-fill asked and failed, 32 requests over a morning in the review's run). The sources panel
   says why ("Alpaca refused the keys: ETFs are read without a key (Yahoo history, no live prints)").
+  A later login that succeeds (a hiccup on Alpaca's side, the keys renewed) reads the ETFs with the
+  key again; they stayed keyless until a restart.
   What the ETFs had heard of their feed before the refusal is forgotten: the refusal comes a round
   trip after the first tick, and with that feed time every session minute became a gap, back-filled
   from Yahoo each minute all session (20 requests and a full cache save each time, about 390 a day).
@@ -1069,7 +1087,14 @@ python tools/measure_resources.py --minutes 10 --clients 1  # with one dashboard
     files written several at once, in the order the next start reads them; refused Alpaca keys (one
     request, then the ETFs as without a key); the downloads' bars closed by the corrected clock; an
     FX leg's unknown weekend after a gap over Friday's close and the dollar on ICE's close over it;
-    the venue's latest trade for an answer without a bar (and none asked over a night).
+    the venue's latest trade for an answer without a bar (and none asked over a night);
+  - a first download cut short, downloaded from the window's start at the next start (also from a
+    cache written before the downloads' reach was recorded: its first value, and for an ETF the
+    shut hours before it); one that failed, retried from there in the same run; a new listing not
+    asked again; the ETFs' downloads (Alpaca, Yahoo) and a picked stock's recording their reach; an
+    ETF's session before its feed was heard downloaded once the network is back, at 11:00 and after
+    the close (the night after it the session's close), none without a key nor for an FX leg; a
+    later login clearing a refusal of the keys.
 
 **Sleep, tested live** (24 Nov 2026, US session). The running service was **frozen for 150 s**
 (process suspended, which is what it experiences during sleep), then resumed:
@@ -1810,6 +1835,50 @@ before this round (cd9e683) and now:
   first run: a message stamped ahead of now taken as the network's newest (a test now covers it), and
   the silent-stream check's own test of the session, which the market-closed rule below it already
   does (removed).
+
+**Eighteenth round (28 Nov 2026): history no download covered.** One cause behind both problems the
+review of 92e30a4 found: every download started from the newest value in the grid, and carried or
+live steps counted as values, so the history before them was never fetched. Each instrument's cache
+now records how far back its downloads reached, and a window no download covered is downloaded from
+its start. Checked on copies of the review's live-run caches and on its reproduction (offline: the
+real engine on a virtual clock, only the network stubbed), on the code before this round (92e30a4)
+and now:
+
+| | Before | Now |
+|---|---|---|
+| **A first start stopped during its download** (the review's live run: stopped while Binance's request budget paused the download; its caches, as each version's next start reads them) | 9 instruments kept with 3-4 five-minute values (Bitcoin, Ether, BNB, Solana and XRP; the oil, QQQ, SPY and UVXY perpetuals): every start downloaded from those minutes (0.09 days back), so the 35 days never came and σ stayed unknown on every window | the 9 from the window's start (35 days back); the 4 complete Binance ones from their newest value, as before; the ETFs (one request for all) once over 35 days, for UUP (below) |
+| **The network down during the first download, back minutes later** | the start-up retries looked only for instruments with no value at all: the live minutes since counted as history, and nothing fetched the 35 days in that run | retried (after 1 min, then 2, 4 … up to 15) from the window's start until a download covers it |
+| **Started offline at 9:15 New York with an Alpaca key, the network back at 11:00** (the review's reproduction) | 16 of the session's 78 five-minute steps per ETF kept at the pre-open price, saved for 35 days (a 1W read's start at 10:00: 600.000, true 600.462) | 0 wrong: the session's steps before the feed was heard are gaps, downloaded once the network is back |
+| **The same, the network back at 16:30** | all 78 wrong; a fresh start a week later read 1W SPY +1.000% (true +0.613%), HYG +0.600% (true +0.368%) | 0 wrong; 1W SPY +0.613%, HYG +0.368% |
+
+- **Older caches** (written before this round) did not record how far their downloads reached:
+  their first value is taken as it (an ETF's, with the shut hours before it). On the review's caches
+  that changes nothing for the complete ones but UUP, whose cache begins at 10:00 New York, half an
+  hour into its first session: the ETFs (one request for all) are downloaded once more over 35 days,
+  then not again.
+- **No loop:** a market with nothing older (a new listing: 10 days of bars in the 35-day window) is
+  covered by one download from the window's start, and not asked again, in that run or after a
+  restart.
+- **Bitcoin and Ether retried too:** the start-up retries skipped the spot pairs whose symbol a
+  funding-only perpetual shares (Bitcoin's and Ether's perpetuals are read for their funding only),
+  so on a first start (no cache) a failed download of them was not tried again in that run.
+- **Without a feed** (an ETF without an Alpaca key) the session's steps are carried, as before; so
+  are an FX leg's before Finnhub is heard (section 9).
+- **What it costs:** offline, the back-fill asks for the session's gap with its back-off (up to
+  15 minutes): 15 failed requests by 11:00 and 59 by 16:30 in the runs above, instead of 10 and 32
+  (each fails at once: no limit is touched). Back at 16:30, 4 answered requests instead of 2.
+- **Alpaca accepting the keys again** after refusing them: the ETFs are read with the key from that
+  login on (they stayed keyless until a restart).
+- **Still as before** (the seventeenth round's runs, on this code): keys refused from the start or
+  revoked at 10:30, no back-fill; the refused stream asleep over an open, over Thanksgiving and over a
+  weekend, every step right; the day nothing trades, no back-fill; 200 outages over the close and 120
+  in a session, none taken as covered.
+- The tests' hand-built caches now record how far their downloads reached: without it four earlier
+  tests (five cases) failed, each start downloading the whole window, which they do not expect.
+- **Tests: 320 pass** (and 1 skipped on a clean copy: the replay test needs local recordings).
+- **Mutation check: 18 of 18 changes are caught**, on this round's code only. One more found a check
+  nothing needs (a connector's health before its feed counts as set up: every connector has one):
+  removed.
 
 ---
 

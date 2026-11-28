@@ -716,7 +716,10 @@ def test_a_failed_pick_is_retried_as_soon_as_the_feeds_are_back_and_stops_once_d
     assert not ent2["ready"] and "AAPLUSDT" not in eng._stocks
 
 
-def test_a_picked_stocks_cached_gap_is_downloaded_from_the_gap(cfg, keys, tmp_path):
+@pytest.mark.parametrize("covered", [True, False])
+def test_a_picked_stocks_cached_gap_is_downloaded_from_the_gap(covered, cfg, keys, tmp_path):
+    """From the cache's gap; and from the window's start when its downloads never reached it (a pick's
+    first download cut short left minutes), the reach recorded once it is in."""
     from moneyflow import history
     eng = filled_engine_at(cfg, keys, NOW)
     eng.cache_dir = tmp_path
@@ -726,6 +729,7 @@ def test_a_picked_stocks_cached_gap_is_downloaded_from_the_gap(cfg, keys, tmp_pa
     inst.seed("g5", [(k * G5_STEP, 100.0) for k in range(k_now - 2000, k_now)], NOW)
     hole = (k_now - 500) * G5_STEP
     inst.g5.put(k_now - 500, float("nan"), False)            # a past outage, in the cache
+    inst.dl_from = NOW - 40 * 86400 if covered else None    # (its downloads reached back over the window)
     history.save(tmp_path, inst)
     fresh = eng.instruments.pop("binance_fut:NVDAUSDT")
     fresh = eng.instrument("binance_fut", "NVDAUSDT", "24/7", True, "NVDA", "index")
@@ -736,7 +740,8 @@ def test_a_picked_stocks_cached_gap_is_downloaded_from_the_gap(cfg, keys, tmp_pa
         asked.append(since5)
     eng._binance_history = history_
     asyncio.run(eng._start_stock("NVDAUSDT"))
-    assert asked == [hole - 600]
+    assert asked == ([hole - 600] if covered else [NOW - 35 * 86400])
+    assert fresh.dl_from == (NOW - 40 * 86400 if covered else NOW - 35 * 86400)
 
 
 def test_the_seed_back_off_starts_over_after_a_success(monkeypatch):

@@ -69,6 +69,8 @@ def save(dirpath: Path, inst: Instrument) -> bool:
     holes = {name: h for name, h in inst.holes.items() if h is not None}
     if holes:
         out["holes"] = holes
+    # how far back real downloads reach (None: never; a cache of only live minutes)
+    out["from"] = inst.dl_from
     # this process's own temporary file: a copy started while this one still saves (the port is
     # free by then) must not write into the same one
     tmp = _file(dirpath, inst).with_suffix(f".{os.getpid()}.tmp")
@@ -226,6 +228,21 @@ def load(dirpath: Path, inst: Instrument, now: float) -> int | None:
         if k is not None:
             inst.price = g.get(k)
             inst.ts = (k + 1) * g.step
+    if "from" in d:
+        f = d["from"]
+        inst.dl_from = float(f) if isinstance(f, (int, float)) and math.isfinite(f) else None
+    elif inst.g5.last_k is not None:
+        # an older cache: its first value is as far as it reaches (a first download cut short left one
+        # of only live minutes: downloaded again from the history window's start), with the shut hours
+        # just before it (nothing traded there: an ETF's first bar is the window's first session)
+        g = inst.g5
+        k = next((k for k in range(g.first_k(), g.last_k + 1) if g.get(k) == g.get(k)), None)
+        if k is not None:
+            j = k
+            while j > k - 1440 and not clock.market_open(inst.hours, j * g.step - 1):
+                j -= 1
+            k = j
+        inst.dl_from = None if k is None else k * g.step
     mark_holes(inst, untrusted=version == 1 or (inst.hours == "us_regular" and version < 5), now=now)
     for name, h in (d.get("holes") or {}).items():   # (saved gaps: at the oldest step its grid holds)
         g = getattr(inst, name, None) if name in inst.holes else None

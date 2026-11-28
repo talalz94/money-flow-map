@@ -145,6 +145,9 @@ class AlpacaStream(StreamConnector):
         except StreamRefused as e:
             self.refused(e.code, str(e))
             raise
+        if self.auth_failed:                # refused before, accepted now: the ETFs are read with the key again
+            self.auth_failed = False
+            self.log.warning("Alpaca accepts the keys again: ETFs read with the key")
         self.health.detail = "authenticated"
         syms = sorted(self.subs)
         await ws.send_str(jsonutil.dumps({"action": "subscribe", "trades": syms,

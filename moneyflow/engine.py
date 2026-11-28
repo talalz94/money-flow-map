@@ -422,8 +422,11 @@ class Engine:
                 if h is not None:
                     last = min(last or h, h)
             days = int(self.cfg.get("general", {}).get("history_days", 35))
+            if inst.history_gap(now - days * 86400):      # never downloaded that far back
+                last = None
             since5 = max(now - days * 86400, (last or 0) - 600)
             await self._binance_history(inst, since5, max(now - 86400 + 60, since5 - 600), now)
+            inst.downloaded(since5)
             inst.roll(self.clock.now())
             bf = self.connectors.get("binance_fut")
             if bf is not None and sym in self._stocks:
@@ -653,6 +656,8 @@ class Engine:
             # the newest value ANYWHERE in the grid: after a sleep of over 4 hours the last 50 steps are
             # all empty, and "nothing found" downloaded 35 days of every instrument with a hole
             t = history.last_good_ts(inst, max_back=inst.g5.size) or horizon
+            if inst.history_gap(horizon):
+                t = horizon                 # never downloaded that far: carried or live steps are no history
             if since is not None:
                 t = min(t, since)
             for h in inst.holes.values():
@@ -690,6 +695,7 @@ class Engine:
                         k1 = await hl.fetch_candles(self.connectors["hyperliquid"], inst.symbol, "1m", since1, now)
                         inst.seed("g5", [(t, c) for t, c, _, _ in k5], now, [(t, q, tb) for t, _, q, tb in k5])
                         inst.seed("g1", [(t, c) for t, c, _, _ in k1], now)
+                    inst.downloaded(since5)
                     st["ok"].append(inst.key)
                 except Exception as e:  # noqa: BLE001
                     st["errors"].append(self.keys.redact(f"{inst.key}: {e}")[:200])
@@ -714,7 +720,7 @@ class Engine:
                     for h in i.holes.values():
                         if h is not None:
                             last = min(last or h, h)
-                    rng = "5d" if last and now - last < 4 * 86400 else "60d"
+                    rng = "5d" if last and now - last < 4 * 86400 and not i.history_gap(horizon) else "60d"
                     try:
                         rows = await pollers.yahoo_chart(self.ctx.session, i.symbol, "5m", rng, now=now)
                         if rows:
@@ -727,6 +733,7 @@ class Engine:
                         rows1 = await pollers.yahoo_chart(self.ctx.session, i.symbol, "1m", "2d", now=now)
                         if rows1:
                             i.seed("g1", rows1, self._through_closed(i, rows1[-1][0] + 60, now))
+                        i.downloaded(horizon if rng == "60d" else now - 4 * 86400)   # (60 sessions: past the window)
                         st["ok"].append(i.key)
                     except Exception as e:  # noqa: BLE001
                         st["errors"].append(f"yahoo {i.symbol}: {e}"[:200])
@@ -768,6 +775,7 @@ class Engine:
                            last_trade=last.get(i.symbol))
                     rows1 = b1.get(i.symbol, [])
                     i.seed("g1", [(t, c) for t, c, _ in rows1], now, since=since1, last_trade=last.get(i.symbol))
+                    i.downloaded(since5)
                     st["ok"].append(i.key)
             except Unauthorized as e:
                 # the keys refused (HTTP 401/403): read the ETFs as without a key from now on, not retried
@@ -1033,7 +1041,11 @@ class Engine:
             self._rescreen_soon()
         self._roll_seen = roll
         before, self._ticked = self._ticked, now
+        expected: dict = {}
         for inst in self.instruments.values():
+            if inst.source not in expected:
+                expected[inst.source] = self._feed_expected(inst.source)
+            inst.feed_expected = expected[inst.source]
             seen = self._feed_seen(inst.source)             # a quiet market on a live feed is covered...
             if woke and before is not None:
                 # ...but not the time asleep by what came in since the wake: the Alpaca fallback's round
@@ -1047,6 +1059,23 @@ class Engine:
             d.refresh(now)
 
     FEEDS = {"alpaca": ("alpaca", "alpaca_rest")}    # the connectors that deliver a source's prices
+
+    def _feed_expected(self, source: str) -> bool:
+        """Is a live feed set up for `source`: a connector, usable (keys) and not refused? (An ETF
+        without a key has none: its steps are carried, not gaps.) Only a market whose own history
+        download fills the gap, and whose REST fallback tells a refused stream from the network down:
+        not an FX leg (Finnhub refusing a second copy's stream from the start would make every minute
+        a gap, each back-filled from ICE's dollar)."""
+        if source not in HISTORY_SOURCES:
+            return False
+        for name in self.FEEDS.get(source, (source,)):
+            c = self.connectors.get(name)
+            if c is None or getattr(c, "auth_failed", False):
+                continue
+            avail = getattr(c, "available", None)
+            if not callable(avail) or avail()[0]:
+                return True
+        return False
 
     def _feed_seen(self, source: str) -> float | None:
         """The newest message or successful poll of the connector(s) feeding `source` (none from one
@@ -1528,11 +1557,7 @@ class Engine:
                 self.seed_state.update(state="failed", errors=[self.keys.redact(e)])
                 log.exception("history seeding failed")
             first = False
-            missing = [i.key for i in self.instruments.values()
-                       if i.source in HISTORY_SOURCES
-                       and i.g5.last_k is None and i.symbol not in self._funding_only()
-                       and i.symbol not in self._stocks         # picked stocks load their own history
-                       and not (i.source == "alpaca" and not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET"))]
+            missing = self._without_history()
             if self.seed_state.get("state") == "done" and not self.seed_state.get("errors") and not missing:
                 return
             self.seed_state["retry_in_s"] = delay
@@ -1540,6 +1565,21 @@ class Engine:
                      len(self.seed_state.get("errors") or []), len(missing), delay)
             await asyncio.sleep(delay)
             delay = min(900.0, delay * 2)
+
+    def _without_history(self) -> list[str]:
+        """The instruments still without their history, for the start-up retries: none at all, or a
+        window no download covered yet (a first download cut short, the network down during it: minutes
+        of carried or live data are not its 35 days). Picked stocks load their own."""
+        horizon = self.clock.now() - int(self.cfg.get("general", {}).get("history_days", 35)) * 86400
+        funding = self._funding_only()
+        # (a funding-only perpetual is skipped, not the spot pair of the same symbol: Bitcoin's was, so
+        # the start-up retries never fetched Bitcoin when its first download failed)
+        return [i.key for i in self.instruments.values()
+                if i.source in HISTORY_SOURCES and i.symbol not in self._stocks
+                and not (i.source == "binance_fut" and i.symbol in funding)
+                and ((i.g5.last_k is None
+                      and not (i.source == "alpaca" and not self.keys.has("ALPACA_KEY_ID", "ALPACA_SECRET")))
+                     or (i.g5.last_k is not None and i.history_gap(horizon) and self._fillable(i)))]
 
     WAKE_GAP_S = 25.0     # wall-clock seconds between two rounds that mean the PC slept (as the watchdog)
 

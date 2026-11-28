@@ -27,6 +27,8 @@ G5_STEP, G5_SIZE = 300, 10080
 # open on IEX, SPY's never 5) it is more likely the venue's own gap: a 200 answer without SPY filled a
 # 30-minute outage with its 9:59 price, flagged live, and cleared the hole for good.
 QUIET_MAX_S = 900.0
+# A download's coverage within this of the history window's start counts as reaching it.
+HISTORY_GAP_SLACK_S = 3600.0
 
 
 def isnum(x) -> bool:
@@ -209,6 +211,16 @@ class Instrument:
         self.g5 = Grid(G5_STEP, G5_SIZE)
         self.v5 = VolumeRing(G5_STEP, G5_SIZE) if volume else None
         self.daily = Daily()                # a year of daily closes: the 1M window's σ
+        # The oldest time a real download of the 5-minute grid started from (it runs to its end: with the
+        # downloads since, everything after it was fetched, but for the gaps in `holes`). None: never.
+        # Carried or live steps are no history: a first download cut short (an auto-stop, the network
+        # down, a crash) left minutes of data, every later download started from them, and the 35 days
+        # before them were never fetched (σ unknown on every window, for weeks).
+        self.dl_from: float | None = None
+        # Its live feed is set up (the engine's tick says so: an ETF with its key): a market that opens
+        # before that feed was heard at all this run has its session steps unknown, gaps to download
+        # (roll). Without a feed (an ETF without a key) they are carried, as before.
+        self.feed_expected = False
         self.price = NaN
         self.ts: float | None = None        # exchange timestamp of the latest price
         self.recv_ts: float | None = None   # local (NTP-corrected) receive time
@@ -275,6 +287,17 @@ class Instrument:
     @property
     def live_seen(self) -> bool:
         return self._live_seen
+
+    def downloaded(self, since: float) -> None:
+        """A download of the 5-minute grid from `since` (to now) succeeded: it covered that much, whatever
+        the exchange had (a new listing has nothing older: that is covered too, no download loop)."""
+        if self.dl_from is None or since < self.dl_from:
+            self.dl_from = since
+
+    def history_gap(self, horizon: float) -> bool:
+        """Is history missing in the 5-minute grid's window, from `horizon` on: no real download covered
+        it (an interrupted first download, a cache of only live minutes)?"""
+        return self.dl_from is None or self.dl_from > horizon + HISTORY_GAP_SLACK_S
 
     def feed_alive(self, ts: float | None) -> None:
         """Real data, or the feed's own heartbeat, reached us at `ts` (local, NTP-corrected)."""
@@ -345,6 +368,11 @@ class Instrument:
         # 0, after a sleep from a Monday's pre-market to the Friday). With no feed at all (TLT without
         # a key) its steps are carried, as above.
         fed = traded or seen == seen
+        # A market that opened before its feed was heard at all this run (started offline before the
+        # open): its session steps are gaps, downloaded once the network is back. Carried, the 5-minute
+        # grid kept the pre-open price in them for 35 days (the retries start from the newest value):
+        # 1W read SPY +1.000% a week later (true +0.613%). Only with a feed set up (feed_expected).
+        unheard = not fed and self.feed_expected and self._shuts
         # before any live data, a step after an unfilled hole would only carry the CACHE's last close
         # (the app was off, the first download failed): unknown too, not that old price
         h1, h5 = self.holes["g1"], self.holes["g5"]
@@ -356,8 +384,8 @@ class Instrument:
         # loops: after a sleep of over a day the 1-minute loop starts past the first missed session.
         # The same for any market with shut hours: an FX leg that slept over Friday's close holds an
         # older price than the close all weekend (its dollar takes ICE's close then: DXY).
-        if fed and seen == seen and self._stale_from is None and self._shuts:
-            m = max(self._k1, int(seen // G1_STEP) + 1)
+        if self._stale_from is None and self._shuts and (unheard or (fed and seen == seen)):
+            m = self._k1 if unheard else max(self._k1, int(seen // G1_STEP) + 1)
             while m < k1_now:
                 if clock.market_open(self.hours, (m + 1) * G1_STEP - 1):
                     self._stale_from = m * G1_STEP
@@ -367,7 +395,7 @@ class Instrument:
         for k in range(start, k1_now):
             t0 = k * G1_STEP
             open_ = clock.market_open(self.hours, t0 + G1_STEP - 1)
-            if fed and open_ and not (seen >= t0):
+            if open_ and ((fed and not (seen >= t0)) or unheard):
                 self.g1.put(k, NaN, False)
                 self._hole("g1", t0)
                 self._gap_open = True
@@ -388,7 +416,7 @@ class Instrument:
                 t0 = k * G5_STEP
                 open_ = clock.market_open(self.hours, t0 + G5_STEP - 1)
                 stale = open_ and not traded and h5 is not None and t0 >= h5
-                covered = not stale and not (fed and open_ and not (seen >= t0))
+                covered = not stale and not (open_ and ((fed and not (seen >= t0)) or unheard))
                 if covered and not open_ and self._stale_from is not None and t0 > self._stale_from:
                     self.g5.put(k, NaN, False)          # the close after a missed session minute (above)
                 elif covered:

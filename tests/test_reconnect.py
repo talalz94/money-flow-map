@@ -527,7 +527,9 @@ def test_engine_resume_resyncs_and_kicks_every_connector(cfg, keys):
 
 
 # ── a sleep or a network outage: empty steps, never the old price as live; back-filled with retries ──
-def _gap_engine(cfg, keys, t0, tmp_path):
+def _gap_engine(cfg, keys, t0, tmp_path, covered=True):
+    """An engine as after its start-up downloads (`covered`: they reached back over the history window,
+    as a full cache's did; False: never downloaded, a first start)."""
     clk = clock.Clock(fixed=t0)
     eng = Engine(cfg, keys, clk)
     eng.cache_dir = tmp_path
@@ -535,6 +537,9 @@ def _gap_engine(cfg, keys, t0, tmp_path):
     eng.cfg = dict(cfg, connectors=dict(cfg["connectors"], yahoo={"enabled": False}))
     eng.seed_state["state"] = "done"
     eng.BACKFILL_SETTLE, eng.BACKFILL_FIRST, eng.BACKFILL_MAX = 0.0, 0.01, 0.02
+    if covered:
+        for i in eng.instruments.values():
+            i.dl_from = t0 - 40 * 86400
     return eng, clk
 
 
@@ -2880,3 +2885,272 @@ def test_a_rounds_text_goes_when_the_next_round_starts():
         await asyncio.gather(task, return_exceptions=True)
     asyncio.run(go())
     assert p.health.state == "ok" and p.health.detail == "" and p.health.last_error.startswith("poll")
+
+
+
+# ── eighteenth round: history never downloaded is downloaded; a market opened before its feed was heard ──
+def _btc_live(eng, clk, t0, t1, truth):
+    """Live Bitcoin minutes from t0 to t1 (its feed heard), ticking every 30 s."""
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    t = t0
+    while t <= t1:
+        clk.set_fixed(t)
+        btc.on_price(truth(t), t, t)
+        eng.tick()
+        t += 30
+    return btc
+
+
+@pytest.mark.parametrize("old_format", [False, True])
+def test_a_first_download_cut_short_is_downloaded_whole_at_the_next_start(old_format, cfg, keys, monkeypatch, tmp_path):
+    """A fresh start stopped minutes in while Binance's request budget paused its first download (the
+    review's live run: 31 s): the final save wrote Bitcoin with only its live minutes, every later start
+    downloaded from their newest value only: its 35 days never came, σ unknown on every window, for
+    weeks. A window no download covered is downloaded from its start (also from a cache written before
+    this, which does not say how far its downloads reach: from its first value)."""
+    import json
+    from moneyflow import history
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    truth = lambda t: 90000.0 + (t - t0) / 60          # noqa: E731
+    old, clk = _gap_engine(cfg, keys, t0, tmp_path, covered=False)
+    btc = _btc_live(old, clk, t0, t0 + 400, truth)         # (no download got through)
+    assert btc.g5.last_k is not None and btc.dl_from is None and history.save(tmp_path, btc)
+    if old_format:
+        f = history._file(tmp_path, btc)
+        d = json.loads(f.read_text())
+        del d["from"]
+        f.write_text(json.dumps(d))
+    now = t0 + 3600
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path, covered=False)
+    klines, _ = _exchange(truth, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    horizon = now - 35 * 86400
+    assert klines.starts[("BTCUSDT", "5m")] == [horizon]
+    b = eng.instruments["binance_spot:BTCUSDT"]
+    assert b.dl_from == horizon and not b.history_gap(horizon)
+    assert b.g5.get(int((horizon + 86400) // 300)) == truth(int((horizon + 86400) // 300) * 300 + 300)
+
+
+def test_a_first_download_that_failed_is_retried_from_the_window_start_in_the_same_run(cfg, keys, monkeypatch, tmp_path):
+    """The network went down during the first download and came back minutes later: the live minutes
+    since were the only history, the start-up retries looked for instruments with none at all, and
+    the 35 days before the start never came in that run either. An instrument whose window no
+    download covered is retried, from the window's start, until one does."""
+    from moneyflow.connectors import binance as bn
+    t0 = 1795528800.0
+    truth = lambda t: 90000.0 + (t - t0) / 60          # noqa: E731
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path, covered=False)
+    down = {"on": True}
+    klines, _ = _exchange(truth, fail=lambda: down["on"])
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())                        # the network down: every download fails
+    btc = _btc_live(eng, clk, t0 + 30, t0 + 600, truth)    # ...and back: live minutes come in
+    assert "binance_spot:BTCUSDT" in eng._without_history()
+    down["on"] = False
+    asyncio.run(eng.seed_history(incremental=True))        # the start-up retry
+    horizon = t0 + 600 - 35 * 86400
+    assert klines.starts[("BTCUSDT", "5m")][-1] == horizon and "binance_spot:BTCUSDT" not in eng._without_history()
+    assert btc.dl_from == horizon
+
+
+def test_a_new_listing_with_nothing_older_is_not_downloaded_again_and_again(cfg, keys, monkeypatch, tmp_path):
+    """A perpetual listed 10 days ago has no bar before that: a download from the window's start covers
+    the window all the same (the exchange has nothing older), so no retry asks again, in that run or
+    after a restart."""
+    from moneyflow import history
+    from moneyflow.connectors import binance as bn
+    now = 1795528800.0
+    listed = now - 10 * 86400
+    truth = lambda t: 50.0 + (t - listed) / 86400       # noqa: E731
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path, covered=False)
+    klines, _ = _exchange(truth, fail=lambda: False)
+
+    async def listing(session, market, symbol, interval, start_ms, end_ms, price="last"):
+        return [r for r in await klines(session, market, symbol, interval, start_ms, end_ms, price) if r[0] >= listed]
+    listing.starts = klines.starts
+    monkeypatch.setattr(bn, "fetch_klines", listing)
+    asyncio.run(eng.seed_history())
+    btc = eng.instruments["binance_spot:BTCUSDT"]
+    horizon = now - 35 * 86400
+    assert btc.dl_from == horizon and "binance_spot:BTCUSDT" not in eng._without_history()
+    assert history.save(tmp_path, btc)
+    eng2, _ = _gap_engine(cfg, keys, now + 3600, tmp_path, covered=False)   # (its coverage from the file)
+    asyncio.run(eng2.seed_history())
+    assert klines.starts[("BTCUSDT", "5m")][-1] > now - 3600           # the tail only
+    assert "binance_spot:BTCUSDT" not in eng2._without_history()
+
+
+@pytest.mark.parametrize("with_feed,back_hm", [(True, (11, 0)), (False, (11, 0)), (True, (16, 30))])
+def test_an_etfs_session_before_its_feed_was_heard_is_downloaded_once_the_network_is_back(
+        with_feed, back_hm, cfg, keys, monkeypatch, tmp_path):
+    """Started offline at 9:15 New York, the network back at 11:00. Nothing told of the ETFs' feed before
+    then (the standby rounds count only as far as the network is known up), so their session steps
+    were carried at the pre-open price, and the retries started from the newest of those: the 5-minute
+    grid kept the pre-open price for 9:30-11:00, saved for 35 days (1W read SPY +1.000% a week later,
+    true +0.613%). With a feed set up, a session step closed before the feed was heard is a gap,
+    downloaded once the network is back. Without one (no key) they are carried, as before."""
+    from conftest import ny_ts
+    from moneyflow.connectors import alpaca as alp, binance as bn
+    from moneyflow.connectors.base import Health
+    from moneyflow.series import G5_STEP
+    t0, back = ny_ts(2026, 11, 23, 9, 15), ny_ts(2026, 11, 23, *back_hm)
+    truth = lambda t: 600.0 + (t - t0) / 3600           # noqa: E731
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    spy = eng.instruments["alpaca:SPY"]
+    for etf in [i for i in eng.instruments.values() if i.source == "alpaca"]:
+        for g, step in ((etf.g5, G5_STEP), (etf.g1, 60)):   # the cache: Friday's close carried to now
+            for k in range(int(t0 // step) - 200, int(t0 // step)):
+                g.put(k, 600.0, False)
+        etf.price, etf.dl_from = 600.0, t0 - 40 * 86400
+    if with_feed:
+        eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={},
+                                                         health=Health("alpaca", "stream", "x"))
+    for t in range(int(t0), int(back), 30):               # offline: no message from any feed
+        clk.set_fixed(t)
+        eng.tick()
+    opened = ny_ts(2026, 11, 23, 9, 30)
+    session = range(int(opened // G5_STEP), min(int(back // G5_STEP) - 1, int(ny_ts(2026, 11, 23, 16, 0) // G5_STEP)))
+    night = int(ny_ts(2026, 11, 23, 16, 10) // G5_STEP)
+    if not with_feed:
+        assert spy.holes == {"g1": None, "g5": None} and all(spy.g5.get(k) == 600.0 for k in session)
+        return
+    assert spy.holes == {"g1": opened, "g5": opened} and all(spy.g5.get(k) != spy.g5.get(k) for k in session)
+    if back_hm >= (16, 0):                                  # the night after it unknown (not the pre-open price)
+        assert spy.g5.get(night) != spy.g5.get(night)
+    starts = []
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        starts.append((tf, since))
+        step = 300 if tf == "5Min" else 60
+        out, t = [], -(-int(since) // step) * step
+        while t + step <= back:
+            if clock.market_open("us_regular", t + step - 1):
+                out.append((t, truth(t + step), 1e5))
+            t += step
+        return {s: list(out) for s in symbols}
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history(incremental=True))       # the network back: the start-up retry
+    assert starts[0] == ("5Min", opened - 600) and spy.holes["g5"] is None
+    assert all(spy.g5.get(k) == truth((k + 1) * G5_STEP) for k in session)
+    if back_hm >= (16, 0):                                  # ...then the session's close
+        assert spy.g5.get(night) == truth(ny_ts(2026, 11, 23, 16, 0))
+
+
+def test_a_later_login_that_succeeds_clears_a_refusal_of_the_keys(keys):
+    """Alpaca refused the keys once (a hiccup on its side, or keys renewed since): a later login that
+    succeeds reads the ETFs with the key again (until a restart they stayed keyless)."""
+    import json
+    from moneyflow.connectors.alpaca import AlpacaStream
+
+    class WS:
+        def __init__(self):
+            self.sent = []
+
+        async def send_str(self, s):
+            self.sent.append(s)
+
+        async def receive(self, timeout=None):
+            return types.SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps([{"T": "success", "msg": "authenticated"}]))
+    ctx = ctx_for(None)
+    ctx.keys = keys
+    st = AlpacaStream(ctx, {})
+    st.keys_refused("HTTP 401")
+    assert st.auth_failed and not st.available()[0]
+    asyncio.run(st.on_open(WS()))
+    assert not st.auth_failed and st.health.detail == "authenticated"
+
+
+def test_an_older_cache_reaches_back_to_its_first_value_and_the_shut_hours_before_it(tmp_path):
+    """A cache written before this round does not say how far its downloads reached: its first value
+    does, with the shut hours just before it (an ETF's first bar is the window's first session:
+    nothing traded before it; counted from the bar alone, every ETF downloaded 35 days again). A
+    24/7 market's first value is its reach: minutes of live data (a first download cut short) do not
+    reach the window's start."""
+    import json
+    from conftest import ny_ts
+    from moneyflow import history
+    from moneyflow.series import G5_STEP, Instrument
+    now = ny_ts(2026, 11, 27, 20, 0)                       # Friday evening: the window opens on Friday 23 Oct
+    first = ny_ts(2026, 10, 26, 9, 30)                     # its first session: Monday's
+    horizon = now - 35 * 86400
+    for key, src, sym, hours, gap in (("alpaca:SPY", "alpaca", "SPY", "us_regular", False),
+                                      ("binance_spot:BTCUSDT", "binance_spot", "BTCUSDT", "24/7", True)):
+        inst = Instrument(key, src, sym, hours)
+        for k in range(int(first // G5_STEP), int(now // G5_STEP)):
+            inst.g5.put(k, 600.0, clock.market_open(hours, (k + 1) * G5_STEP - 1))
+        assert history.save(tmp_path, inst)
+        f = history._file(tmp_path, inst)
+        d = json.loads(f.read_text())
+        del d["from"]                                      # (an older cache)
+        f.write_text(json.dumps(d))
+        again = Instrument(key, src, sym, hours)
+        history.load(tmp_path, again, now)
+        assert again.history_gap(horizon) is gap, key
+
+
+@pytest.mark.parametrize("with_key", [True, False])
+def test_the_etfs_downloads_record_how_far_back_they_reached(with_key, cfg, keys, monkeypatch, tmp_path):
+    """An ETF's history from Alpaca (all ETFs in one request) or, without a key, from Yahoo's chart: what
+    the download covered is recorded, so the next start does not fetch the window again. Without a key
+    and with a recent cache that never reached the window's start, Yahoo is asked for 60 sessions (5
+    would not reach it)."""
+    from moneyflow.connectors import alpaca as alp, binance as bn, pollers
+    from moneyflow.series import G5_STEP
+    now = 1795528800.0
+    horizon = now - 35 * 86400
+    eng, _ = _gap_engine(cfg, keys, now, tmp_path, covered=False)
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+    etfs = [i for i in eng.instruments.values() if i.source == "alpaca"]
+    for i in etfs:                                         # minutes of carried data: no reach
+        for k in range(int(now // G5_STEP) - 20, int(now // G5_STEP)):
+            i.g5.put(k, 80.0, False)
+    asked = []
+    if with_key:
+        eng.connectors["alpaca"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={})
+
+    async def bars(conn, symbols, tf, since, end=None, feed="iex"):
+        asked.append((tf, since))
+        return {s: [] for s in symbols}
+
+    async def chart(session, symbol, interval="5m", rng="60d", now=None):
+        asked.append((interval, rng))
+        return [(now - 86400 * 50, 80.0), (now - 3600, 80.0)]
+    monkeypatch.setattr(alp, "fetch_bars", bars)
+    monkeypatch.setattr(pollers, "yahoo_chart", chart)
+    klines, _ = _exchange(lambda t: 100.0, fail=lambda: False)
+    monkeypatch.setattr(bn, "fetch_klines", klines)
+    asyncio.run(eng.seed_history())
+    if with_key:
+        assert asked[0] == ("5Min", horizon)
+    else:
+        assert ("5m", "60d") in asked and ("5m", "5d") not in asked
+    assert all(i.dl_from == horizon for i in etfs) and not [k for k in eng._without_history() if k.startswith("alpaca:")]
+
+
+def test_an_fx_leg_before_its_feed_was_heard_is_carried_as_before(cfg, keys, tmp_path):
+    """The rule above is the ETFs' only: an FX leg's week before Finnhub was heard is carried, as before.
+    Finnhub refusing a second copy's stream from the start (the network up) would otherwise make every
+    minute a gap, each back-filled from ICE's dollar."""
+    from conftest import ny_ts
+    from moneyflow.connectors.base import Health
+    from moneyflow.series import G5_STEP
+    t0 = ny_ts(2026, 11, 23, 9, 15)
+    eng, clk = _gap_engine(cfg, keys, t0, tmp_path)
+    eng.cfg = dict(eng.cfg, connectors=dict(eng.cfg["connectors"], yahoo={"enabled": True}))
+    legs = [i for i in eng.instruments.values() if i.source == "finnhub"]
+    for leg in legs:                                       # the cache: the price before the start
+        for g, step in ((leg.g5, G5_STEP), (leg.g1, 60)):
+            for k in range(int(t0 // step) - 200, int(t0 // step)):
+                g.put(k, 1.1, False)
+        leg.price = 1.1
+    eng.connectors["finnhub"] = types.SimpleNamespace(available=lambda: (True, ""), cfg={},
+                                                      health=Health("finnhub", "stream", "x"))
+    for t in range(int(t0), int(t0) + 900, 30):           # nothing heard from Finnhub
+        clk.set_fixed(t)
+        eng.tick()
+    assert legs and all(leg.holes == {"g1": None, "g5": None} for leg in legs) and not eng.holes()
+    assert all(leg.g5.get(int(t0 // G5_STEP) + 1) == 1.1 for leg in legs)
