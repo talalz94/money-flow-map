@@ -27,6 +27,7 @@ read as a **local JSON API** (REST, WebSocket, SSE, webhooks) for other apps, pl
 9. [Recovery after sleep or network loss](#9-recovery-after-sleep-or-network-loss)
 10. [Tests and tools](#10-tests-and-tools)
 11. [Limits: what is real-time and what is not](#11-limits-what-is-real-time-and-what-is-not)
+    - [Known limitations](#known-limitations)
 12. [Project layout](#12-project-layout)
 13. [License](#13-license)
 
@@ -1921,6 +1922,38 @@ More caveats:
 - **Trading-day σ assumes the default calendars.** An asset added with `enabled = true` gets one
   from its `hours` (US hours → NYSE days, FX hours → weekdays, otherwise every day); set
   `calendar` yourself if that is wrong for it.
+
+### Known limitations
+
+Rare cases the reviews found and left as they are, each with what it does:
+
+- **An offline start whose first back-fill answer has no bar for an ETF.** The session is
+  downloaded, but the ETF's night after it stays unknown, so 1H reads unknown all evening (all
+  weekend after a Friday). Nothing shown is wrong, only missing, until the next download covers it.
+- **Alpaca accepting the keys again after refusing them.** The session minutes carried while the
+  keys were refused are not downloaded again: 1H can be off for about an hour, and a few 5-minute
+  steps stay carried.
+- **Offline, the back-fill keeps asking for the gap,** backing off up to 15 minutes: more failed
+  requests than before (59 instead of 32 for a start offline from 9:15 to 16:30 New York), each
+  failing at once.
+- **An FX leg before Finnhub is first heard** (an offline start) is carried at its cached price,
+  not marked as a gap (section 9: a Finnhub stream refused from the start would otherwise make every
+  minute a gap).
+- **A short FX outage** (under about 15 minutes): ICE's dollar, about 10 minutes late, does not reach
+  the gap, so the back-fill gives it up with a "no exchange data" line per leg, and the dollar's
+  minutes of the outage stay unknown. Each back-fill for an FX leg downloads ICE's 60 days of
+  5-minute bars again.
+- **NTP:** one box that intercepts NTP and answers for every server with the same wrong time (days
+  off) cannot be told from a PC clock days off, and is followed (section 4.2).
+- **A 1M pick at a start** is made on hourly bars before the stock's year of daily closes is in, and
+  can show until the next screen (up to 5 minutes), which judges it on its year.
+- **The final save on a very busy PC:** Windows ends the process about 4.5 s after the console
+  window is closed, saved or not. Files the save did not reach keep their last save (at most
+  10 minutes old); the ones the next start reads first are written first (section 9).
+- **Logoff and shutdown** were tested by sending the app's windows the messages Windows sends at a
+  logoff and then ending the process as Windows does, not by a real logoff or shutdown. A forced
+  end (the process killed, a crash, a power cut) saves nothing: the cache is as of its last save,
+  at most 10 minutes old.
 
 ---
 
